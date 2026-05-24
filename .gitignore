@@ -1,0 +1,17 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Generated experiment artifacts (script defaults: --data_root ./beir_data, --out ./results)
+beir_data/
+results/
+*.npy
+
+# macOS
+.DS_Store

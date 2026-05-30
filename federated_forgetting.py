@@ -54,6 +54,8 @@ def new_model(model_path, lora_rank, fp16):
                      r=lora_rank, lora_alpha=2 * lora_rank, lora_dropout=0.1,
                      target_modules=["query", "key", "value", "dense"])
     model.add_adapter(cfg)
+    model[0].auto_model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False})
     return model
 
 
@@ -68,7 +70,7 @@ def client_train(global_state, model_path, lora_rank, fp16, data,
         model.fit(train_objectives=[(loader, loss_fn)], epochs=epochs,
                   optimizer_params={"lr": lr},
                   warmup_steps=max(1, int(0.1 * len(loader))),
-                  show_progress_bar=False)
+                  show_progress_bar=False, use_amp=True)
     state = get_adapter_state(model)
     del model; torch.cuda.empty_cache()
     return state

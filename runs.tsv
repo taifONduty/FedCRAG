@@ -1,0 +1,5 @@
+run_id	phase	script	model	slices	seed	variant	status	bwt_ndcg10	forgetting_ndcg10	output_json	log
+p42	1-pilot	pilot_forgetting.py	bge-m3	nfcorpus fiqa scifact arguana	42	sequential	todo	-	-	results/pilot_bge-m3_seed42.json	logs/p42.log
+c42	2-controls	controls.py	bge-m3	nfcorpus fiqa scifact arguana	42	frozen+indep+joint	todo	-	-	results/controls_bge-m3_seed42.json	logs/c42.log
+f42	3-federated	federated_forgetting.py	bge-m3	nfcorpus fiqa scifact arguana	42	unweighted-5r	todo	-	-	results/federated_bge-m3_seed42.json	logs/f42.log
+fw42	3-federated	federated_forgetting.py	bge-m3	nfcorpus fiqa scifact arguana	42	weighted-5r	todo	-	-	results/federated_bge-m3_seed42_w.json	logs/fw42.log

@@ -46,7 +46,7 @@ def train_on_slice(model, data, q_prefix, d_prefix, epochs, batch_size, lr):
     model.fit(train_objectives=[(loader, loss)], epochs=epochs,
               optimizer_params={"lr": lr},
               warmup_steps=max(1, int(0.1 * len(loader))),
-              show_progress_bar=True)
+              show_progress_bar=True, use_amp=True)
 
 
 def main():
@@ -81,6 +81,8 @@ def main():
                           lora_dropout=0.1,
                           target_modules=["query", "key", "value", "dense"])
     model.add_adapter(peft_cfg)
+    model[0].auto_model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False})
 
     primary = args.metrics[0]
     R = {}
@@ -95,6 +97,7 @@ def main():
 
     print("=== frozen baseline ===")
     eval_all("frozen")
+    torch.cuda.empty_cache()
 
     for i, s in enumerate(order):
         print(f"=== stage {i}: train on '{s}' ===")

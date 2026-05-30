@@ -20,6 +20,8 @@ def fresh_model(name, lora_rank):
                      r=lora_rank, lora_alpha=2 * lora_rank, lora_dropout=0.1,
                      target_modules=["query", "key", "value", "dense"])
     model.add_adapter(cfg)
+    model[0].auto_model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False})
     return model, q_prefix, d_prefix
 
 
@@ -44,7 +46,7 @@ def train(model, examples, epochs, batch_size, lr):
     model.fit(train_objectives=[(loader, loss_fn)], epochs=epochs,
               optimizer_params={"lr": lr},
               warmup_steps=max(1, int(0.1 * len(loader))),
-              show_progress_bar=True)
+              show_progress_bar=True, use_amp=True)
 
 
 def evaluate(model, data, q_prefix, d_prefix, metrics, batch_size):

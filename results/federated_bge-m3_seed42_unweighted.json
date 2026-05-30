@@ -1,0 +1,31 @@
+{
+  "seed": 42,
+  "slices": [
+    "nfcorpus",
+    "fiqa",
+    "scifact",
+    "arguana"
+  ],
+  "model": "bge-m3",
+  "metrics": [
+    "ndcg@10",
+    "recall@10",
+    "recall@100"
+  ],
+  "num_rounds": 5,
+  "weighted": false,
+  "note": "R_matrix ndcg@10 values recovered from logs/f42.log (weighted run fw42 overwrote the original JSON). recall@10 and recall@100 per-round values not logged; only BWT summary available.",
+  "R_matrix_ndcg10": {
+    "frozen":  { "nfcorpus": 0.3141, "fiqa": 0.4130, "scifact": 0.6437, "arguana": 0.4013 },
+    "round_1": { "nfcorpus": 0.3309, "fiqa": 0.4209, "scifact": 0.6645, "arguana": 0.4275 },
+    "round_2": { "nfcorpus": 0.3345, "fiqa": 0.4049, "scifact": 0.6699, "arguana": 0.4382 },
+    "round_3": { "nfcorpus": 0.3313, "fiqa": 0.3901, "scifact": 0.6614, "arguana": 0.4377 },
+    "round_4": { "nfcorpus": 0.3246, "fiqa": 0.3782, "scifact": 0.6591, "arguana": 0.4347 },
+    "round_5": { "nfcorpus": 0.3231, "fiqa": 0.3720, "scifact": 0.6518, "arguana": 0.4284 }
+  },
+  "BWT": {
+    "ndcg@10": -0.0171,
+    "recall@10": -0.0169,
+    "recall@100": 0.0042
+  }
+}

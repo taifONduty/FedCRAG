@@ -10,7 +10,8 @@ env/
 
 # Generated experiment artifacts (script defaults: --data_root ./beir_data, --out ./results)
 beir_data/
-results/
+results_smoke/
+results_smoke4/
 *.npy
 
 # macOS

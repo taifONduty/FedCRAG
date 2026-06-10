@@ -29,10 +29,10 @@ run p42  $PYTHON pilot_forgetting.py     --model bge-m3 --slices $SLICES --seed 
 run c42  $PYTHON controls.py             --model bge-m3 --slices $SLICES --seed 42 --batch_size 8
 
 # Phase 3: Federated — unweighted FedAvg
-run f42  $PYTHON federated_forgetting.py --model bge-m3 --slices $SLICES --seed 42 --num_rounds 5 --batch_size 8
+run f42  $PYTHON federated_forgetting.py --model bge-m3 --slices $SLICES --seed 42 --num_rounds 5 --batch_size 8 --save_states
 
-# Phase 4: Federated — size-weighted FedAvg
-run fw42 $PYTHON federated_forgetting.py --model bge-m3 --slices $SLICES --seed 42 --num_rounds 5 --batch_size 8 --weighted
+# Phase 4: Federated — weighted FedAvg (corpus-size weighting, as in the original F4 run)
+run fw42 $PYTHON federated_forgetting.py --model bge-m3 --slices $SLICES --seed 42 --num_rounds 5 --batch_size 8 --weighted --weight_by corpus --save_states
 
 echo ""
 echo "================================================"

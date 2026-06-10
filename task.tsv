@@ -22,12 +22,12 @@ id	phase	task	command	depends_on	status	gate_or_expected
 4.1	4-method	Build FedCRAG method (LoRA + EWC + severity-aware FedAvg)	-	2.4	todo	method recovers gap to ceilings vs naive FedAvg
 4.2	4-method	FlowRAG baseline wrapper (reproduce + federate)	-	2.4	todo	prompt-based baseline; show it fails / underperforms in federated setting
 4.3	4-method	Ablations: LoRA rank, LR sweep, frozen vs ANCE negatives, EWC on/off	-	4.1	todo	effect robust to hyperparameters
-5.1	5-eng	Fix LoRA target_modules for Qwen-family backbones	-	-	todo	q_proj/k_proj/v_proj/o_proj auto-detected per backbone
-5.2	5-eng	Add requirements.txt with pinned versions	-	-	todo	reproducible install
+5.1	5-eng	Fix LoRA target_modules for Qwen-family backbones	-	-	partial	check_lora_targets now fails fast with a clear error on unsupported backbones; q_proj/k_proj/v_proj/o_proj auto-detection still todo
+5.2	5-eng	Add requirements.txt with pinned versions	-	-	partial	requirements.txt added with tested bounds; regenerate exact pins via pip freeze on the run machine
 5.3	5-eng	Add orchestration script (all seeds + summary table)	-	1.2,2.1	todo	one nohup command produces mean+/-std BWT table
 5.4	5-eng	Verify model instruction prefixes vs HF cards	-	-	todo	prefixes correct (wrong prefix silently tanks scores)
 5.5	5-eng	Verify OpenRouter embedding model strings + provider keys	-	-	todo	API_MODELS strings resolve; recheck cost before large corpora
-5.6	5-eng	Make mrr@k respect its cutoff (truncate run to k before recip_rank)	-	-	todo	gold beyond rank k yields 0; defaults already correct
+5.6	5-eng	Make mrr@k respect its cutoff (truncate run to k before recip_rank)	-	-	done	evaluate_metrics now truncates the run to k for mrr@k; gold beyond rank k yields 0
 6.1	6-writing	Evaluation-gaps table: FlowRAG setup vs temporal+federated	-	2.4	todo	motivating table for intro
 6.2	6-writing	Secure senior co-author	-	-	todo	highest-leverage move for A* credibility
 6.3	6-writing	Draft Section 3 problem formulation + R-matrix Figure 1	-	1.6	todo	formal federated continual retrieval definition

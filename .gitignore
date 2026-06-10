@@ -13,6 +13,13 @@ beir_data/
 results_smoke/
 results_smoke4/
 *.npy
+results/states_*.pt
+results/*.json.tmp
+
+# Editor / AI-assistant artifacts
+.cursorindexingignore
+.specstory/
+.claude/
 
 # macOS
 .DS_Store

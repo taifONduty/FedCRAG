@@ -6,10 +6,11 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from sentence_transformers import SentenceTransformer, losses, InputExample
+from sentence_transformers.datasets import NoDuplicatesDataLoader
 from peft import (LoraConfig, TaskType,
                   get_peft_model_state_dict, set_peft_model_state_dict)
 from fedcrag_common import (load_slice_with_train, doc_text, resolve_local,
-                            evaluate_metrics)
+                            evaluate_metrics, check_lora_targets, LORA_TARGETS)
 
 
 def get_adapter_state(model):
@@ -27,6 +28,11 @@ def fedavg(states, weights=None):
     if weights is None:
         weights = [1.0] * len(states)
     total = sum(weights)
+    if total <= 0:
+        print("  WARNING: all FedAvg weights are zero (no client trained?); "
+              "falling back to uniform averaging")
+        weights = [1.0] * len(states)
+        total = float(len(states))
     weights = [w / total for w in weights]
     avg = {}
     for key in states[0]:
@@ -46,39 +52,49 @@ def make_examples(data, q_prefix, d_prefix):
     return ex
 
 
-def new_model(model_path, lora_rank, fp16):
+def new_model(model_name, model_path, lora_rank, fp16):
     model = SentenceTransformer(model_path, trust_remote_code=True)
     if fp16:
         model.half()
+    check_lora_targets(model, model_name)
     cfg = LoraConfig(task_type=TaskType.FEATURE_EXTRACTION,
                      r=lora_rank, lora_alpha=2 * lora_rank, lora_dropout=0.1,
-                     target_modules=["query", "key", "value", "dense"])
+                     target_modules=LORA_TARGETS)
     model.add_adapter(cfg)
     model[0].auto_model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False})
     return model
 
 
-def client_train(global_state, model_path, lora_rank, fp16, data,
-                 q_prefix, d_prefix, epochs, batch_size, lr):
-    model = new_model(model_path, lora_rank, fp16)
+def client_train(model, global_state, data, q_prefix, d_prefix,
+                 epochs, batch_size, lr, name):
     set_adapter_state(model, global_state)
     examples = make_examples(data, q_prefix, d_prefix)
-    if examples and len(examples) >= batch_size:
-        loader = DataLoader(examples, shuffle=True, batch_size=batch_size, drop_last=True)
+    num_steps = 0
+    if not examples:
+        print(f"  WARNING: client '{name}' has 0 training pairs -> "
+              f"NO local training this round (state = incoming global state)")
+    else:
+        if len(examples) < batch_size:
+            bs = len(examples)
+            print(f"  WARNING: client '{name}' has only {len(examples)} train "
+                  f"pairs (< batch_size {batch_size}); shrinking batch_size to {bs}")
+            loader = DataLoader(examples, shuffle=True, batch_size=bs,
+                                drop_last=False)
+        else:
+            # avoids in-batch false negatives when a query has several positives
+            loader = NoDuplicatesDataLoader(examples, batch_size=batch_size)
         loss_fn = losses.MultipleNegativesRankingLoss(model)
         model.fit(train_objectives=[(loader, loss_fn)], epochs=epochs,
                   optimizer_params={"lr": lr},
                   warmup_steps=max(1, int(0.1 * len(loader))),
                   show_progress_bar=False, use_amp=True)
-    state = get_adapter_state(model)
-    del model; torch.cuda.empty_cache()
-    return state
+        num_steps = len(loader) * epochs
+    return get_adapter_state(model), len(examples), num_steps
 
 
-def eval_global(global_state, model_path, lora_rank, fp16, data, slices,
-                q_prefix, d_prefix, metrics, batch_size):
-    model = new_model(model_path, lora_rank, fp16)
+def eval_global(model, global_state, data, slices, q_prefix, d_prefix,
+                metrics, batch_size):
     set_adapter_state(model, global_state)
     scores = {}
     for s in slices:
@@ -97,8 +113,20 @@ def eval_global(global_state, model_path, lora_rank, fp16, data, slices,
                              normalize_embeddings=True, show_progress_bar=False)
         scores[s] = evaluate_metrics(cids, c_emb, qids, q_emb,
                                      data[s]["eval_qrels"], metrics)
-    del model; torch.cuda.empty_cache()
     return scores
+
+
+def print_scores(label, scores, slices, metrics):
+    for s in slices:
+        print(f"  [{label}] {s}: "
+              + " ".join(f"{m}:{scores[s][m]:.4f}" for m in metrics))
+
+
+def dump_json(out, jpath):
+    tmp = jpath + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(out, f, indent=2)
+    os.replace(tmp, jpath)
 
 
 def main():
@@ -113,6 +141,14 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--lora_rank", type=int, default=16)
     ap.add_argument("--weighted", action="store_true")
+    ap.add_argument("--weight_by", choices=["examples", "corpus"], default="examples",
+                    help="FedAvg weighting basis when --weighted: 'examples' = "
+                         "local training-pair count (canonical FedAvg n_k), "
+                         "'corpus' = client corpus size (the original F4 run)")
+    ap.add_argument("--save_states", action="store_true",
+                    help="save per-client + global adapter states each round "
+                         "(needed for mechanism diagnostics, e.g. principal "
+                         "angles between client updates)")
     ap.add_argument("--data_root", default="./beir_data")
     ap.add_argument("--out", default="./results")
     args = ap.parse_args()
@@ -122,34 +158,61 @@ def main():
 
     data = {s: load_slice_with_train(s, args.data_root) for s in args.slices}
     model_path, q_prefix, d_prefix, fp16 = resolve_local(args.model)
-    primary = args.metrics[0]
 
-    init = new_model(model_path, args.lora_rank, fp16)
-    global_state = get_adapter_state(init)
-    del init; torch.cuda.empty_cache()
+    model = new_model(args.model, model_path, args.lora_rank, fp16)
+    global_state = get_adapter_state(model)
 
-    R = {}
-    R["frozen"] = eval_global(global_state, model_path, args.lora_rank, fp16,
-                              data, args.slices, q_prefix, d_prefix,
-                              args.metrics, args.batch_size)
-    print("  [frozen] " + " ".join(f"{s}:{R['frozen'][s][primary]:.4f}" for s in args.slices))
+    tag = "weighted" if args.weighted else "unweighted"
+    model_safe = args.model.replace("/", "_")
+    jpath = os.path.join(args.out,
+                         f"federated_{model_safe}_seed{args.seed}_{tag}.json")
+
+    out = {"seed": args.seed, "slices": args.slices, "model": args.model,
+           "metrics": args.metrics, "num_rounds": args.num_rounds,
+           "weighted": args.weighted,
+           "weight_by": args.weight_by if args.weighted else None,
+           "split_fallback": [s for s in args.slices
+                              if data[s].get("split_fallback")],
+           "args": vars(args), "clients": {}, "R_matrix": {}, "BWT": None}
+    R = out["R_matrix"]
+
+    R["frozen"] = eval_global(model, global_state, data, args.slices,
+                              q_prefix, d_prefix, args.metrics, args.batch_size)
+    print_scores("frozen", R["frozen"], args.slices, args.metrics)
+    dump_json(out, jpath)
 
     for rnd in range(args.num_rounds):
         print(f"  --- round {rnd+1}/{args.num_rounds} ---")
-        states, sizes = [], []
+        states, n_examples, client_stats = [], [], {}
         for s in args.slices:
-            st = client_train(global_state, model_path, args.lora_rank, fp16,
-                              data[s], q_prefix, d_prefix,
-                              args.local_epochs, args.batch_size, args.lr)
+            st, n_ex, n_steps = client_train(model, global_state, data[s],
+                                             q_prefix, d_prefix,
+                                             args.local_epochs,
+                                             args.batch_size, args.lr, name=s)
             states.append(st)
-            sizes.append(len(data[s]["corpus"]))
-        weights = sizes if args.weighted else None
+            n_examples.append(n_ex)
+            client_stats[s] = {"num_examples": n_ex, "num_steps": n_steps}
+        if args.weighted:
+            weights = ([len(data[s]["corpus"]) for s in args.slices]
+                       if args.weight_by == "corpus" else n_examples)
+        else:
+            weights = None
         global_state = fedavg(states, weights=weights)
         label = f"round_{rnd+1}"
-        R[label] = eval_global(global_state, model_path, args.lora_rank, fp16,
-                               data, args.slices, q_prefix, d_prefix,
-                               args.metrics, args.batch_size)
-        print(f"  [{label}] " + " ".join(f"{s}:{R[label][s][primary]:.4f}" for s in args.slices))
+        out["clients"][label] = client_stats
+        if args.save_states:
+            spath = os.path.join(
+                args.out,
+                f"states_{model_safe}_seed{args.seed}_{tag}_round{rnd+1}.pt")
+            torch.save({"clients": dict(zip(args.slices, states)),
+                        "global": global_state}, spath)
+            print(f"  saved adapter states -> {spath}")
+        R[label] = eval_global(model, global_state, data, args.slices,
+                               q_prefix, d_prefix, args.metrics,
+                               args.batch_size)
+        print_scores(label, R[label], args.slices, args.metrics)
+        dump_json(out, jpath)
+        torch.cuda.empty_cache()
 
     bwt = {}
     anchor = "round_1"
@@ -159,12 +222,8 @@ def main():
         bwt[m] = float(np.mean(terms))
         print(f">>> Federated BWT[{m}] (round1->final) = {bwt[m]:+.4f}")
 
-    out = {"seed": args.seed, "slices": args.slices, "model": args.model,
-           "metrics": args.metrics, "num_rounds": args.num_rounds,
-           "weighted": args.weighted, "R_matrix": R, "BWT": bwt}
-    jpath = os.path.join(args.out, f"federated_{args.model.replace('/','_')}_seed{args.seed}.json")
-    with open(jpath, "w") as f:
-        json.dump(out, f, indent=2)
+    out["BWT"] = bwt
+    dump_json(out, jpath)
     print(f"saved {jpath}")
 
 

@@ -1,11 +1,30 @@
 import os
 import json
+import time
 import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer
 from beir import util as beir_util
 from beir.datasets.data_loader import GenericDataLoader
 import pytrec_eval
+
+
+# Attention + FFN/pooler modules on BERT/XLM-R-style backbones ("dense" matches
+# both the FFN and the pooler). Qwen/Mistral-style encoders name these
+# q_proj/k_proj/v_proj/o_proj and are NOT supported by the training scripts.
+LORA_TARGETS = ["query", "key", "value", "dense"]
+
+
+def check_lora_targets(model, model_name, targets=None):
+    targets = targets if targets is not None else LORA_TARGETS
+    names = {n.split(".")[-1] for n, _ in model[0].auto_model.named_modules()}
+    missing = [t for t in targets if t not in names]
+    if missing:
+        raise ValueError(
+            f"LoRA target modules {missing} do not exist in '{model_name}'. "
+            f"This backbone is not BERT/XLM-R-style (Qwen/Mistral encoders use "
+            f"q_proj/k_proj/v_proj/o_proj). Pick a supported model or extend "
+            f"LORA_TARGETS in fedcrag_common.py.")
 
 
 LOCAL_MODELS = {
@@ -72,9 +91,14 @@ def load_slice_with_train(name, data_root):
     url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{name}.zip"
     path = beir_util.download_and_unzip(url, data_root)
     corpus, test_q, test_qrels = GenericDataLoader(path).load(split="test")
+    split_fallback = False
     try:
         _, train_q, train_qrels = GenericDataLoader(path).load(split="train")
     except Exception:
+        split_fallback = True
+        print(f"  WARNING: slice '{name}' has no train split; deterministically "
+              f"halving its test queries (sorted qids) into train/eval. "
+              f"Recorded as split_fallback in the output JSON.")
         qids = sorted(test_qrels.keys())
         half = len(qids) // 2
         tr, ev = set(qids[:half]), set(qids[half:])
@@ -83,7 +107,8 @@ def load_slice_with_train(name, data_root):
         test_q = {q: test_q[q] for q in ev if q in test_q}
         test_qrels = {q: test_qrels[q] for q in ev}
     return {"corpus": corpus, "train_q": train_q, "train_qrels": train_qrels,
-            "eval_q": test_q, "eval_qrels": test_qrels}
+            "eval_q": test_q, "eval_qrels": test_qrels,
+            "split_fallback": split_fallback}
 
 
 def doc_text(d):
@@ -106,26 +131,46 @@ def required_depth(metrics, floor=100):
     return depth
 
 
+def _truncate_run(run, k):
+    return {q: dict(sorted(d.items(), key=lambda kv: -kv[1])[:k])
+            for q, d in run.items()}
+
+
 def evaluate_metrics(cids, c_emb, qids, q_emb, qrels, metrics):
     depth = required_depth(metrics)
     sims = q_emb @ c_emb.T
     topk = np.argsort(-sims, axis=1)[:, :min(depth, sims.shape[1])]
     run = {qids[i]: {cids[j]: float(sims[i, j]) for j in topk[i]}
            for i in range(len(qids))}
-    measures = set()
+    measures, mrr_ks = set(), set()
     for m in metrics:
         base, k = parse_metric(m)
-        if base in ("ndcg_cut", "map_cut", "P", "recall", "success"):
+        if base == "recip_rank":
+            # pytrec_eval's recip_rank has no cutoff; mrr@k is computed
+            # separately on a run truncated to depth k so a gold doc beyond
+            # rank k correctly contributes 0.
+            mrr_ks.add(k)
+        elif base in ("ndcg_cut", "map_cut", "P", "recall", "success"):
             measures.add(f"{base}.{k}")
         else:
             measures.add(base)
-    ev = pytrec_eval.RelevanceEvaluator(qrels, measures)
-    scores = ev.evaluate(run)
+    scores = {}
+    if measures:
+        ev = pytrec_eval.RelevanceEvaluator(qrels, measures)
+        scores = ev.evaluate(run)
+    mrr_scores = {}
+    for k in mrr_ks:
+        ev = pytrec_eval.RelevanceEvaluator(qrels, {"recip_rank"})
+        mrr_scores[k] = ev.evaluate(_truncate_run(run, k))
     out = {}
     for m in metrics:
         base, k = parse_metric(m)
-        key = f"{base}_{k}" if base in ("ndcg_cut", "map_cut", "P", "recall", "success") else base
-        vals = [scores[q][key] for q in scores if key in scores[q]]
+        if base == "recip_rank":
+            src, key = mrr_scores[k], "recip_rank"
+        else:
+            src = scores
+            key = f"{base}_{k}" if base in ("ndcg_cut", "map_cut", "P", "recall", "success") else base
+        vals = [src[q][key] for q in src if key in src[q]]
         out[m] = float(np.mean(vals)) if vals else float("nan")
     return out
 
@@ -139,10 +184,17 @@ def load_local_model(name):
 
 
 def encode_texts(model, texts, prefix, batch_size, cache_path=None):
+    expected_dim = None
+    get_dim = getattr(model, "get_sentence_embedding_dimension", None)
+    if callable(get_dim):
+        expected_dim = get_dim()
     if cache_path and os.path.exists(cache_path):
         emb = np.load(cache_path)
-        if emb.shape[0] == len(texts):
+        if emb.shape[0] == len(texts) and (expected_dim is None
+                                           or emb.shape[1] == expected_dim):
             return emb
+        print(f"  WARNING: stale embedding cache {cache_path} "
+              f"(shape {emb.shape}, expected {len(texts)} x {expected_dim}); re-encoding")
     emb = model.encode([prefix + t for t in texts], batch_size=batch_size,
                        convert_to_numpy=True, normalize_embeddings=True,
                        show_progress_bar=False)
@@ -152,11 +204,14 @@ def encode_texts(model, texts, prefix, batch_size, cache_path=None):
 
 
 class APIEmbedder:
-    def __init__(self, model_key, api_key=None, base_url=None):
+    def __init__(self, model_key, api_key=None, base_url=None,
+                 max_retries=5, max_chars=20000):
         cfg = API_MODELS[model_key]
         self.provider = cfg["provider"]
         self.model = cfg["model"]
         self.dim = cfg["dim"]
+        self.max_retries = max_retries
+        self.max_chars = max_chars
         from openai import OpenAI
         if self.provider == "openrouter":
             self.client = OpenAI(
@@ -173,11 +228,31 @@ class APIEmbedder:
         else:
             raise ValueError(f"unknown provider {self.provider}")
 
+    def _embed_chunk(self, chunk):
+        for attempt in range(self.max_retries):
+            try:
+                return self.client.embeddings.create(model=self.model, input=chunk)
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    raise
+                wait = 2 ** attempt
+                print(f"  API error ({type(e).__name__}: {e}); "
+                      f"retry {attempt + 1}/{self.max_retries - 1} in {wait}s")
+                time.sleep(wait)
+
     def encode(self, texts, batch_size=64, **kwargs):
+        clean, truncated = [], 0
+        for t in texts:
+            if len(t) > self.max_chars:
+                truncated += 1
+                t = t[:self.max_chars]
+            clean.append(t if t.strip() else " ")
+        if truncated:
+            print(f"  WARNING: truncated {truncated}/{len(texts)} inputs "
+                  f"to {self.max_chars} chars for API embedding")
         out = []
-        for i in range(0, len(texts), batch_size):
-            chunk = texts[i:i + batch_size]
-            resp = self.client.embeddings.create(model=self.model, input=chunk)
+        for i in range(0, len(clean), batch_size):
+            resp = self._embed_chunk(clean[i:i + batch_size])
             out.extend([d.embedding for d in resp.data])
         arr = np.array(out, dtype=np.float32)
         norms = np.linalg.norm(arr, axis=1, keepdims=True)

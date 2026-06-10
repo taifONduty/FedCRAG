@@ -1,0 +1,14 @@
+# FedCRAG dependency spec.
+#
+# IMPORTANT: these are the tested *bounds*. For paper-grade reproducibility,
+# regenerate this file on the actual run machine with:
+#     pip freeze > requirements.txt
+# sentence-transformers / peft minor versions change model.fit and
+# adapter-naming behavior, so exact pins from the run environment matter.
+torch>=2.2
+sentence-transformers>=3.0,<4.0
+peft>=0.11
+beir
+pytrec_eval-terrier
+numpy
+openai

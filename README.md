@@ -53,9 +53,11 @@ checkpoint after training through stage `i`. From it:
 | `federated_forgetting.py` | **Federated simulation**: N clients, local LoRA training, FedAvg aggregation over rounds. `--weighted` toggles corpus-size-weighted averaging. The novel-axis experiment. |
 | `README.md` / `task.tsv` | This file / the task tracker. |
 
-**Planned (see `task.tsv`):** the evolving-corpus / federated-temporal environment, the
-FedCRAG method and a FlowRAG baseline, plus an orchestration script and a pinned
-`requirements.txt`.
+`run_all_paper.sh` orchestrates the four paper runs (pilot, controls, federated
+unweighted, federated weighted) with per-run logs in `logs/`.
+
+**Planned (see `task.tsv`):** the evolving-corpus / federated-temporal environment, and
+the FedCRAG method plus a FlowRAG baseline.
 
 ---
 
@@ -63,9 +65,12 @@ FedCRAG method and a FlowRAG baseline, plus an orchestration script and a pinned
 
 ```bash
 conda create -n fedcrag python=3.11 -y && conda activate fedcrag
-pip install "sentence-transformers>=3.0,<4.0" "peft>=0.11" beir \
-    pytrec_eval-terrier numpy torch openai
+pip install -r requirements.txt
 ```
+
+For paper-grade reproducibility, snapshot the exact environment of the machine that
+produced the results: `pip freeze > requirements.txt` (sentence-transformers/peft minor
+versions change `model.fit` and adapter-naming behavior).
 
 Notes:
 - Use `pytrec_eval-terrier` (prebuilt wheel); plain `pytrec_eval` needs compilation.
@@ -131,8 +136,20 @@ method can recover. No gap ⇒ no phenomenon worth fixing.
 ### 4. Federated — *does aggregation make it worse?* (the novel claim)
 ```bash
 python federated_forgetting.py --model bge-m3 --slices nfcorpus fiqa scifact arguana \
-    --num_rounds 5 --seed 42            # add --weighted for size-weighted FedAvg
+    --num_rounds 5 --seed 42            # add --weighted for weighted FedAvg
 ```
+Flags specific to this script:
+- `--weighted` enables weighted FedAvg; `--weight_by examples` (default, canonical
+  FedAvg `n_k` = local training-pair count) or `--weight_by corpus` (corpus size — the
+  weighting the original F4 run used; nonstandard, becomes wrong under query sharding
+  where several clients share one corpus). State which one was used in the paper.
+- `--save_states` saves per-client + global adapter states each round
+  (`states_<model>_seed<seed>_<tag>_round<N>.pt`, a few MB each at LoRA r=16) — required
+  for any mechanism diagnostics (principal angles between client updates,
+  `‖avg(B)avg(A) − avg(BA)‖`). Turn it on for every scaled run you may analyze later.
+- Output goes to `federated_<model>_seed<seed>_<weighted|unweighted>.json`, is rewritten
+  atomically **after every round** (a crash loses at most the current round), and the log
+  prints **all** metrics per round, so trajectories are always recoverable.
 **Expectation (decides the paper's framing):**
 - federated-final **below** centralized-final ⇒ aggregation compounds forgetting → thesis holds.
 - **about equal** ⇒ reframe around "forgetting persists even under federated averaging".
@@ -189,23 +206,31 @@ averaged adapter and overwrite small-corpus clients' representations. The cluste
 
 ## Known limitations / caveats
 
-- **LoRA targets are BERT/XLM-R only.** Training scripts hardcode
-  `target_modules=["query","key","value","dense"]`, which matches bge-*, e5, gte-large,
-  etc. **Qwen-family** retrievers (qwen3, gte-qwen2, e5-mistral, nv-embed) use
-  `q_proj/k_proj/v_proj/o_proj` — they work for zero-shot benchmarking but the pilot/
-  controls/federated scripts will attach LoRA to nothing on those backbones. Tracked in
-  `task.tsv`.
+- **LoRA targets are BERT/XLM-R only.** Training scripts use
+  `target_modules=["query","key","value","dense"]` (note: `"dense"` also matches the FFN
+  and pooler layers, so the LoRA is attention+FFN — state this in the paper), which fits
+  bge-*, e5, gte-large, etc. **Qwen-family** retrievers (qwen3, gte-qwen2, e5-mistral,
+  nv-embed) use `q_proj/k_proj/v_proj/o_proj` — they work for zero-shot benchmarking, and
+  the training scripts now **fail fast with a clear error** (`check_lora_targets`) instead
+  of silently attaching LoRA to nothing. Auto-detection tracked in `task.tsv`.
+- **Slices without a BEIR train split (e.g. ArguAna) fall back** to a deterministic halving
+  of their test queries (sorted qids) into train/eval. The fallback now logs a warning and
+  is recorded as `"split_fallback"` in every result JSON — mention it in the paper's setup,
+  since ArguAna ships no train split.
 - **Federated BWT is anchored at round 1** (`final − round_1`), because in federation every
   client trains every round so there is no single "moment slice i was learned". Compare
   *final scores across regimes*, not raw BWT deltas, when claiming aggregation interference.
-- **`mrr@k` ignores its cutoff.** It maps to pytrec_eval's uncut `recip_rank`, so a gold
-  doc beyond rank `k` still contributes `1/rank` instead of `0`. The default metrics
-  (`ndcg@10`, `recall@10`, `recall@100`) are unaffected and cutoff-correct; only request
-  MRR with this caveat in mind. Tracked in `task.tsv`.
+- **Optimizer state resets every round.** `model.fit` re-creates the optimizer per call, so
+  Adam moments reset at each federated round (standard in FedAvg) and at each sequential
+  stage in the pilot. Say so in the paper.
+- **Determinism is partial.** Seeds pin python/numpy/torch (incl. CUDA RNG), but AMP and
+  cudnn nondeterminism are not pinned — acceptable, but state it in the repro statement.
 - **Verify prefixes & API model strings** against each model's HF card / the OpenRouter
   catalog before trusting absolute numbers — they drift between versions.
-- **No `requirements.txt` / orchestration script yet** — install manually (above); run
-  scripts per-seed by hand until an orchestration script is added.
+
+Fixed (previously listed here): `mrr@k` now respects its cutoff (the run is truncated to
+`k` before `recip_rank`, so a gold doc beyond rank `k` contributes 0), and a
+`requirements.txt` + `run_all_paper.sh` orchestration script exist.
 
 ---
 

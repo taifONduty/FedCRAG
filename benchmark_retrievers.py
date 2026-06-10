@@ -15,18 +15,21 @@ def benchmark_local(model_name, slice_data, slices, metrics, out_dir,
     print(f"=== local: {model_name} ({path}) ===")
     model, q_prefix, d_prefix, fp16 = load_local_model(model_name)
     bs = 8 if fp16 else corpus_batch
+    qbs = 8 if fp16 else query_batch
     cache_dir = os.path.join(out_dir, "emb_cache")
     os.makedirs(cache_dir, exist_ok=True)
     res = {}
+    # cache key includes the resolved checkpoint path so a registry alias
+    # repointed at a different checkpoint cannot silently reuse stale vectors
+    safe = f"{model_name}__{path}".replace("/", "_")
     for s in slices:
         corpus, queries, qrels = slice_data[s]
         cids = list(corpus.keys())
-        safe = model_name.replace("/", "_")
         cache = os.path.join(cache_dir, f"{safe}__{s}.npy")
         c_emb = encode_texts(model, [doc_text(corpus[c]) for c in cids],
                              d_prefix, bs, cache)
         qids = [q for q in queries if q in qrels and qrels[q]]
-        q_emb = encode_texts(model, [queries[q] for q in qids], q_prefix, query_batch)
+        q_emb = encode_texts(model, [queries[q] for q in qids], q_prefix, qbs)
         res[s] = evaluate_metrics(cids, c_emb, qids, q_emb, qrels, metrics)
         print("  " + s + ": " + " ".join(f"{m}:{res[s][m]:.4f}" for m in metrics))
     del model; torch.cuda.empty_cache()
@@ -43,11 +46,17 @@ def benchmark_api(model_name, slice_data, slices, metrics, out_dir,
     for s in slices:
         corpus, queries, qrels = slice_data[s]
         cids = list(corpus.keys())
-        safe = model_name.replace("/", "_")
+        safe = f"{model_name}__{API_MODELS[model_name]['model']}".replace("/", "_")
         cache = os.path.join(cache_dir, f"{safe}__{s}.npy")
+        c_emb = None
         if os.path.exists(cache):
             c_emb = np.load(cache)
-        else:
+            if c_emb.shape[0] != len(cids) or c_emb.shape[1] != embedder.dim:
+                print(f"  WARNING: stale embedding cache {cache} "
+                      f"(shape {c_emb.shape}, expected {len(cids)} x "
+                      f"{embedder.dim}); re-encoding")
+                c_emb = None
+        if c_emb is None:
             c_emb = embedder.encode([doc_text(corpus[c]) for c in cids],
                                     batch_size=corpus_batch)
             np.save(cache, c_emb)

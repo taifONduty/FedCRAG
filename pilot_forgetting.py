@@ -6,9 +6,10 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from sentence_transformers import losses, InputExample
+from sentence_transformers.datasets import NoDuplicatesDataLoader
 from peft import LoraConfig, TaskType
 from fedcrag_common import (load_slice_with_train, doc_text, resolve_local,
-                            evaluate_metrics)
+                            evaluate_metrics, check_lora_targets, LORA_TARGETS)
 from sentence_transformers import SentenceTransformer
 
 
@@ -37,16 +38,24 @@ def train_on_slice(model, data, q_prefix, d_prefix, epochs, batch_size, lr):
                 examples.append(InputExample(
                     texts=[q_prefix + data["train_q"][qid],
                            d_prefix + doc_text(data["corpus"][did])]))
+    if not examples:
+        print("  WARNING: 0 training pairs -> SKIPPING this stage entirely")
+        return {"num_examples": 0, "num_steps": 0}
     if len(examples) < batch_size:
-        print(f"  warning: only {len(examples)} train pairs")
-        if not examples:
-            return
-    loader = DataLoader(examples, shuffle=True, batch_size=batch_size, drop_last=True)
+        bs = len(examples)
+        print(f"  WARNING: only {len(examples)} train pairs "
+              f"(< batch_size {batch_size}); shrinking batch_size to {bs}")
+        loader = DataLoader(examples, shuffle=True, batch_size=bs,
+                            drop_last=False)
+    else:
+        # avoids in-batch false negatives when a query has several positives
+        loader = NoDuplicatesDataLoader(examples, batch_size=batch_size)
     loss = losses.MultipleNegativesRankingLoss(model)
     model.fit(train_objectives=[(loader, loss)], epochs=epochs,
               optimizer_params={"lr": lr},
               warmup_steps=max(1, int(0.1 * len(loader))),
               show_progress_bar=True, use_amp=True)
+    return {"num_examples": len(examples), "num_steps": len(loader) * epochs}
 
 
 def main():
@@ -76,10 +85,11 @@ def main():
     model = SentenceTransformer(path, trust_remote_code=True)
     if fp16:
         model.half()
+    check_lora_targets(model, args.model)
     peft_cfg = LoraConfig(task_type=TaskType.FEATURE_EXTRACTION,
                           r=args.lora_rank, lora_alpha=2 * args.lora_rank,
                           lora_dropout=0.1,
-                          target_modules=["query", "key", "value", "dense"])
+                          target_modules=LORA_TARGETS)
     model.add_adapter(peft_cfg)
     model[0].auto_model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -99,10 +109,12 @@ def main():
     eval_all("frozen")
     torch.cuda.empty_cache()
 
+    train_stats = {}
     for i, s in enumerate(order):
         print(f"=== stage {i}: train on '{s}' ===")
-        train_on_slice(model, data[s], q_prefix, d_prefix,
-                       args.epochs, args.batch_size, args.lr)
+        train_stats[f"stage_{i}_{s}"] = train_on_slice(
+            model, data[s], q_prefix, d_prefix,
+            args.epochs, args.batch_size, args.lr)
         eval_all(f"after_{i}_{s}")
 
     forget = {}
@@ -130,6 +142,9 @@ def main():
 
     out = {"seed": args.seed, "order": order, "slices": args.slices,
            "model": args.model, "metrics": args.metrics,
+           "split_fallback": [s for s in args.slices
+                              if data[s].get("split_fallback")],
+           "args": vars(args), "train_stats": train_stats,
            "R_matrix": R, "forgetting": forget, "BWT": bwt}
     jpath = os.path.join(args.out, f"pilot_{args.model.replace('/','_')}_seed{args.seed}.json")
     with open(jpath, "w") as f:

@@ -6,9 +6,10 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from sentence_transformers import SentenceTransformer, losses, InputExample
+from sentence_transformers.datasets import NoDuplicatesDataLoader
 from peft import LoraConfig, TaskType
 from fedcrag_common import (load_slice_with_train, doc_text, resolve_local,
-                            evaluate_metrics)
+                            evaluate_metrics, check_lora_targets, LORA_TARGETS)
 
 
 def fresh_model(name, lora_rank):
@@ -16,9 +17,10 @@ def fresh_model(name, lora_rank):
     model = SentenceTransformer(path, trust_remote_code=True)
     if fp16:
         model.half()
+    check_lora_targets(model, name)
     cfg = LoraConfig(task_type=TaskType.FEATURE_EXTRACTION,
                      r=lora_rank, lora_alpha=2 * lora_rank, lora_dropout=0.1,
-                     target_modules=["query", "key", "value", "dense"])
+                     target_modules=LORA_TARGETS)
     model.add_adapter(cfg)
     model[0].auto_model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -38,15 +40,24 @@ def make_examples(data, q_prefix, d_prefix):
 
 
 def train(model, examples, epochs, batch_size, lr):
+    if not examples:
+        print("  WARNING: 0 training pairs -> SKIPPING training entirely")
+        return {"num_examples": 0, "num_steps": 0}
     if len(examples) < batch_size:
-        if not examples:
-            return
-    loader = DataLoader(examples, shuffle=True, batch_size=batch_size, drop_last=True)
+        bs = len(examples)
+        print(f"  WARNING: only {len(examples)} train pairs "
+              f"(< batch_size {batch_size}); shrinking batch_size to {bs}")
+        loader = DataLoader(examples, shuffle=True, batch_size=bs,
+                            drop_last=False)
+    else:
+        # avoids in-batch false negatives when a query has several positives
+        loader = NoDuplicatesDataLoader(examples, batch_size=batch_size)
     loss_fn = losses.MultipleNegativesRankingLoss(model)
     model.fit(train_objectives=[(loader, loss_fn)], epochs=epochs,
               optimizer_params={"lr": lr},
               warmup_steps=max(1, int(0.1 * len(loader))),
               show_progress_bar=True, use_amp=True)
+    return {"num_examples": len(examples), "num_steps": len(loader) * epochs}
 
 
 def evaluate(model, data, q_prefix, d_prefix, metrics, batch_size):
@@ -95,10 +106,12 @@ def main():
     del fm; torch.cuda.empty_cache()
 
     print("=== independent (per-slice ceiling) ===")
-    independent = {}
+    independent, train_stats = {}, {}
     for s in args.slices:
         model, qp, dp = fresh_model(args.model, args.lora_rank)
-        train(model, make_examples(data[s], qp, dp), args.epochs, args.batch_size, args.lr)
+        train_stats[f"independent_{s}"] = train(
+            model, make_examples(data[s], qp, dp),
+            args.epochs, args.batch_size, args.lr)
         independent[s] = evaluate(model, data[s], qp, dp, args.metrics, args.batch_size)
         print(f"  {s}: " + " ".join(f"{m}:{independent[s][m]:.4f}" for m in args.metrics))
         del model; torch.cuda.empty_cache()
@@ -108,7 +121,7 @@ def main():
     all_ex = []
     for s in args.slices:
         all_ex.extend(make_examples(data[s], qp, dp))
-    train(model, all_ex, args.epochs, args.batch_size, args.lr)
+    train_stats["joint"] = train(model, all_ex, args.epochs, args.batch_size, args.lr)
     joint = {s: evaluate(model, data[s], qp, dp, args.metrics, args.batch_size)
              for s in args.slices}
     for s in args.slices:
@@ -116,8 +129,11 @@ def main():
     del model; torch.cuda.empty_cache()
 
     out = {"seed": args.seed, "slices": args.slices, "model": args.model,
-           "metrics": args.metrics, "frozen": frozen,
-           "independent": independent, "joint": joint}
+           "metrics": args.metrics,
+           "split_fallback": [s for s in args.slices
+                              if data[s].get("split_fallback")],
+           "args": vars(args), "train_stats": train_stats,
+           "frozen": frozen, "independent": independent, "joint": joint}
     jpath = os.path.join(args.out, f"controls_{args.model.replace('/','_')}_seed{args.seed}.json")
     with open(jpath, "w") as f:
         json.dump(out, f, indent=2)

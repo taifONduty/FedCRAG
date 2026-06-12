@@ -144,10 +144,13 @@ Flags specific to this script:
   weighting the original F4 run used; nonstandard, becomes wrong under query sharding
   where several clients share one corpus). State which one was used in the paper.
 - `--save_states` saves per-client + global adapter states each round
-  (`states_<model>_seed<seed>_<tag>_round<N>.pt`, a few MB each at LoRA r=16) — required
+  (`states_<model>_seed<seed>_<weighted|unweighted>_r<rounds>_round<N>.pt`, a few MB each
+  at LoRA r=16) — required
   for any mechanism diagnostics (principal angles between client updates,
   `‖avg(B)avg(A) − avg(BA)‖`). Turn it on for every scaled run you may analyze later.
-- Output goes to `federated_<model>_seed<seed>_<weighted|unweighted>.json`, is rewritten
+- Output goes to `federated_<model>_seed<seed>_<weighted|unweighted>_r<rounds>.json`
+  (the round count in the name keeps runs with different `--num_rounds` from
+  overwriting each other), is rewritten
   atomically **after every round** (a crash loses at most the current round), and the log
   prints **all** metrics per round, so trajectories are always recoverable.
 **Expectation (decides the paper's framing):**

@@ -162,7 +162,7 @@ def main():
     model = new_model(args.model, model_path, args.lora_rank, fp16)
     global_state = get_adapter_state(model)
 
-    tag = "weighted" if args.weighted else "unweighted"
+    tag = f"{'weighted' if args.weighted else 'unweighted'}_r{args.num_rounds}"
     model_safe = args.model.replace("/", "_")
     jpath = os.path.join(args.out,
                          f"federated_{model_safe}_seed{args.seed}_{tag}.json")

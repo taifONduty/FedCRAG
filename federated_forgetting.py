@@ -139,6 +139,9 @@ def main():
     ap.add_argument("--num_rounds", type=int, default=5)
     ap.add_argument("--local_epochs", type=int, default=1)
     ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--eval_batch_size", type=int, default=128,
+                    help="encode batch for evaluation only (no gradients; "
+                         "affects speed, not results)")
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--lora_rank", type=int, default=16)
     ap.add_argument("--weighted", action="store_true")
@@ -183,7 +186,8 @@ def main():
     R = out["R_matrix"]
 
     R["frozen"] = eval_global(model, global_state, data, args.slices,
-                              q_prefix, d_prefix, args.metrics, args.batch_size)
+                              q_prefix, d_prefix, args.metrics,
+                              args.eval_batch_size)
     print_scores("frozen", R["frozen"], args.slices, args.metrics)
     dump_json(out, jpath)
 
@@ -215,7 +219,7 @@ def main():
             print(f"  saved adapter states -> {spath}")
         R[label] = eval_global(model, global_state, data, args.slices,
                                q_prefix, d_prefix, args.metrics,
-                               args.batch_size)
+                               args.eval_batch_size)
         print_scores(label, R[label], args.slices, args.metrics)
         dump_json(out, jpath)
         torch.cuda.empty_cache()

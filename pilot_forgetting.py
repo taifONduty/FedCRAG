@@ -67,6 +67,9 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--eval_batch_size", type=int, default=128,
+                    help="encode batch for evaluation only (no gradients; "
+                         "affects speed, not results)")
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--lora_rank", type=int, default=16)
     ap.add_argument("--data_root", default="./beir_data")
@@ -102,7 +105,7 @@ def main():
         R[label] = {}
         for s in args.slices:
             R[label][s] = build_eval(model, data[s], q_prefix, d_prefix,
-                                     args.metrics, args.batch_size)
+                                     args.metrics, args.eval_batch_size)
         print(f"  [{label}] " +
               " ".join(f"{s}:{R[label][s][primary]:.4f}" for s in args.slices))
 

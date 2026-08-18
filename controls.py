@@ -84,6 +84,9 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--eval_batch_size", type=int, default=128,
+                    help="encode batch for evaluation only (no gradients; "
+                         "affects speed, not results)")
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--lora_rank", type=int, default=16)
     ap.add_argument("--data_root", default="./beir_data")
@@ -100,7 +103,8 @@ def main():
     fm = SentenceTransformer(path, trust_remote_code=True)
     if fp16:
         fm.half()
-    frozen = {s: evaluate(fm, data[s], q_prefix, d_prefix, args.metrics, args.batch_size)
+    frozen = {s: evaluate(fm, data[s], q_prefix, d_prefix, args.metrics,
+                          args.eval_batch_size)
               for s in args.slices}
     for s in args.slices:
         print(f"  {s}: " + " ".join(f"{m}:{frozen[s][m]:.4f}" for m in args.metrics))
@@ -113,7 +117,8 @@ def main():
         train_stats[f"independent_{s}"] = train(
             model, make_examples(data[s], qp, dp),
             args.epochs, args.batch_size, args.lr)
-        independent[s] = evaluate(model, data[s], qp, dp, args.metrics, args.batch_size)
+        independent[s] = evaluate(model, data[s], qp, dp, args.metrics,
+                                  args.eval_batch_size)
         print(f"  {s}: " + " ".join(f"{m}:{independent[s][m]:.4f}" for m in args.metrics))
         del model; torch.cuda.empty_cache()
 
@@ -123,7 +128,8 @@ def main():
     for s in args.slices:
         all_ex.extend(make_examples(data[s], qp, dp))
     train_stats["joint"] = train(model, all_ex, args.epochs, args.batch_size, args.lr)
-    joint = {s: evaluate(model, data[s], qp, dp, args.metrics, args.batch_size)
+    joint = {s: evaluate(model, data[s], qp, dp, args.metrics,
+                         args.eval_batch_size)
              for s in args.slices}
     for s in args.slices:
         print(f"  {s}: " + " ".join(f"{m}:{joint[s][m]:.4f}" for m in args.metrics))

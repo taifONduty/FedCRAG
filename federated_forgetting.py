@@ -94,6 +94,11 @@ def client_train(model, global_state, data, q_prefix, d_prefix,
         else:
             # avoids in-batch false negatives when a query has several positives
             loader = NoDuplicatesDataLoader(examples, batch_size=batch_size)
+        if max_steps > 0 and epochs != 1:
+            raise ValueError(
+                "max_steps_per_round requires local_epochs=1: sentence-"
+                "transformers silently drops steps_per_epoch when epochs > 1 "
+                "(fit_mixin), which would un-cap the round unnoticed.")
         steps_per_epoch = (min(len(loader), max_steps) if max_steps > 0
                            else len(loader))
         loss_fn = losses.MultipleNegativesRankingLoss(model)

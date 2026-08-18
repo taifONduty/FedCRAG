@@ -10,7 +10,8 @@ from sentence_transformers.datasets import NoDuplicatesDataLoader
 from peft import (LoraConfig, TaskType,
                   get_peft_model_state_dict, set_peft_model_state_dict)
 from fedcrag_common import (load_slice_with_train, doc_text, resolve_local,
-                            evaluate_metrics, check_lora_targets, LORA_TARGETS)
+                            evaluate_metrics, check_lora_targets, LORA_TARGETS,
+                            amp_enabled, get_git_commit)
 
 
 def get_adapter_state(model):
@@ -88,7 +89,7 @@ def client_train(model, global_state, data, q_prefix, d_prefix,
         model.fit(train_objectives=[(loader, loss_fn)], epochs=epochs,
                   optimizer_params={"lr": lr},
                   warmup_steps=max(1, int(0.1 * len(loader))),
-                  show_progress_bar=False, use_amp=True)
+                  show_progress_bar=False, use_amp=amp_enabled())
         num_steps = len(loader) * epochs
     return get_adapter_state(model), len(examples), num_steps
 
@@ -162,7 +163,11 @@ def main():
     model = new_model(args.model, model_path, args.lora_rank, fp16)
     global_state = get_adapter_state(model)
 
-    tag = f"{'weighted' if args.weighted else 'unweighted'}_r{args.num_rounds}"
+    # tag must encode EVERY arm-distinguishing option: the May-2026 pilot lost
+    # its unweighted per-round data to a filename collision, and weighted runs
+    # with different --weight_by would collide again without the basis here.
+    basis = f"weighted-{args.weight_by}" if args.weighted else "unweighted"
+    tag = f"{basis}_r{args.num_rounds}"
     model_safe = args.model.replace("/", "_")
     jpath = os.path.join(args.out,
                          f"federated_{model_safe}_seed{args.seed}_{tag}.json")
@@ -173,6 +178,7 @@ def main():
            "weight_by": args.weight_by if args.weighted else None,
            "split_fallback": [s for s in args.slices
                               if data[s].get("split_fallback")],
+           "commit": get_git_commit(), "use_amp": amp_enabled(),
            "args": vars(args), "clients": {}, "R_matrix": {}, "BWT": None}
     R = out["R_matrix"]
 

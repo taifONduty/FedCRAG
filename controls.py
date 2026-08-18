@@ -9,7 +9,8 @@ from sentence_transformers import SentenceTransformer, losses, InputExample
 from sentence_transformers.datasets import NoDuplicatesDataLoader
 from peft import LoraConfig, TaskType
 from fedcrag_common import (load_slice_with_train, doc_text, resolve_local,
-                            evaluate_metrics, check_lora_targets, LORA_TARGETS)
+                            evaluate_metrics, check_lora_targets, LORA_TARGETS,
+                            amp_enabled, get_git_commit)
 
 
 def fresh_model(name, lora_rank):
@@ -56,7 +57,7 @@ def train(model, examples, epochs, batch_size, lr):
     model.fit(train_objectives=[(loader, loss_fn)], epochs=epochs,
               optimizer_params={"lr": lr},
               warmup_steps=max(1, int(0.1 * len(loader))),
-              show_progress_bar=True, use_amp=True)
+              show_progress_bar=True, use_amp=amp_enabled())
     return {"num_examples": len(examples), "num_steps": len(loader) * epochs}
 
 
@@ -132,6 +133,7 @@ def main():
            "metrics": args.metrics,
            "split_fallback": [s for s in args.slices
                               if data[s].get("split_fallback")],
+           "commit": get_git_commit(), "use_amp": amp_enabled(),
            "args": vars(args), "train_stats": train_stats,
            "frozen": frozen, "independent": independent, "joint": joint}
     jpath = os.path.join(args.out, f"controls_{args.model.replace('/','_')}_seed{args.seed}.json")

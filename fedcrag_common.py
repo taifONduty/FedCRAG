@@ -32,6 +32,15 @@ LOCAL_MODELS = {
     "bge-base":       ("BAAI/bge-base-en-v1.5", "Represent this sentence for searching relevant passages: ", "", False),
     "bge-large":      ("BAAI/bge-large-en-v1.5", "Represent this sentence for searching relevant passages: ", "", False),
     "bge-m3":         ("BAAI/bge-m3", "", "", False),
+    # Plain-BERT encoders with no upstream sentence-transformers config:
+    # SentenceTransformer auto-wraps them with MEAN pooling (a "creating a new
+    # one with mean pooling" warning at load is expected) — which is exactly the
+    # Contriever convention. No query/doc prefixes. Note: this repo scores with
+    # cosine (normalize_embeddings=True everywhere), not the Contriever paper's
+    # unnormalized dot product; the convention is uniform across all backbones
+    # here and required by the unit-norm assumption (A6) of the margin analysis.
+    "contriever":         ("facebook/contriever", "", "", False),
+    "contriever-msmarco": ("facebook/contriever-msmarco", "", "", False),
     "e5-base":        ("intfloat/e5-base-v2", "query: ", "passage: ", False),
     "e5-large":       ("intfloat/e5-large-v2", "query: ", "passage: ", False),
     "me5-large":      ("intfloat/multilingual-e5-large-instruct", "Instruct: Given a query, retrieve relevant passages\nQuery: ", "", False),
@@ -78,6 +87,35 @@ def resolve_local(name):
         path, qp, dp, fp16 = LOCAL_MODELS[name]
         return path, qp, dp, fp16
     return name, "", "", False
+
+
+def amp_enabled():
+    # sentence-transformers' use_amp path (fp16 autocast) requires CUDA;
+    # enabling it on CPU/MPS machines crashes model.fit. Record the returned
+    # value in every result JSON so runs are comparable.
+    return torch.cuda.is_available()
+
+
+def get_git_commit(repo_dir=None):
+    # Best-effort provenance for result JSONs; never raises. The env guards
+    # match the known-good invocation on machines where bare `git` hangs
+    # (system-config/pager issue observed on the student's Mac, 2026-08-18).
+    import subprocess
+    repo_dir = repo_dir or os.path.dirname(os.path.abspath(__file__))
+    env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0",
+               GIT_OPTIONAL_LOCKS="0", GIT_PAGER="cat")
+    try:
+        r = subprocess.run(["git", "-C", repo_dir, "rev-parse", "--short=12", "HEAD"],
+                           capture_output=True, text=True, timeout=10, env=env)
+        commit = r.stdout.strip() if r.returncode == 0 else ""
+        if not commit:
+            return "unknown"
+        r2 = subprocess.run(["git", "-C", repo_dir, "status", "--porcelain"],
+                            capture_output=True, text=True, timeout=10, env=env)
+        dirty = "-dirty" if (r2.returncode == 0 and r2.stdout.strip()) else ""
+        return commit + dirty
+    except Exception:
+        return "unknown"
 
 
 def load_slice(name, data_root):
@@ -136,12 +174,25 @@ def _truncate_run(run, k):
             for q, d in run.items()}
 
 
-def evaluate_metrics(cids, c_emb, qids, q_emb, qrels, metrics):
+def evaluate_metrics(cids, c_emb, qids, q_emb, qrels, metrics,
+                     ignore_identical_ids=True):
+    # ignore_identical_ids: drop candidates whose corpus id equals the query id
+    # (MTEB/BEIR convention; in this repo it only bites on ArguAna, where the
+    # query's own argument document otherwise sits at rank 1 and deflates
+    # absolute nDCG). Enabled by default from 2026-08-18; pre-Contriever pilot
+    # JSONs (May 2026) were computed without it.
     depth = required_depth(metrics)
     sims = q_emb @ c_emb.T
-    topk = np.argsort(-sims, axis=1)[:, :min(depth, sims.shape[1])]
-    run = {qids[i]: {cids[j]: float(sims[i, j]) for j in topk[i]}
-           for i in range(len(qids))}
+    extra = 1 if ignore_identical_ids else 0
+    topk = np.argsort(-sims, axis=1)[:, :min(depth + extra, sims.shape[1])]
+    run = {}
+    for i in range(len(qids)):
+        d = {}
+        for j in topk[i]:
+            if ignore_identical_ids and cids[j] == qids[i]:
+                continue
+            d[cids[j]] = float(sims[i, j])
+        run[qids[i]] = d
     measures, mrr_ks = set(), set()
     for m in metrics:
         base, k = parse_metric(m)

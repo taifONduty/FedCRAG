@@ -53,7 +53,7 @@ def make_examples(data, q_prefix, d_prefix):
     return ex
 
 
-def new_model(model_name, model_path, lora_rank, fp16):
+def new_model(model_name, model_path, lora_rank, fp16, grad_ckpt=True):
     model = SentenceTransformer(model_path, trust_remote_code=True)
     if fp16:
         model.half()
@@ -62,13 +62,22 @@ def new_model(model_name, model_path, lora_rank, fp16):
                      r=lora_rank, lora_alpha=2 * lora_rank, lora_dropout=0.1,
                      target_modules=LORA_TARGETS)
     model.add_adapter(cfg)
-    model[0].auto_model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False})
+    if grad_ckpt:
+        model[0].auto_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
     return model
 
 
 def client_train(model, global_state, data, q_prefix, d_prefix,
-                 epochs, batch_size, lr, name):
+                 epochs, batch_size, lr, name, max_steps=0):
+    # max_steps > 0 caps local optimization steps per round (standard FL
+    # practice: fixed local work per round rather than full epochs). Without
+    # a cap, the largest client (nfcorpus, ~110k pairs) trains a full 3.4k-step
+    # epoch EVERY round, which dominates wall-clock and makes R=15 x 3 seeds
+    # x 3 weightings infeasible on one GPU. Aggregation weights (n_k) still
+    # use example counts, so client size asymmetry is preserved where the
+    # weighting arms need it. Convention introduced 2026-08-18; the May pilot
+    # (bge-m3, R=5) trained full epochs per round.
     set_adapter_state(model, global_state)
     examples = make_examples(data, q_prefix, d_prefix)
     num_steps = 0
@@ -85,12 +94,15 @@ def client_train(model, global_state, data, q_prefix, d_prefix,
         else:
             # avoids in-batch false negatives when a query has several positives
             loader = NoDuplicatesDataLoader(examples, batch_size=batch_size)
+        steps_per_epoch = (min(len(loader), max_steps) if max_steps > 0
+                           else len(loader))
         loss_fn = losses.MultipleNegativesRankingLoss(model)
         model.fit(train_objectives=[(loader, loss_fn)], epochs=epochs,
+                  steps_per_epoch=steps_per_epoch,
                   optimizer_params={"lr": lr},
-                  warmup_steps=max(1, int(0.1 * len(loader))),
+                  warmup_steps=max(1, int(0.1 * steps_per_epoch)),
                   show_progress_bar=False, use_amp=amp_enabled())
-        num_steps = len(loader) * epochs
+        num_steps = steps_per_epoch * epochs
     return get_adapter_state(model), len(examples), num_steps
 
 
@@ -153,6 +165,12 @@ def main():
                     help="save per-client + global adapter states each round "
                          "(needed for mechanism diagnostics, e.g. principal "
                          "angles between client updates)")
+    ap.add_argument("--max_steps_per_round", type=int, default=0,
+                    help="cap on local optimization steps per client per round "
+                         "(0 = full epoch, the May-pilot convention)")
+    ap.add_argument("--no_grad_ckpt", action="store_true",
+                    help="disable gradient checkpointing (faster when VRAM "
+                         "allows; no effect on results)")
     ap.add_argument("--data_root", default="./beir_data")
     ap.add_argument("--out", default="./results")
     args = ap.parse_args()
@@ -163,7 +181,8 @@ def main():
     data = {s: load_slice_with_train(s, args.data_root) for s in args.slices}
     model_path, q_prefix, d_prefix, fp16 = resolve_local(args.model)
 
-    model = new_model(args.model, model_path, args.lora_rank, fp16)
+    model = new_model(args.model, model_path, args.lora_rank, fp16,
+                      grad_ckpt=not args.no_grad_ckpt)
     global_state = get_adapter_state(model)
 
     # tag must encode EVERY arm-distinguishing option: the May-2026 pilot lost
@@ -198,7 +217,8 @@ def main():
             st, n_ex, n_steps = client_train(model, global_state, data[s],
                                              q_prefix, d_prefix,
                                              args.local_epochs,
-                                             args.batch_size, args.lr, name=s)
+                                             args.batch_size, args.lr, name=s,
+                                             max_steps=args.max_steps_per_round)
             states.append(st)
             n_examples.append(n_ex)
             client_stats[s] = {"num_examples": n_ex, "num_steps": n_steps}

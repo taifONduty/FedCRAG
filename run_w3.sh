@@ -86,7 +86,7 @@ rt)
         run "rt-${PRIMARY}-${s}" 1-pilot pilot_forgetting.py "$PRIMARY" "$s" sequential \
             "results/pilot_${PRIMARY}_seed${s}.json" \
             $PYTHON pilot_forgetting.py --model "$PRIMARY" --slices $SLICES \
-            --seed "$s" --batch_size $BS
+            --seed "$s" --batch_size $BS --eval_batch_size 256 --no_grad_ckpt
     done
     ;;
 rs)
@@ -94,16 +94,19 @@ rs)
         run "rs-${PRIMARY}-${s}-uniform" 3-federated federated_forgetting.py "$PRIMARY" "$s" "uniform-${ROUNDS}r" \
             "results/federated_${PRIMARY}_seed${s}_unweighted_r${ROUNDS}.json" \
             $PYTHON federated_forgetting.py --model "$PRIMARY" --slices $SLICES \
-            --seed "$s" --num_rounds $ROUNDS --batch_size $BS --save_states
+            --seed "$s" --num_rounds $ROUNDS --batch_size $BS --save_states \
+            --eval_batch_size 256 --no_grad_ckpt --max_steps_per_round ${STEP_CAP:-500}
         run "rs-${PRIMARY}-${s}-nk" 3-federated federated_forgetting.py "$PRIMARY" "$s" "nk-${ROUNDS}r" \
             "results/federated_${PRIMARY}_seed${s}_weighted-examples_r${ROUNDS}.json" \
             $PYTHON federated_forgetting.py --model "$PRIMARY" --slices $SLICES \
             --seed "$s" --num_rounds $ROUNDS --batch_size $BS --save_states \
+            --eval_batch_size 256 --no_grad_ckpt --max_steps_per_round ${STEP_CAP:-500} \
             --weighted --weight_by examples
         run "rs-${PRIMARY}-${s}-corpus" 3-federated federated_forgetting.py "$PRIMARY" "$s" "corpus-${ROUNDS}r" \
             "results/federated_${PRIMARY}_seed${s}_weighted-corpus_r${ROUNDS}.json" \
             $PYTHON federated_forgetting.py --model "$PRIMARY" --slices $SLICES \
             --seed "$s" --num_rounds $ROUNDS --batch_size $BS --save_states \
+            --eval_batch_size 256 --no_grad_ckpt --max_steps_per_round ${STEP_CAP:-500} \
             --weighted --weight_by corpus
     done
     ;;

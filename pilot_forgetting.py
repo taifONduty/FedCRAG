@@ -72,6 +72,9 @@ def main():
                          "affects speed, not results)")
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--lora_rank", type=int, default=16)
+    ap.add_argument("--no_grad_ckpt", action="store_true",
+                    help="disable gradient checkpointing (faster when VRAM "
+                         "allows; no effect on results)")
     ap.add_argument("--data_root", default="./beir_data")
     ap.add_argument("--out", default="./results")
     args = ap.parse_args()
@@ -95,8 +98,9 @@ def main():
                           lora_dropout=0.1,
                           target_modules=LORA_TARGETS)
     model.add_adapter(peft_cfg)
-    model[0].auto_model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False})
+    if not args.no_grad_ckpt:
+        model[0].auto_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
 
     primary = args.metrics[0]
     R = {}

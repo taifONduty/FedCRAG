@@ -2,6 +2,7 @@ import os
 import json
 import argparse
 import random
+import re
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -23,6 +24,58 @@ def get_adapter_state(model):
 def set_adapter_state(model, state):
     inner = model[0].auto_model
     set_peft_model_state_dict(inner, state)
+
+
+def _module_pairs(state):
+    mods = {}
+    for k, v in state.items():
+        m = re.match(r"(.*)\.lora_(A|B)\.weight$", k)
+        if m:
+            mods.setdefault(m.group(1), {})[m.group(2)] = v.float()
+    return {n: (ab["A"], ab["B"]) for n, ab in mods.items()
+            if "A" in ab and "B" in ab}
+
+
+def _stack_ip(s1, s2):
+    # <sum ci Bi Ai, sum cj Bj Aj>_F via trace identity — r x r ops only,
+    # never materializing d_out x d_in products (mechanism_suite.py convention)
+    tot = 0.0
+    for c1, B1, A1 in s1:
+        for c2, B2, A2 in s2:
+            tot += c1 * c2 * torch.sum((B1.T @ B2) * (A2 @ A1.T)).item()
+    return tot
+
+
+def maxmin_weights(client_states, broadcast_state):
+    # Conflict-aware aggregation weights: cosine Gram of weight-space client
+    # updates (dW_k = B_k A_k - B_g A_g), then the LP
+    #   w* = argmax_{w in simplex} min_i (G w)_i.
+    # Returns None (caller falls back to uniform) if the LP fails.
+    from scipy.optimize import linprog
+    prev = _module_pairs(broadcast_state)
+    stacks = []
+    for st in client_states:
+        mp = _module_pairs(st)
+        stacks.append({n: [(1.0, B, A)]
+                       + ([(-1.0, prev[n][1], prev[n][0])] if n in prev else [])
+                       for n, (A, B) in mp.items()})
+    K = len(stacks)
+    G = np.zeros((K, K))
+    for a in range(K):
+        for b in range(a, K):
+            ip = sum(_stack_ip(stacks[a][n], stacks[b][n])
+                     for n in stacks[a] if n in stacks[b])
+            G[a, b] = G[b, a] = ip
+    norms = np.sqrt(np.clip(np.diag(G), 1e-24, None))
+    Gc = G / np.outer(norms, norms)
+    c = np.zeros(K + 1); c[-1] = -1.0
+    res = linprog(c, A_ub=np.hstack([-Gc, np.ones((K, 1))]), b_ub=np.zeros(K),
+                  A_eq=[[1.0] * K + [0.0]], b_eq=[1.0],
+                  bounds=[(0, 1)] * K + [(None, None)], method="highs")
+    if not res.success:
+        print("  WARNING: max-min LP failed; falling back to uniform weights")
+        return None
+    return [float(x) for x in res.x[:K]]
 
 
 def fedavg(states, weights=None):
@@ -162,10 +215,14 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--lora_rank", type=int, default=16)
     ap.add_argument("--weighted", action="store_true")
-    ap.add_argument("--weight_by", choices=["examples", "corpus"], default="examples",
+    ap.add_argument("--weight_by", choices=["examples", "corpus", "maxmin"],
+                    default="examples",
                     help="FedAvg weighting basis when --weighted: 'examples' = "
                          "local training-pair count (canonical FedAvg n_k), "
-                         "'corpus' = client corpus size (the original F4 run)")
+                         "'corpus' = client corpus size (the original F4 run), "
+                         "'maxmin' = conflict-aware per-round LP over the "
+                         "cosine Gram of client weight-space updates (the "
+                         "FedSpan repair; falls back to uniform on LP failure)")
     ap.add_argument("--save_states", action="store_true",
                     help="save per-client + global adapter states each round "
                          "(needed for mechanism diagnostics, e.g. principal "
@@ -228,10 +285,18 @@ def main():
             n_examples.append(n_ex)
             client_stats[s] = {"num_examples": n_ex, "num_steps": n_steps}
         if args.weighted:
-            weights = ([len(data[s]["corpus"]) for s in args.slices]
-                       if args.weight_by == "corpus" else n_examples)
+            if args.weight_by == "maxmin":
+                weights = maxmin_weights(states, global_state)
+            elif args.weight_by == "corpus":
+                weights = [len(data[s]["corpus"]) for s in args.slices]
+            else:
+                weights = n_examples
         else:
             weights = None
+        if args.weighted and args.weight_by == "maxmin":
+            wn = weights if weights is not None else [1.0 / len(states)] * len(states)
+            out.setdefault("round_weights", {})[f"round_{rnd+1}"] = [round(w, 4) for w in wn]
+            print(f"  maxmin weights: {[round(w, 3) for w in wn]}")
         global_state = fedavg(states, weights=weights)
         label = f"round_{rnd+1}"
         out["clients"][label] = client_stats

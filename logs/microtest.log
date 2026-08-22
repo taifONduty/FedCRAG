@@ -1,0 +1,92 @@
+  0%|          | 0/5183 [00:00<?, ?it/s]100%|██████████| 5183/5183 [00:00<00:00, 106210.07it/s]
+  0%|          | 0/5183 [00:00<?, ?it/s]100%|██████████| 5183/5183 [00:00<00:00, 114219.62it/s]
+  0%|          | 0/8674 [00:00<?, ?it/s]100%|██████████| 8674/8674 [00:00<00:00, 136843.15it/s]
+No sentence-transformers model found with name facebook/contriever. Creating a new one with mean pooling.
+[W818 06:24:19.102761903 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 229507072, total: 23659151360).
+[W818 06:24:21.069453999 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 1437466624, total: 23659151360).
+  WARNING: slice 'arguana' has no train split; deterministically halving its test queries (sorted qids) into train/eval. Recorded as split_fallback in the output JSON.
+Traceback (most recent call last):
+  File "/home/turjo/FedCRAG/federated_forgetting.py", line 266, in <module>
+    main()
+    ~~~~^^
+  File "/home/turjo/FedCRAG/federated_forgetting.py", line 212, in main
+    R["frozen"] = eval_global(model, global_state, data, args.slices,
+                  ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                              q_prefix, d_prefix, args.metrics,
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                              args.eval_batch_size)
+                              ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/turjo/FedCRAG/federated_forgetting.py", line 126, in eval_global
+    c_emb = model.encode([d_prefix + doc_text(corpus[c]) for c in cids],
+                         batch_size=batch_size, convert_to_numpy=True,
+                         normalize_embeddings=True, show_progress_bar=False)
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/sentence_transformers/SentenceTransformer.py", line 623, in encode
+    out_features = self.forward(features, **kwargs)
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/sentence_transformers/SentenceTransformer.py", line 685, in forward
+    return super().forward(input)
+           ~~~~~~~~~~~~~~~^^^^^^^
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/torch/nn/modules/container.py", line 253, in forward
+    input = module(input)
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/sentence_transformers/models/Transformer.py", line 442, in forward
+    output_states = self.auto_model(**trans_features, **kwargs, return_dict=False)
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/transformers/models/bert/modeling_bert.py", line 1000, in forward
+    encoder_outputs = self.encoder(
+        embedding_output,
+    ...<9 lines>...
+        cache_position=cache_position,
+    )
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/transformers/models/bert/modeling_bert.py", line 650, in forward
+    layer_outputs = layer_module(
+        hidden_states,
+    ...<6 lines>...
+        cache_position=cache_position,
+    )
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/transformers/modeling_layers.py", line 94, in __call__
+    return super().__call__(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/transformers/utils/deprecation.py", line 172, in wrapped_func
+    return func(*args, **kwargs)
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/transformers/models/bert/modeling_bert.py", line 588, in forward
+    layer_output = apply_chunking_to_forward(
+        self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output
+    )
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/transformers/pytorch_utils.py", line 257, in apply_chunking_to_forward
+    return forward_fn(*input_tensors)
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/transformers/models/bert/modeling_bert.py", line 596, in feed_forward_chunk
+    intermediate_output = self.intermediate(attention_output)
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/transformers/models/bert/modeling_bert.py", line 512, in forward
+    hidden_states = self.dense(hidden_states)
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/turjo/FedCRAG/.venv/lib/python3.13/site-packages/peft/tuners/lora/layer.py", line 1058, in forward
+    result = result + lora_B(lora_A(dropout(x))) * scaling
+                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1.50 GiB. GPU 0 has a total capacity of 22.03 GiB of which 1.34 GiB is free. Process 2061 has 2.75 GiB memory in use. Process 3899 has 11.23 GiB memory in use. Including non-PyTorch memory, this process has 6.70 GiB memory in use. Of the allocated memory 5.18 GiB is allocated by PyTorch, and 1.30 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)

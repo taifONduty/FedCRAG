@@ -1,0 +1,12 @@
+./beir_data/scifact.zip:   0%|          | 0.00/2.69M [00:00<?, ?iB/s]./beir_data/scifact.zip:   1%|          | 32.0k/2.69M [00:00<00:22, 125kiB/s]./beir_data/scifact.zip:   3%|▎         | 80.0k/2.69M [00:00<00:16, 161kiB/s]./beir_data/scifact.zip:   7%|▋         | 192k/2.69M [00:00<00:09, 286kiB/s] ./beir_data/scifact.zip:  15%|█▍        | 400k/2.69M [00:01<00:04, 493kiB/s]./beir_data/scifact.zip:  30%|███       | 832k/2.69M [00:01<00:02, 920kiB/s]./beir_data/scifact.zip:  61%|██████    | 1.64M/2.69M [00:01<00:00, 1.73MiB/s]./beir_data/scifact.zip: 100%|██████████| 2.69M/2.69M [00:01<00:00, 1.77MiB/s]
+  0%|          | 0/5183 [00:00<?, ?it/s]100%|██████████| 5183/5183 [00:00<00:00, 106361.29it/s]
+  0%|          | 0/5183 [00:00<?, ?it/s]100%|██████████| 5183/5183 [00:00<00:00, 114955.28it/s]
+No sentence-transformers model found with name facebook/contriever. Creating a new one with mean pooling.
+  [frozen] scifact: ndcg@10:0.5714 recall@10:0.7198 recall@100:0.8966
+  --- round 1/1 ---
+Computing widget examples:   0%|          | 0/1 [00:00<?, ?example/s]                                                                     {'train_runtime': 34.6465, 'train_samples_per_second': 26.323, 'train_steps_per_second': 3.29, 'train_loss': 0.25257401717336553, 'epoch': 1.0}
+  [round_1] scifact: ndcg@10:0.6459 recall@10:0.8001 recall@100:0.9477
+>>> Federated BWT[ndcg@10] (round1->final) = +0.0000
+>>> Federated BWT[recall@10] (round1->final) = +0.0000
+>>> Federated BWT[recall@100] (round1->final) = +0.0000
+saved results_smoke/federated_contriever_seed42_unweighted_r1.json

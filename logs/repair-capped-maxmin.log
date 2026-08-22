@@ -1,0 +1,197 @@
+  0%|          | 0/3633 [00:00<?, ?it/s]100%|██████████| 3633/3633 [00:00<00:00, 103216.17it/s]
+  0%|          | 0/3633 [00:00<?, ?it/s]100%|██████████| 3633/3633 [00:00<00:00, 103638.78it/s]
+  0%|          | 0/57638 [00:00<?, ?it/s] 30%|███       | 17324/57638 [00:00<00:00, 173201.35it/s] 60%|██████    | 34645/57638 [00:00<00:00, 169778.10it/s] 90%|████████▉ | 51628/57638 [00:00<00:00, 168102.81it/s]100%|██████████| 57638/57638 [00:00<00:00, 168744.02it/s]
+  0%|          | 0/57638 [00:00<?, ?it/s] 30%|██▉       | 17006/57638 [00:00<00:00, 170046.78it/s] 59%|█████▉    | 34011/57638 [00:00<00:00, 168523.90it/s] 88%|████████▊ | 50865/57638 [00:00<00:00, 167687.30it/s]100%|██████████| 57638/57638 [00:00<00:00, 168288.25it/s]
+  0%|          | 0/5183 [00:00<?, ?it/s]100%|██████████| 5183/5183 [00:00<00:00, 130842.43it/s]
+  0%|          | 0/5183 [00:00<?, ?it/s]100%|██████████| 5183/5183 [00:00<00:00, 129591.34it/s]
+  0%|          | 0/8674 [00:00<?, ?it/s]100%|██████████| 8674/8674 [00:00<00:00, 144567.95it/s]
+No sentence-transformers model found with name facebook/contriever. Creating a new one with mean pooling.
+  WARNING: slice 'arguana' has no train split; deterministically halving its test queries (sorted qids) into train/eval. Recorded as split_fallback in the output JSON.
+  [frozen] nfcorpus: ndcg@10:0.2711 recall@10:0.1385 recall@100:0.2611
+  [frozen] fiqa: ndcg@10:0.1241 recall@10:0.1525 recall@100:0.3634
+  [frozen] scifact: ndcg@10:0.5714 recall@10:0.7198 recall@100:0.8966
+  [frozen] arguana: ndcg@10:0.4542 recall@10:0.7383 recall@100:0.9531
+  --- round 1/15 ---
+Computing widget examples:   0%|          | 0/1 [00:00<?, ?example/s]                                                                     {'loss': 3.147, 'grad_norm': 2.414520740509033, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 402.0233, 'train_samples_per_second': 39.799, 'train_steps_per_second': 1.244, 'train_loss': 3.147038818359375, 'epoch': 0.1447178002894356}
+{'train_runtime': 352.0797, 'train_samples_per_second': 40.173, 'train_steps_per_second': 1.255, 'train_loss': 0.9398064246544471, 'epoch': 1.0}
+{'train_runtime': 23.1176, 'train_samples_per_second': 38.758, 'train_steps_per_second': 1.211, 'train_loss': 0.7509172303336007, 'epoch': 1.0}
+{'train_runtime': 26.1481, 'train_samples_per_second': 25.7, 'train_steps_per_second': 0.803, 'train_loss': 0.4465871992565337, 'epoch': 1.0}
+  maxmin weights: [0.301, 0.23, 0.221, 0.248]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round1.pt
+  [round_1] nfcorpus: ndcg@10:0.3149 recall@10:0.1543 recall@100:0.3012
+  [round_1] fiqa: ndcg@10:0.1680 recall@10:0.2079 recall@100:0.4742
+  [round_1] scifact: ndcg@10:0.6289 recall@10:0.7959 recall@100:0.9410
+  [round_1] arguana: ndcg@10:0.4738 recall@10:0.7639 recall@100:0.9716
+  --- round 2/15 ---
+{'loss': 3.1037, 'grad_norm': 2.520123243331909, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 403.6527, 'train_samples_per_second': 39.638, 'train_steps_per_second': 1.239, 'train_loss': 3.103723388671875, 'epoch': 0.1447178002894356}
+{'train_runtime': 351.9893, 'train_samples_per_second': 40.183, 'train_steps_per_second': 1.256, 'train_loss': 0.8351241582119626, 'epoch': 1.0}
+{'train_runtime': 23.169, 'train_samples_per_second': 38.672, 'train_steps_per_second': 1.209, 'train_loss': 0.5737973621913365, 'epoch': 1.0}
+{'train_runtime': 26.1824, 'train_samples_per_second': 25.666, 'train_steps_per_second': 0.802, 'train_loss': 0.3128949801127116, 'epoch': 1.0}
+  maxmin weights: [0.331, 0.206, 0.247, 0.216]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round2.pt
+  [round_2] nfcorpus: ndcg@10:0.3315 recall@10:0.1614 recall@100:0.3129
+  [round_2] fiqa: ndcg@10:0.2147 recall@10:0.2676 recall@100:0.5626
+  [round_2] scifact: ndcg@10:0.6549 recall@10:0.8101 recall@100:0.9493
+  [round_2] arguana: ndcg@10:0.4850 recall@10:0.7866 recall@100:0.9758
+  --- round 3/15 ---
+{'loss': 3.0714, 'grad_norm': 2.706082820892334, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 403.4292, 'train_samples_per_second': 39.66, 'train_steps_per_second': 1.239, 'train_loss': 3.07140673828125, 'epoch': 0.1447178002894356}
+{'train_runtime': 351.9493, 'train_samples_per_second': 40.188, 'train_steps_per_second': 1.256, 'train_loss': 0.7747444394487062, 'epoch': 1.0}
+{'train_runtime': 23.1518, 'train_samples_per_second': 38.701, 'train_steps_per_second': 1.209, 'train_loss': 0.4906571592603411, 'epoch': 1.0}
+{'train_runtime': 26.1674, 'train_samples_per_second': 25.681, 'train_steps_per_second': 0.803, 'train_loss': 0.2358190899803525, 'epoch': 1.0}
+  maxmin weights: [0.347, 0.184, 0.274, 0.195]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round3.pt
+  [round_3] nfcorpus: ndcg@10:0.3367 recall@10:0.1623 recall@100:0.3167
+  [round_3] fiqa: ndcg@10:0.2421 recall@10:0.3063 recall@100:0.6013
+  [round_3] scifact: ndcg@10:0.6697 recall@10:0.8274 recall@100:0.9583
+  [round_3] arguana: ndcg@10:0.4996 recall@10:0.8108 recall@100:0.9772
+  --- round 4/15 ---
+{'loss': 3.0468, 'grad_norm': 2.9647634029388428, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 403.4988, 'train_samples_per_second': 39.653, 'train_steps_per_second': 1.239, 'train_loss': 3.046819091796875, 'epoch': 0.1447178002894356}
+{'train_runtime': 351.8884, 'train_samples_per_second': 40.195, 'train_steps_per_second': 1.256, 'train_loss': 0.740270416121677, 'epoch': 1.0}
+{'train_runtime': 23.1406, 'train_samples_per_second': 38.72, 'train_steps_per_second': 1.21, 'train_loss': 0.46169751031058176, 'epoch': 1.0}
+{'train_runtime': 26.1784, 'train_samples_per_second': 25.67, 'train_steps_per_second': 0.802, 'train_loss': 0.20437980833507718, 'epoch': 1.0}
+  maxmin weights: [0.357, 0.173, 0.283, 0.187]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round4.pt
+  [round_4] nfcorpus: ndcg@10:0.3350 recall@10:0.1620 recall@100:0.3192
+  [round_4] fiqa: ndcg@10:0.2535 recall@10:0.3196 recall@100:0.6188
+  [round_4] scifact: ndcg@10:0.6688 recall@10:0.8402 recall@100:0.9550
+  [round_4] arguana: ndcg@10:0.5081 recall@10:0.8151 recall@100:0.9829
+  --- round 5/15 ---
+{'loss': 3.0258, 'grad_norm': 3.2708940505981445, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 403.4449, 'train_samples_per_second': 39.658, 'train_steps_per_second': 1.239, 'train_loss': 3.02583154296875, 'epoch': 0.1447178002894356}
+{'train_runtime': 352.0708, 'train_samples_per_second': 40.174, 'train_steps_per_second': 1.255, 'train_loss': 0.7177547955405119, 'epoch': 1.0}
+{'train_runtime': 23.1632, 'train_samples_per_second': 38.682, 'train_steps_per_second': 1.209, 'train_loss': 0.44722158568246023, 'epoch': 1.0}
+{'train_runtime': 26.2202, 'train_samples_per_second': 25.629, 'train_steps_per_second': 0.801, 'train_loss': 0.18910144624255953, 'epoch': 1.0}
+  maxmin weights: [0.361, 0.174, 0.278, 0.186]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round5.pt
+  [round_5] nfcorpus: ndcg@10:0.3368 recall@10:0.1633 recall@100:0.3202
+  [round_5] fiqa: ndcg@10:0.2578 recall@10:0.3228 recall@100:0.6287
+  [round_5] scifact: ndcg@10:0.6699 recall@10:0.8269 recall@100:0.9483
+  [round_5] arguana: ndcg@10:0.5149 recall@10:0.8208 recall@100:0.9872
+  --- round 6/15 ---
+{'loss': 3.0065, 'grad_norm': 3.623136043548584, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 403.9143, 'train_samples_per_second': 39.612, 'train_steps_per_second': 1.238, 'train_loss': 3.00647412109375, 'epoch': 0.1447178002894356}
+{'train_runtime': 352.2768, 'train_samples_per_second': 40.15, 'train_steps_per_second': 1.255, 'train_loss': 0.6993397156037896, 'epoch': 1.0}
+{'train_runtime': 23.1479, 'train_samples_per_second': 38.708, 'train_steps_per_second': 1.21, 'train_loss': 0.4362283774784633, 'epoch': 1.0}
+{'train_runtime': 26.1787, 'train_samples_per_second': 25.67, 'train_steps_per_second': 0.802, 'train_loss': 0.17879920914059594, 'epoch': 1.0}
+  maxmin weights: [0.361, 0.18, 0.272, 0.187]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round6.pt
+  [round_6] nfcorpus: ndcg@10:0.3348 recall@10:0.1595 recall@100:0.3201
+  [round_6] fiqa: ndcg@10:0.2639 recall@10:0.3307 recall@100:0.6332
+  [round_6] scifact: ndcg@10:0.6738 recall@10:0.8302 recall@100:0.9483
+  [round_6] arguana: ndcg@10:0.5231 recall@10:0.8321 recall@100:0.9872
+  --- round 7/15 ---
+{'loss': 2.9879, 'grad_norm': 3.988232135772705, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 402.9121, 'train_samples_per_second': 39.711, 'train_steps_per_second': 1.241, 'train_loss': 2.98792724609375, 'epoch': 0.1447178002894356}
+{'train_runtime': 351.6116, 'train_samples_per_second': 40.226, 'train_steps_per_second': 1.257, 'train_loss': 0.6830422932206236, 'epoch': 1.0}
+{'train_runtime': 23.1268, 'train_samples_per_second': 38.743, 'train_steps_per_second': 1.211, 'train_loss': 0.4254999501364572, 'epoch': 1.0}
+{'train_runtime': 26.1682, 'train_samples_per_second': 25.68, 'train_steps_per_second': 0.803, 'train_loss': 0.17016801379975818, 'epoch': 1.0}
+  maxmin weights: [0.358, 0.185, 0.268, 0.189]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round7.pt
+  [round_7] nfcorpus: ndcg@10:0.3351 recall@10:0.1602 recall@100:0.3223
+  [round_7] fiqa: ndcg@10:0.2671 recall@10:0.3352 recall@100:0.6385
+  [round_7] scifact: ndcg@10:0.6761 recall@10:0.8269 recall@100:0.9483
+  [round_7] arguana: ndcg@10:0.5298 recall@10:0.8350 recall@100:0.9872
+  --- round 8/15 ---
+{'loss': 2.9697, 'grad_norm': 4.38442850112915, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 403.3768, 'train_samples_per_second': 39.665, 'train_steps_per_second': 1.24, 'train_loss': 2.969666748046875, 'epoch': 0.1447178002894356}
+{'train_runtime': 351.6872, 'train_samples_per_second': 40.218, 'train_steps_per_second': 1.257, 'train_loss': 0.668521863842442, 'epoch': 1.0}
+{'train_runtime': 23.1271, 'train_samples_per_second': 38.742, 'train_steps_per_second': 1.211, 'train_loss': 0.4142523833683559, 'epoch': 1.0}
+{'train_runtime': 26.1705, 'train_samples_per_second': 25.678, 'train_steps_per_second': 0.802, 'train_loss': 0.16273983319600424, 'epoch': 1.0}
+  maxmin weights: [0.353, 0.19, 0.264, 0.194]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round8.pt
+  [round_8] nfcorpus: ndcg@10:0.3368 recall@10:0.1616 recall@100:0.3232
+  [round_8] fiqa: ndcg@10:0.2691 recall@10:0.3370 recall@100:0.6457
+  [round_8] scifact: ndcg@10:0.6742 recall@10:0.8258 recall@100:0.9483
+  [round_8] arguana: ndcg@10:0.5333 recall@10:0.8364 recall@100:0.9886
+  --- round 9/15 ---
+{'loss': 2.9518, 'grad_norm': 4.7672014236450195, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 403.4178, 'train_samples_per_second': 39.661, 'train_steps_per_second': 1.239, 'train_loss': 2.951769287109375, 'epoch': 0.1447178002894356}
+{'train_runtime': 351.5636, 'train_samples_per_second': 40.232, 'train_steps_per_second': 1.257, 'train_loss': 0.6544386919806985, 'epoch': 1.0}
+{'train_runtime': 23.1219, 'train_samples_per_second': 38.751, 'train_steps_per_second': 1.211, 'train_loss': 0.4028839383806501, 'epoch': 1.0}
+{'train_runtime': 26.168, 'train_samples_per_second': 25.68, 'train_steps_per_second': 0.803, 'train_loss': 0.1561260563986642, 'epoch': 1.0}
+  maxmin weights: [0.346, 0.195, 0.261, 0.198]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round9.pt
+  [round_9] nfcorpus: ndcg@10:0.3366 recall@10:0.1619 recall@100:0.3266
+  [round_9] fiqa: ndcg@10:0.2729 recall@10:0.3408 recall@100:0.6494
+  [round_9] scifact: ndcg@10:0.6773 recall@10:0.8258 recall@100:0.9517
+  [round_9] arguana: ndcg@10:0.5380 recall@10:0.8421 recall@100:0.9886
+  --- round 10/15 ---
+{'loss': 2.9343, 'grad_norm': 5.147023677825928, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 403.3837, 'train_samples_per_second': 39.664, 'train_steps_per_second': 1.24, 'train_loss': 2.934302978515625, 'epoch': 0.1447178002894356}
+{'train_runtime': 351.9592, 'train_samples_per_second': 40.186, 'train_steps_per_second': 1.256, 'train_loss': 0.641869661495157, 'epoch': 1.0}
+{'train_runtime': 23.1325, 'train_samples_per_second': 38.733, 'train_steps_per_second': 1.21, 'train_loss': 0.3908142362322126, 'epoch': 1.0}
+{'train_runtime': 26.174, 'train_samples_per_second': 25.674, 'train_steps_per_second': 0.802, 'train_loss': 0.15028065726870582, 'epoch': 1.0}
+  maxmin weights: [0.34, 0.198, 0.257, 0.205]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round10.pt
+  [round_10] nfcorpus: ndcg@10:0.3348 recall@10:0.1600 recall@100:0.3257
+  [round_10] fiqa: ndcg@10:0.2769 recall@10:0.3472 recall@100:0.6529
+  [round_10] scifact: ndcg@10:0.6786 recall@10:0.8291 recall@100:0.9550
+  [round_10] arguana: ndcg@10:0.5412 recall@10:0.8464 recall@100:0.9900
+  --- round 11/15 ---
+{'loss': 2.9172, 'grad_norm': 5.547232627868652, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 403.1469, 'train_samples_per_second': 39.688, 'train_steps_per_second': 1.24, 'train_loss': 2.917182861328125, 'epoch': 0.1447178002894356}
+{'train_runtime': 351.5607, 'train_samples_per_second': 40.232, 'train_steps_per_second': 1.257, 'train_loss': 0.6295656920558187, 'epoch': 1.0}
+{'train_runtime': 23.1064, 'train_samples_per_second': 38.777, 'train_steps_per_second': 1.212, 'train_loss': 0.37956152643476215, 'epoch': 1.0}
+{'train_runtime': 26.1849, 'train_samples_per_second': 25.664, 'train_steps_per_second': 0.802, 'train_loss': 0.1451753094082787, 'epoch': 1.0}
+  maxmin weights: [0.333, 0.202, 0.254, 0.211]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round11.pt
+  [round_11] nfcorpus: ndcg@10:0.3371 recall@10:0.1612 recall@100:0.3274
+  [round_11] fiqa: ndcg@10:0.2775 recall@10:0.3480 recall@100:0.6574
+  [round_11] scifact: ndcg@10:0.6801 recall@10:0.8324 recall@100:0.9550
+  [round_11] arguana: ndcg@10:0.5513 recall@10:0.8563 recall@100:0.9900
+  --- round 12/15 ---
+{'loss': 2.9003, 'grad_norm': 5.976900100708008, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 403.4098, 'train_samples_per_second': 39.662, 'train_steps_per_second': 1.239, 'train_loss': 2.900284423828125, 'epoch': 0.1447178002894356}
+{'train_runtime': 351.655, 'train_samples_per_second': 40.221, 'train_steps_per_second': 1.257, 'train_loss': 0.6177532489483173, 'epoch': 1.0}
+{'train_runtime': 23.1268, 'train_samples_per_second': 38.743, 'train_steps_per_second': 1.211, 'train_loss': 0.36811736651829313, 'epoch': 1.0}
+{'train_runtime': 26.1478, 'train_samples_per_second': 25.7, 'train_steps_per_second': 0.803, 'train_loss': 0.1404280321938651, 'epoch': 1.0}
+  maxmin weights: [0.327, 0.205, 0.252, 0.216]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round12.pt
+  [round_12] nfcorpus: ndcg@10:0.3367 recall@10:0.1616 recall@100:0.3281
+  [round_12] fiqa: ndcg@10:0.2790 recall@10:0.3477 recall@100:0.6572
+  [round_12] scifact: ndcg@10:0.6827 recall@10:0.8324 recall@100:0.9617
+  [round_12] arguana: ndcg@10:0.5559 recall@10:0.8592 recall@100:0.9900
+  --- round 13/15 ---
+{'loss': 2.8836, 'grad_norm': 6.394026756286621, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 403.8345, 'train_samples_per_second': 39.62, 'train_steps_per_second': 1.238, 'train_loss': 2.8836376953125, 'epoch': 0.1447178002894356}
+{'train_runtime': 351.6648, 'train_samples_per_second': 40.22, 'train_steps_per_second': 1.257, 'train_loss': 0.6068113853489112, 'epoch': 1.0}
+{'train_runtime': 23.1411, 'train_samples_per_second': 38.719, 'train_steps_per_second': 1.21, 'train_loss': 0.3573331151689802, 'epoch': 1.0}
+{'train_runtime': 26.1611, 'train_samples_per_second': 25.687, 'train_steps_per_second': 0.803, 'train_loss': 0.13614639781770252, 'epoch': 1.0}
+  maxmin weights: [0.321, 0.208, 0.251, 0.22]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round13.pt
+  [round_13] nfcorpus: ndcg@10:0.3338 recall@10:0.1609 recall@100:0.3267
+  [round_13] fiqa: ndcg@10:0.2822 recall@10:0.3517 recall@100:0.6570
+  [round_13] scifact: ndcg@10:0.6847 recall@10:0.8324 recall@100:0.9617
+  [round_13] arguana: ndcg@10:0.5633 recall@10:0.8677 recall@100:0.9900
+  --- round 14/15 ---
+{'loss': 2.8673, 'grad_norm': 6.844876289367676, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 403.048, 'train_samples_per_second': 39.698, 'train_steps_per_second': 1.241, 'train_loss': 2.86726904296875, 'epoch': 0.1447178002894356}
+{'train_runtime': 351.5391, 'train_samples_per_second': 40.234, 'train_steps_per_second': 1.257, 'train_loss': 0.5961144218617435, 'epoch': 1.0}
+{'train_runtime': 23.146, 'train_samples_per_second': 38.711, 'train_steps_per_second': 1.21, 'train_loss': 0.34715121132986887, 'epoch': 1.0}
+{'train_runtime': 26.1715, 'train_samples_per_second': 25.677, 'train_steps_per_second': 0.802, 'train_loss': 0.1322676113673619, 'epoch': 1.0}
+  maxmin weights: [0.315, 0.211, 0.249, 0.225]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round14.pt
+  [round_14] nfcorpus: ndcg@10:0.3352 recall@10:0.1642 recall@100:0.3263
+  [round_14] fiqa: ndcg@10:0.2835 recall@10:0.3554 recall@100:0.6596
+  [round_14] scifact: ndcg@10:0.6862 recall@10:0.8302 recall@100:0.9650
+  [round_14] arguana: ndcg@10:0.5627 recall@10:0.8649 recall@100:0.9900
+  --- round 15/15 ---
+{'loss': 2.8512, 'grad_norm': 7.259746551513672, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 403.2875, 'train_samples_per_second': 39.674, 'train_steps_per_second': 1.24, 'train_loss': 2.851203369140625, 'epoch': 0.1447178002894356}
+{'train_runtime': 351.5003, 'train_samples_per_second': 40.239, 'train_steps_per_second': 1.257, 'train_loss': 0.5859050491816318, 'epoch': 1.0}
+{'train_runtime': 23.1251, 'train_samples_per_second': 38.746, 'train_steps_per_second': 1.211, 'train_loss': 0.33750952993120464, 'epoch': 1.0}
+{'train_runtime': 26.1687, 'train_samples_per_second': 25.68, 'train_steps_per_second': 0.802, 'train_loss': 0.12875138010297502, 'epoch': 1.0}
+  maxmin weights: [0.309, 0.214, 0.248, 0.229]
+  saved adapter states -> results/states_contriever_seed42_weighted-maxmin_r15_round15.pt
+  [round_15] nfcorpus: ndcg@10:0.3355 recall@10:0.1651 recall@100:0.3267
+  [round_15] fiqa: ndcg@10:0.2859 recall@10:0.3611 recall@100:0.6592
+  [round_15] scifact: ndcg@10:0.6837 recall@10:0.8236 recall@100:0.9650
+  [round_15] arguana: ndcg@10:0.5633 recall@10:0.8634 recall@100:0.9900
+>>> Federated BWT[ndcg@10] (round1->final) = +0.0707
+>>> Federated BWT[recall@10] (round1->final) = +0.0728
+>>> Federated BWT[recall@100] (round1->final) = +0.0632
+saved results/federated_contriever_seed42_weighted-maxmin_r15.json

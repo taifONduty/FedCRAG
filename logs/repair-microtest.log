@@ -1,0 +1,23 @@
+  0%|          | 0/5183 [00:00<?, ?it/s]100%|██████████| 5183/5183 [00:00<00:00, 112136.29it/s]
+  0%|          | 0/5183 [00:00<?, ?it/s]100%|██████████| 5183/5183 [00:00<00:00, 105542.82it/s]
+  0%|          | 0/8674 [00:00<?, ?it/s]100%|██████████| 8674/8674 [00:00<00:00, 135179.48it/s]
+No sentence-transformers model found with name facebook/contriever. Creating a new one with mean pooling.
+  WARNING: slice 'arguana' has no train split; deterministically halving its test queries (sorted qids) into train/eval. Recorded as split_fallback in the output JSON.
+  [frozen] scifact: ndcg@10:0.5714 recall@10:0.7198 recall@100:0.8966
+  [frozen] arguana: ndcg@10:0.4542 recall@10:0.7383 recall@100:0.9531
+  --- round 1/2 ---
+Computing widget examples:   0%|          | 0/1 [00:00<?, ?example/s]                                                                     {'train_runtime': 2.6344, 'train_samples_per_second': 30.367, 'train_steps_per_second': 3.796, 'train_loss': 0.2746711015701294, 'epoch': 0.08771929824561403}
+{'train_runtime': 2.1423, 'train_samples_per_second': 37.342, 'train_steps_per_second': 4.668, 'train_loss': 0.10711677074432373, 'epoch': 0.11494252873563218}
+  maxmin weights: [0.5, 0.5]
+  [round_1] scifact: ndcg@10:0.5733 recall@10:0.7232 recall@100:0.9043
+  [round_1] arguana: ndcg@10:0.4571 recall@10:0.7440 recall@100:0.9573
+  --- round 2/2 ---
+{'train_runtime': 1.9925, 'train_samples_per_second': 40.15, 'train_steps_per_second': 5.019, 'train_loss': 0.33436663150787355, 'epoch': 0.08771929824561403}
+{'train_runtime': 2.2321, 'train_samples_per_second': 35.84, 'train_steps_per_second': 4.48, 'train_loss': 0.1714647889137268, 'epoch': 0.11494252873563218}
+  maxmin weights: [0.5, 0.5]
+  [round_2] scifact: ndcg@10:0.5776 recall@10:0.7265 recall@100:0.9043
+  [round_2] arguana: ndcg@10:0.4603 recall@10:0.7468 recall@100:0.9616
+>>> Federated BWT[ndcg@10] (round1->final) = +0.0037
+>>> Federated BWT[recall@10] (round1->final) = +0.0031
+>>> Federated BWT[recall@100] (round1->final) = +0.0021
+saved results_smoke/federated_contriever_seed7_weighted-maxmin_r2.json

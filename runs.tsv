@@ -3,3 +3,14 @@ p42	1-pilot	pilot_forgetting.py	bge-m3	nfcorpus fiqa scifact arguana	42	sequenti
 c42	2-controls	controls.py	bge-m3	nfcorpus fiqa scifact arguana	42	frozen+indep+joint	todo	-	-	results/controls_bge-m3_seed42.json	logs/c42.log
 f42	3-federated	federated_forgetting.py	bge-m3	nfcorpus fiqa scifact arguana	42	unweighted-5r	todo	-	-	results/federated_bge-m3_seed42_unweighted.json	logs/f42.log
 fw42	3-federated	federated_forgetting.py	bge-m3	nfcorpus fiqa scifact arguana	42	weighted-5r	todo	-	-	results/federated_bge-m3_seed42_weighted.json	logs/fw42.log
+smoke-ct	0-smoke	federated_forgetting.py	contriever	nfcorpus fiqa scifact arguana	42	smoke-1r	done	+0.0000	-	results_smoke/federated_contriever_seed42_unweighted_r1.json	logs/smoke-ct.log
+ctl-contriever	2-controls	controls.py	contriever	nfcorpus fiqa scifact arguana	42	frozen+indep+joint	done	-	-	results/controls_contriever_seed42.json	logs/ctl-contriever.log
+ctl-contriever-msmarco	2-controls	controls.py	contriever-msmarco	nfcorpus fiqa scifact arguana	42	frozen+indep+joint	done	-	-	results/controls_contriever-msmarco_seed42.json	logs/ctl-contriever-msmarco.log
+rt-contriever-42	1-pilot	pilot_forgetting.py	contriever	nfcorpus fiqa scifact arguana	42	sequential	done	-0.0245	+0.0482	results/pilot_contriever_seed42.json	logs/rt-contriever-42.log
+rt-contriever-123	1-pilot	pilot_forgetting.py	contriever	nfcorpus fiqa scifact arguana	123	sequential	done	-0.0027	+0.0450	results/pilot_contriever_seed123.json	logs/rt-contriever-123.log
+rt-contriever-2024	1-pilot	pilot_forgetting.py	contriever	nfcorpus fiqa scifact arguana	2024	sequential	done	+0.0006	+0.0225	results/pilot_contriever_seed2024.json	logs/rt-contriever-2024.log
+rs-contriever-42-uniform	3-federated	federated_forgetting.py	contriever	nfcorpus fiqa scifact arguana	42	uniform-15r	done	+0.0731	-	results/federated_contriever_seed42_unweighted_r15.json	logs/rs-contriever-42-uniform.log
+rs-contriever-42-nk	3-federated	federated_forgetting.py	contriever	nfcorpus fiqa scifact arguana	42	nk-15r	done	+0.0183	-	results/federated_contriever_seed42_weighted-examples_r15.json	logs/rs-contriever-42-nk.log
+rs-contriever-42-corpus	3-federated	federated_forgetting.py	contriever	nfcorpus fiqa scifact arguana	42	corpus-15r	done	+0.0248	-	results/federated_contriever_seed42_weighted-corpus_r15.json	logs/rs-contriever-42-corpus.log
+rs-contriever-123-uniform	3-federated	federated_forgetting.py	contriever	nfcorpus fiqa scifact arguana	123	uniform-15r	done	+0.0738	-	results/federated_contriever_seed123_unweighted_r15.json	logs/rs-contriever-123-uniform.log
+rs-contriever-123-nk	3-federated	federated_forgetting.py	contriever	nfcorpus fiqa scifact arguana	123	nk-15r	done	+0.0211	-	results/federated_contriever_seed123_weighted-examples_r15.json	logs/rs-contriever-123-nk.log

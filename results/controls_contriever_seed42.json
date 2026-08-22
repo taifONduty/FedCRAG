@@ -1,0 +1,130 @@
+{
+  "seed": 42,
+  "slices": [
+    "nfcorpus",
+    "fiqa",
+    "scifact",
+    "arguana"
+  ],
+  "model": "contriever",
+  "metrics": [
+    "ndcg@10",
+    "recall@10",
+    "recall@100"
+  ],
+  "split_fallback": [
+    "arguana"
+  ],
+  "commit": "ee1d881f0ae6-dirty",
+  "use_amp": true,
+  "args": {
+    "slices": [
+      "nfcorpus",
+      "fiqa",
+      "scifact",
+      "arguana"
+    ],
+    "model": "contriever",
+    "metrics": [
+      "ndcg@10",
+      "recall@10",
+      "recall@100"
+    ],
+    "seed": 42,
+    "epochs": 1,
+    "batch_size": 32,
+    "eval_batch_size": 128,
+    "lr": 2e-05,
+    "lora_rank": 16,
+    "data_root": "./beir_data",
+    "out": "./results"
+  },
+  "train_stats": {
+    "independent_nfcorpus": {
+      "num_examples": 110575,
+      "num_steps": 3455
+    },
+    "independent_fiqa": {
+      "num_examples": 14166,
+      "num_steps": 442
+    },
+    "independent_scifact": {
+      "num_examples": 919,
+      "num_steps": 28
+    },
+    "independent_arguana": {
+      "num_examples": 701,
+      "num_steps": 21
+    },
+    "joint": {
+      "num_examples": 126361,
+      "num_steps": 3948
+    }
+  },
+  "frozen": {
+    "nfcorpus": {
+      "ndcg@10": 0.27105249552416816,
+      "recall@10": 0.13854626767588468,
+      "recall@100": 0.2611133300387433
+    },
+    "fiqa": {
+      "ndcg@10": 0.12409525195120148,
+      "recall@10": 0.15254269478806515,
+      "recall@100": 0.36338680181272776
+    },
+    "scifact": {
+      "ndcg@10": 0.5713760531753794,
+      "recall@10": 0.7198333333333333,
+      "recall@100": 0.8965555555555557
+    },
+    "arguana": {
+      "ndcg@10": 0.4541624510847163,
+      "recall@10": 0.7382645803698435,
+      "recall@100": 0.9530583214793741
+    }
+  },
+  "independent": {
+    "nfcorpus": {
+      "ndcg@10": 0.32199903518085476,
+      "recall@10": 0.15070387525815684,
+      "recall@100": 0.3424689476585622
+    },
+    "fiqa": {
+      "ndcg@10": 0.2608555915563444,
+      "recall@10": 0.3268456680493717,
+      "recall@100": 0.6278047141473068
+    },
+    "scifact": {
+      "ndcg@10": 0.5985338807882998,
+      "recall@10": 0.7609444444444444,
+      "recall@100": 0.9276666666666668
+    },
+    "arguana": {
+      "ndcg@10": 0.4667164404511787,
+      "recall@10": 0.7553342816500711,
+      "recall@100": 0.968705547652916
+    }
+  },
+  "joint": {
+    "nfcorpus": {
+      "ndcg@10": 0.3281097163320053,
+      "recall@10": 0.15725230679127772,
+      "recall@100": 0.34111620654669556
+    },
+    "fiqa": {
+      "ndcg@10": 0.22880314439357294,
+      "recall@10": 0.2831808280882355,
+      "recall@100": 0.5952122722956056
+    },
+    "scifact": {
+      "ndcg@10": 0.6291354317475751,
+      "recall@10": 0.7991111111111111,
+      "recall@100": 0.93
+    },
+    "arguana": {
+      "ndcg@10": 0.5020721570747666,
+      "recall@10": 0.8065433854907539,
+      "recall@100": 0.9800853485064012
+    }
+  }
+}

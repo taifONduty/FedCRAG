@@ -1,0 +1,205 @@
+  0%|          | 0/3633 [00:00<?, ?it/s]100%|██████████| 3633/3633 [00:00<00:00, 102761.64it/s]
+  0%|          | 0/3633 [00:00<?, ?it/s]100%|██████████| 3633/3633 [00:00<00:00, 96176.44it/s]
+  0%|          | 0/57638 [00:00<?, ?it/s] 31%|███       | 17822/57638 [00:00<00:00, 178205.72it/s] 62%|██████▏   | 35643/57638 [00:00<00:00, 172338.17it/s] 92%|█████████▏| 52891/57638 [00:00<00:00, 170149.59it/s]100%|██████████| 57638/57638 [00:00<00:00, 171252.35it/s]
+  0%|          | 0/57638 [00:00<?, ?it/s] 30%|██▉       | 17128/57638 [00:00<00:00, 171268.32it/s] 59%|█████▉    | 34255/57638 [00:00<00:00, 170565.42it/s] 89%|████████▉ | 51312/57638 [00:00<00:00, 169503.20it/s]100%|██████████| 57638/57638 [00:00<00:00, 170003.64it/s]
+  0%|          | 0/5183 [00:00<?, ?it/s]100%|██████████| 5183/5183 [00:00<00:00, 132233.64it/s]
+  0%|          | 0/5183 [00:00<?, ?it/s]100%|██████████| 5183/5183 [00:00<00:00, 131581.33it/s]
+  0%|          | 0/8674 [00:00<?, ?it/s]100%|██████████| 8674/8674 [00:00<00:00, 147635.58it/s]
+No sentence-transformers model found with name facebook/contriever. Creating a new one with mean pooling.
+  WARNING: slice 'arguana' has no train split; deterministically halving its test queries (sorted qids) into train/eval. Recorded as split_fallback in the output JSON.
+  [frozen] nfcorpus: ndcg@10:0.2711 recall@10:0.1385 recall@100:0.2611
+  [frozen] fiqa: ndcg@10:0.1241 recall@10:0.1525 recall@100:0.3634
+  [frozen] scifact: ndcg@10:0.5714 recall@10:0.7198 recall@100:0.8966
+  [frozen] arguana: ndcg@10:0.4542 recall@10:0.7383 recall@100:0.9531
+  --- round 1/15 ---
+Computing widget examples:   0%|          | 0/1 [00:00<?, ?example/s]                                                                     [W820 04:03:00.588227169 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+[W820 04:22:30.942560447 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+[W820 04:42:02.600695061 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+[W820 05:01:33.097781319 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+[W820 05:21:05.359449512 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+[W820 05:40:36.737850706 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+[W820 06:00:08.409889528 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+{'loss': 3.1593, 'grad_norm': 2.1982619762420654, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 390.3472, 'train_samples_per_second': 40.989, 'train_steps_per_second': 1.281, 'train_loss': 3.15929736328125, 'epoch': 0.1447178002894356}
+{'train_runtime': 343.5409, 'train_samples_per_second': 41.171, 'train_steps_per_second': 1.287, 'train_loss': 0.9383886000689339, 'epoch': 1.0}
+{'train_runtime': 22.2457, 'train_samples_per_second': 40.277, 'train_steps_per_second': 1.259, 'train_loss': 0.7496217318943569, 'epoch': 1.0}
+{'train_runtime': 25.3469, 'train_samples_per_second': 26.512, 'train_steps_per_second': 0.829, 'train_loss': 0.4491069884527297, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round1.pt
+  [round_1] nfcorpus: ndcg@10:0.3284 recall@10:0.1609 recall@100:0.3083
+  [round_1] fiqa: ndcg@10:0.2433 recall@10:0.3039 recall@100:0.6132
+  [round_1] scifact: ndcg@10:0.6530 recall@10:0.8151 recall@100:0.9510
+  [round_1] arguana: ndcg@10:0.5050 recall@10:0.8137 recall@100:0.9787
+  --- round 2/15 ---
+{'loss': 3.1294, 'grad_norm': 2.253173828125, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 392.115, 'train_samples_per_second': 40.804, 'train_steps_per_second': 1.275, 'train_loss': 3.1294052734375, 'epoch': 0.1447178002894356}
+{'train_runtime': 343.7245, 'train_samples_per_second': 41.149, 'train_steps_per_second': 1.286, 'train_loss': 0.735261045430041, 'epoch': 1.0}
+{'train_runtime': 22.3249, 'train_samples_per_second': 40.135, 'train_steps_per_second': 1.254, 'train_loss': 0.46969785009111675, 'epoch': 1.0}
+{'train_runtime': 25.3875, 'train_samples_per_second': 26.47, 'train_steps_per_second': 0.827, 'train_loss': 0.20232377733503068, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round2.pt
+  [round_2] nfcorpus: ndcg@10:0.3327 recall@10:0.1617 recall@100:0.3132
+  [round_2] fiqa: ndcg@10:0.2764 recall@10:0.3466 recall@100:0.6407
+  [round_2] scifact: ndcg@10:0.6691 recall@10:0.8278 recall@100:0.9460
+  [round_2] arguana: ndcg@10:0.5322 recall@10:0.8492 recall@100:0.9886
+  --- round 3/15 ---
+{'loss': 3.1179, 'grad_norm': 2.4232277870178223, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 392.8473, 'train_samples_per_second': 40.728, 'train_steps_per_second': 1.273, 'train_loss': 3.117899658203125, 'epoch': 0.1447178002894356}
+{'train_runtime': 343.6839, 'train_samples_per_second': 41.154, 'train_steps_per_second': 1.286, 'train_loss': 0.6710905877713165, 'epoch': 1.0}
+{'train_runtime': 22.2858, 'train_samples_per_second': 40.205, 'train_steps_per_second': 1.256, 'train_loss': 0.42859057017735075, 'epoch': 1.0}
+{'train_runtime': 25.3888, 'train_samples_per_second': 26.468, 'train_steps_per_second': 0.827, 'train_loss': 0.16468750862848192, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round3.pt
+  [round_3] nfcorpus: ndcg@10:0.3324 recall@10:0.1621 recall@100:0.3178
+  [round_3] fiqa: ndcg@10:0.2903 recall@10:0.3669 recall@100:0.6568
+  [round_3] scifact: ndcg@10:0.6681 recall@10:0.8244 recall@100:0.9467
+  [round_3] arguana: ndcg@10:0.5406 recall@10:0.8506 recall@100:0.9886
+  --- round 4/15 ---
+{'loss': 3.1107, 'grad_norm': 2.6213202476501465, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 392.6159, 'train_samples_per_second': 40.752, 'train_steps_per_second': 1.274, 'train_loss': 3.110685302734375, 'epoch': 0.1447178002894356}
+{'train_runtime': 343.7946, 'train_samples_per_second': 41.141, 'train_steps_per_second': 1.286, 'train_loss': 0.6293551760021917, 'epoch': 1.0}
+{'train_runtime': 22.2572, 'train_samples_per_second': 40.257, 'train_steps_per_second': 1.258, 'train_loss': 0.41673292432512554, 'epoch': 1.0}
+{'train_runtime': 25.4044, 'train_samples_per_second': 26.452, 'train_steps_per_second': 0.827, 'train_loss': 0.1541548456464495, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round4.pt
+  [round_4] nfcorpus: ndcg@10:0.3322 recall@10:0.1615 recall@100:0.3153
+  [round_4] fiqa: ndcg@10:0.2944 recall@10:0.3660 recall@100:0.6642
+  [round_4] scifact: ndcg@10:0.6723 recall@10:0.8244 recall@100:0.9467
+  [round_4] arguana: ndcg@10:0.5472 recall@10:0.8506 recall@100:0.9886
+  --- round 5/15 ---
+{'loss': 3.1055, 'grad_norm': 2.830580234527588, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 392.4906, 'train_samples_per_second': 40.765, 'train_steps_per_second': 1.274, 'train_loss': 3.105470458984375, 'epoch': 0.1447178002894356}
+{'train_runtime': 343.811, 'train_samples_per_second': 41.139, 'train_steps_per_second': 1.286, 'train_loss': 0.594448452082155, 'epoch': 1.0}
+{'train_runtime': 22.2776, 'train_samples_per_second': 40.22, 'train_steps_per_second': 1.257, 'train_loss': 0.409017699105399, 'epoch': 1.0}
+{'train_runtime': 25.3793, 'train_samples_per_second': 26.478, 'train_steps_per_second': 0.827, 'train_loss': 0.14871110234941756, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round5.pt
+  [round_5] nfcorpus: ndcg@10:0.3304 recall@10:0.1612 recall@100:0.3181
+  [round_5] fiqa: ndcg@10:0.2958 recall@10:0.3671 recall@100:0.6588
+  [round_5] scifact: ndcg@10:0.6724 recall@10:0.8211 recall@100:0.9483
+  [round_5] arguana: ndcg@10:0.5553 recall@10:0.8578 recall@100:0.9872
+  --- round 6/15 ---
+{'loss': 3.1011, 'grad_norm': 3.029980182647705, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 392.5869, 'train_samples_per_second': 40.755, 'train_steps_per_second': 1.274, 'train_loss': 3.10107470703125, 'epoch': 0.1447178002894356}
+{'train_runtime': 343.7972, 'train_samples_per_second': 41.141, 'train_steps_per_second': 1.286, 'train_loss': 0.5631104551289416, 'epoch': 1.0}
+{'train_runtime': 22.2804, 'train_samples_per_second': 40.215, 'train_steps_per_second': 1.257, 'train_loss': 0.40258240699768066, 'epoch': 1.0}
+{'train_runtime': 25.3875, 'train_samples_per_second': 26.47, 'train_steps_per_second': 0.827, 'train_loss': 0.14487300600324357, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round6.pt
+  [round_6] nfcorpus: ndcg@10:0.3305 recall@10:0.1609 recall@100:0.3220
+  [round_6] fiqa: ndcg@10:0.2981 recall@10:0.3671 recall@100:0.6605
+  [round_6] scifact: ndcg@10:0.6714 recall@10:0.8161 recall@100:0.9517
+  [round_6] arguana: ndcg@10:0.5550 recall@10:0.8578 recall@100:0.9886
+  --- round 7/15 ---
+{'loss': 3.097, 'grad_norm': 3.245368003845215, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 392.713, 'train_samples_per_second': 40.742, 'train_steps_per_second': 1.273, 'train_loss': 3.097033203125, 'epoch': 0.1447178002894356}
+{'train_runtime': 343.9014, 'train_samples_per_second': 41.128, 'train_steps_per_second': 1.285, 'train_loss': 0.5340020020083605, 'epoch': 1.0}
+{'train_runtime': 22.2943, 'train_samples_per_second': 40.19, 'train_steps_per_second': 1.256, 'train_loss': 0.39721805708748953, 'epoch': 1.0}
+{'train_runtime': 25.3905, 'train_samples_per_second': 26.467, 'train_steps_per_second': 0.827, 'train_loss': 0.14161998885018484, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round7.pt
+  [round_7] nfcorpus: ndcg@10:0.3312 recall@10:0.1618 recall@100:0.3217
+  [round_7] fiqa: ndcg@10:0.3020 recall@10:0.3719 recall@100:0.6611
+  [round_7] scifact: ndcg@10:0.6684 recall@10:0.8141 recall@100:0.9517
+  [round_7] arguana: ndcg@10:0.5552 recall@10:0.8563 recall@100:0.9886
+  --- round 8/15 ---
+{'loss': 3.0936, 'grad_norm': 3.457566022872925, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 392.7492, 'train_samples_per_second': 40.738, 'train_steps_per_second': 1.273, 'train_loss': 3.09359814453125, 'epoch': 0.1447178002894356}
+{'train_runtime': 343.9045, 'train_samples_per_second': 41.128, 'train_steps_per_second': 1.285, 'train_loss': 0.5066627053653493, 'epoch': 1.0}
+{'train_runtime': 22.2903, 'train_samples_per_second': 40.197, 'train_steps_per_second': 1.256, 'train_loss': 0.3929791109902518, 'epoch': 1.0}[W820 06:19:39.274811919 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+[W820 06:39:11.989096379 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+[W820 06:58:43.780179466 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+[W820 07:18:15.856075807 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+[W820 07:37:47.501823032 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+[W820 07:57:18.204146854 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+[W820 08:16:50.758494520 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+[W820 08:36:22.728539312 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1610612736 bytes (free: 785514496, total: 23659151360).
+
+{'train_runtime': 25.4101, 'train_samples_per_second': 26.446, 'train_steps_per_second': 0.826, 'train_loss': 0.13890417416890463, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round8.pt
+  [round_8] nfcorpus: ndcg@10:0.3285 recall@10:0.1614 recall@100:0.3228
+  [round_8] fiqa: ndcg@10:0.3009 recall@10:0.3686 recall@100:0.6635
+  [round_8] scifact: ndcg@10:0.6669 recall@10:0.8141 recall@100:0.9483
+  [round_8] arguana: ndcg@10:0.5562 recall@10:0.8578 recall@100:0.9900
+  --- round 9/15 ---
+{'loss': 3.0903, 'grad_norm': 3.697681188583374, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 392.6765, 'train_samples_per_second': 40.746, 'train_steps_per_second': 1.273, 'train_loss': 3.09034130859375, 'epoch': 0.1447178002894356}
+{'train_runtime': 343.8778, 'train_samples_per_second': 41.131, 'train_steps_per_second': 1.285, 'train_loss': 0.48082857434026793, 'epoch': 1.0}
+{'train_runtime': 22.3031, 'train_samples_per_second': 40.174, 'train_steps_per_second': 1.255, 'train_loss': 0.38930630683898926, 'epoch': 1.0}
+{'train_runtime': 25.3966, 'train_samples_per_second': 26.46, 'train_steps_per_second': 0.827, 'train_loss': 0.13654195694696336, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round9.pt
+  [round_9] nfcorpus: ndcg@10:0.3270 recall@10:0.1598 recall@100:0.3202
+  [round_9] fiqa: ndcg@10:0.3023 recall@10:0.3707 recall@100:0.6617
+  [round_9] scifact: ndcg@10:0.6648 recall@10:0.8208 recall@100:0.9483
+  [round_9] arguana: ndcg@10:0.5547 recall@10:0.8549 recall@100:0.9872
+  --- round 10/15 ---
+{'loss': 3.0874, 'grad_norm': 4.02542781829834, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 392.6976, 'train_samples_per_second': 40.744, 'train_steps_per_second': 1.273, 'train_loss': 3.087449951171875, 'epoch': 0.1447178002894356}
+{'train_runtime': 343.9714, 'train_samples_per_second': 41.12, 'train_steps_per_second': 1.285, 'train_loss': 0.45638703221109655, 'epoch': 1.0}
+{'train_runtime': 22.2763, 'train_samples_per_second': 40.222, 'train_steps_per_second': 1.257, 'train_loss': 0.386359623500279, 'epoch': 1.0}
+{'train_runtime': 25.3903, 'train_samples_per_second': 26.467, 'train_steps_per_second': 0.827, 'train_loss': 0.13442497026352657, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round10.pt
+  [round_10] nfcorpus: ndcg@10:0.3275 recall@10:0.1600 recall@100:0.3175
+  [round_10] fiqa: ndcg@10:0.3027 recall@10:0.3725 recall@100:0.6639
+  [round_10] scifact: ndcg@10:0.6633 recall@10:0.8114 recall@100:0.9483
+  [round_10] arguana: ndcg@10:0.5559 recall@10:0.8578 recall@100:0.9872
+  --- round 11/15 ---
+{'loss': 3.0849, 'grad_norm': 4.165505886077881, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 392.7294, 'train_samples_per_second': 40.741, 'train_steps_per_second': 1.273, 'train_loss': 3.084878173828125, 'epoch': 0.1447178002894356}
+{'train_runtime': 344.0964, 'train_samples_per_second': 41.105, 'train_steps_per_second': 1.285, 'train_loss': 0.4331961929528422, 'epoch': 1.0}
+{'train_runtime': 22.2983, 'train_samples_per_second': 40.182, 'train_steps_per_second': 1.256, 'train_loss': 0.3843026501791818, 'epoch': 1.0}
+{'train_runtime': 25.4158, 'train_samples_per_second': 26.44, 'train_steps_per_second': 0.826, 'train_loss': 0.13266155833289736, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round11.pt
+  [round_11] nfcorpus: ndcg@10:0.3259 recall@10:0.1591 recall@100:0.3177
+  [round_11] fiqa: ndcg@10:0.3031 recall@10:0.3743 recall@100:0.6623
+  [round_11] scifact: ndcg@10:0.6578 recall@10:0.8081 recall@100:0.9467
+  [round_11] arguana: ndcg@10:0.5562 recall@10:0.8578 recall@100:0.9872
+  --- round 12/15 ---
+{'loss': 3.0824, 'grad_norm': 4.3898725509643555, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 392.6946, 'train_samples_per_second': 40.744, 'train_steps_per_second': 1.273, 'train_loss': 3.0824384765625, 'epoch': 0.1447178002894356}
+{'train_runtime': 343.8268, 'train_samples_per_second': 41.137, 'train_steps_per_second': 1.286, 'train_loss': 0.41137988750751203, 'epoch': 1.0}
+{'train_runtime': 22.2785, 'train_samples_per_second': 40.218, 'train_steps_per_second': 1.257, 'train_loss': 0.3830930164882115, 'epoch': 1.0}
+{'train_runtime': 25.385, 'train_samples_per_second': 26.472, 'train_steps_per_second': 0.827, 'train_loss': 0.13131886436825707, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round12.pt
+  [round_12] nfcorpus: ndcg@10:0.3251 recall@10:0.1587 recall@100:0.3159
+  [round_12] fiqa: ndcg@10:0.3041 recall@10:0.3771 recall@100:0.6581
+  [round_12] scifact: ndcg@10:0.6556 recall@10:0.8048 recall@100:0.9500
+  [round_12] arguana: ndcg@10:0.5565 recall@10:0.8535 recall@100:0.9872
+  --- round 13/15 ---
+{'loss': 3.0802, 'grad_norm': 4.627817630767822, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 392.6675, 'train_samples_per_second': 40.747, 'train_steps_per_second': 1.273, 'train_loss': 3.08022216796875, 'epoch': 0.1447178002894356}
+{'train_runtime': 343.7884, 'train_samples_per_second': 41.142, 'train_steps_per_second': 1.286, 'train_loss': 0.39103104949536904, 'epoch': 1.0}
+{'train_runtime': 22.2756, 'train_samples_per_second': 40.223, 'train_steps_per_second': 1.257, 'train_loss': 0.38236253602164133, 'epoch': 1.0}
+{'train_runtime': 25.4024, 'train_samples_per_second': 26.454, 'train_steps_per_second': 0.827, 'train_loss': 0.1299588680267334, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round13.pt
+  [round_13] nfcorpus: ndcg@10:0.3233 recall@10:0.1547 recall@100:0.3155
+  [round_13] fiqa: ndcg@10:0.3048 recall@10:0.3773 recall@100:0.6598
+  [round_13] scifact: ndcg@10:0.6546 recall@10:0.8048 recall@100:0.9500
+  [round_13] arguana: ndcg@10:0.5559 recall@10:0.8506 recall@100:0.9872
+  --- round 14/15 ---
+{'loss': 3.0782, 'grad_norm': 4.835249423980713, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 392.7149, 'train_samples_per_second': 40.742, 'train_steps_per_second': 1.273, 'train_loss': 3.078166748046875, 'epoch': 0.1447178002894356}
+{'train_runtime': 343.7436, 'train_samples_per_second': 41.147, 'train_steps_per_second': 1.286, 'train_loss': 0.37218689379109515, 'epoch': 1.0}
+{'train_runtime': 22.2992, 'train_samples_per_second': 40.181, 'train_steps_per_second': 1.256, 'train_loss': 0.3821765014103481, 'epoch': 1.0}
+{'train_runtime': 25.3736, 'train_samples_per_second': 26.484, 'train_steps_per_second': 0.828, 'train_loss': 0.1288415136791411, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round14.pt
+  [round_14] nfcorpus: ndcg@10:0.3215 recall@10:0.1545 recall@100:0.3119
+  [round_14] fiqa: ndcg@10:0.3026 recall@10:0.3742 recall@100:0.6591
+  [round_14] scifact: ndcg@10:0.6518 recall@10:0.7981 recall@100:0.9467
+  [round_14] arguana: ndcg@10:0.5543 recall@10:0.8506 recall@100:0.9872
+  --- round 15/15 ---
+{'loss': 3.0762, 'grad_norm': 5.281836986541748, 'learning_rate': 4.444444444444445e-08, 'epoch': 0.1447178002894356}
+{'train_runtime': 392.5879, 'train_samples_per_second': 40.755, 'train_steps_per_second': 1.274, 'train_loss': 3.0761533203125, 'epoch': 0.1447178002894356}
+{'train_runtime': 343.8436, 'train_samples_per_second': 41.135, 'train_steps_per_second': 1.285, 'train_loss': 0.3546117031736072, 'epoch': 1.0}
+{'train_runtime': 22.2892, 'train_samples_per_second': 40.199, 'train_steps_per_second': 1.256, 'train_loss': 0.3823035785130092, 'epoch': 1.0}
+{'train_runtime': 25.3826, 'train_samples_per_second': 26.475, 'train_steps_per_second': 0.827, 'train_loss': 0.12796978723435176, 'epoch': 1.0}
+  saved adapter states -> results/states_contriever_seed123_weighted-corpus_r15_round15.pt
+  [round_15] nfcorpus: ndcg@10:0.3224 recall@10:0.1555 recall@100:0.3100
+  [round_15] fiqa: ndcg@10:0.2991 recall@10:0.3699 recall@100:0.6574
+  [round_15] scifact: ndcg@10:0.6484 recall@10:0.7881 recall@100:0.9456
+  [round_15] arguana: ndcg@10:0.5564 recall@10:0.8521 recall@100:0.9872
+>>> Federated BWT[ndcg@10] (round1->final) = +0.0241
+>>> Federated BWT[recall@10] (round1->final) = +0.0180
+>>> Federated BWT[recall@100] (round1->final) = +0.0123
+saved results/federated_contriever_seed123_weighted-corpus_r15.json
+  0%|          | 0/3633 [00:00<?, ?it/s]100%|██████████| 3633/3633 [00:00<00:00, 102372.95it/s]
+  0%|          | 0/3633 [00:00<?, ?it/s]100%|██████████| 3633/3633 [00:00<00:00, 95144.15it/s]
+  0%|          | 0/57638 [00:00<?, ?it/s] 31%|███       | 17709/57638 [00:00<00:00, 177073.70it/s] 61%|██████▏   | 35417/57638 [00:00<00:00, 171985.89it/s] 91%|█████████▏| 52626/57638 [00:00<00:00, 170060.74it/s]100%|██████████| 57638/57638 [00:00<00:00, 170913.23it/s]
+  0%|          | 0/57638 [00:00<?, ?it/s] 30%|██▉       | 17015/57638 [00:00<00:00, 170140.02it/s] 59%|█████▉    | 34030/57638 [00:00<00:00, 169581.39it/s] 88%|████████▊ | 50989/57638 [00:00<00:00, 168489.56it/s]100%|██████████| 57638/57638 [00:00<00:00, 168981.34it/s]
+  0%|          | 0/5183 [00:00<?, ?it/s]100%|██████████| 5183/5183 [00:00<00:00, 130884.97it/s]
+  0%|          | 0/5183 [00:00<?, ?it/s]100%|██████████| 5183/5183 [00:00<00:00, 132510.10it/s]
+  0%|          | 0/8674 [00:00<?, ?it/s]100%|██████████| 8674/8674 [00:00<00:00, 146851.94it/s]
+No sentence-transformers model found with name facebook/contriever. Creating a new one with mean pooling.

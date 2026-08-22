@@ -26,56 +26,14 @@ def set_adapter_state(model, state):
     set_peft_model_state_dict(inner, state)
 
 
-def _module_pairs(state):
-    mods = {}
-    for k, v in state.items():
-        m = re.match(r"(.*)\.lora_(A|B)\.weight$", k)
-        if m:
-            mods.setdefault(m.group(1), {})[m.group(2)] = v.float()
-    return {n: (ab["A"], ab["B"]) for n, ab in mods.items()
-            if "A" in ab and "B" in ab}
-
-
-def _stack_ip(s1, s2):
-    # <sum ci Bi Ai, sum cj Bj Aj>_F via trace identity — r x r ops only,
-    # never materializing d_out x d_in products (mechanism_suite.py convention)
-    tot = 0.0
-    for c1, B1, A1 in s1:
-        for c2, B2, A2 in s2:
-            tot += c1 * c2 * torch.sum((B1.T @ B2) * (A2 @ A1.T)).item()
-    return tot
-
-
-def maxmin_weights(client_states, broadcast_state):
-    # Conflict-aware aggregation weights: cosine Gram of weight-space client
-    # updates (dW_k = B_k A_k - B_g A_g), then the LP
-    #   w* = argmax_{w in simplex} min_i (G w)_i.
-    # Returns None (caller falls back to uniform) if the LP fails.
-    from scipy.optimize import linprog
-    prev = _module_pairs(broadcast_state)
-    stacks = []
-    for st in client_states:
-        mp = _module_pairs(st)
-        stacks.append({n: [(1.0, B, A)]
-                       + ([(-1.0, prev[n][1], prev[n][0])] if n in prev else [])
-                       for n, (A, B) in mp.items()})
-    K = len(stacks)
-    G = np.zeros((K, K))
-    for a in range(K):
-        for b in range(a, K):
-            ip = sum(_stack_ip(stacks[a][n], stacks[b][n])
-                     for n in stacks[a] if n in stacks[b])
-            G[a, b] = G[b, a] = ip
-    norms = np.sqrt(np.clip(np.diag(G), 1e-24, None))
-    Gc = G / np.outer(norms, norms)
-    c = np.zeros(K + 1); c[-1] = -1.0
-    res = linprog(c, A_ub=np.hstack([-Gc, np.ones((K, 1))]), b_ub=np.zeros(K),
-                  A_eq=[[1.0] * K + [0.0]], b_eq=[1.0],
-                  bounds=[(0, 1)] * K + [(None, None)], method="highs")
-    if not res.success:
-        print("  WARNING: max-min LP failed; falling back to uniform weights")
-        return None
-    return [float(x) for x in res.x[:K]]
+# Gram/LP/QP/delta-space weighting machinery lives in aggregation_schemes.py
+# (pure math, unit-tested in tests/test_aggregation.py). NOTE: the corrected
+# trace identity there fixes a cross-pairing in the campaign-era inline copy;
+# measured effect on the shipped maxmin arms: weight shift <= 0.0025, gamma*
+# shift <= 0.0023 (results/gram_bug_audit.json) — below the seed noise floor.
+from aggregation_schemes import (afl_update, apply_delta_weights,
+                                 fednova_delta_weights, maxmin_weights,
+                                 mgda_weights, qffl_delta_weights, update_gram)
 
 
 def fedavg(states, weights=None):
@@ -164,6 +122,47 @@ def client_train(model, global_state, data, q_prefix, d_prefix,
     return get_adapter_state(model), len(examples), num_steps
 
 
+def estimate_client_losses(model, global_state, data_by_slice, slices,
+                           q_prefix, d_prefix, sample, batch_size, rng_seed):
+    """Per-client training loss at the BROADCAST point w^t (the evaluation
+    point q-FedAvg and AFL prescribe: F_k(w^t), before local training).
+
+    MNRL-consistent estimator: for a deterministic sample of up to ``sample``
+    training pairs per client, loss = in-batch-negatives cross-entropy over
+    cosine scores at the MNRL default scale of 20. No gradients; batched with
+    the eval batch size. The sample is fixed per (seed, round) so all schemes
+    see identical losses.
+    """
+    set_adapter_state(model, global_state)
+    out = []
+    for s in slices:
+        examples = make_examples(data_by_slice[s], q_prefix, d_prefix)
+        if not examples:
+            out.append(0.0)
+            continue
+        rng = np.random.RandomState(rng_seed)
+        idx = rng.permutation(len(examples))[:sample]
+        losses = []
+        with torch.no_grad():
+            for lo in range(0, len(idx), batch_size):
+                chunk = [examples[i] for i in idx[lo:lo + batch_size]]
+                q = model.encode([e.texts[0] for e in chunk],
+                                 batch_size=batch_size, convert_to_tensor=True,
+                                 normalize_embeddings=True,
+                                 show_progress_bar=False)
+                d = model.encode([e.texts[1] for e in chunk],
+                                 batch_size=batch_size, convert_to_tensor=True,
+                                 normalize_embeddings=True,
+                                 show_progress_bar=False)
+                scores = 20.0 * (q @ d.T)
+                target = torch.arange(len(chunk), device=scores.device)
+                ce = torch.nn.functional.cross_entropy(scores, target,
+                                                       reduction="sum")
+                losses.append(float(ce))
+        out.append(sum(losses) / max(len(idx), 1))
+    return out
+
+
 def eval_global(model, global_state, data, slices, q_prefix, d_prefix,
                 metrics, batch_size):
     set_adapter_state(model, global_state)
@@ -215,14 +214,32 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--lora_rank", type=int, default=16)
     ap.add_argument("--weighted", action="store_true")
-    ap.add_argument("--weight_by", choices=["examples", "corpus", "maxmin"],
+    ap.add_argument("--weight_by",
+                    choices=["examples", "corpus", "maxmin",
+                             "qffl", "afl", "mgda", "fednova"],
                     default="examples",
                     help="FedAvg weighting basis when --weighted: 'examples' = "
                          "local training-pair count (canonical FedAvg n_k), "
                          "'corpus' = client corpus size (the original F4 run), "
                          "'maxmin' = conflict-aware per-round LP over the "
                          "cosine Gram of client weight-space updates (the "
-                         "FedSpan repair; falls back to uniform on LP failure)")
+                         "FedSpan repair; falls back to uniform on LP failure); "
+                         "E2 external baselines: 'qffl' = q-FedAvg "
+                         "(arXiv:1905.10497, loss^q with h_k normalization), "
+                         "'afl' = agnostic-FL multiplicative-weights ascent "
+                         "(arXiv:1902.00146), 'mgda' = min-norm weights on the "
+                         "raw update Gram (arXiv:1810.04650), 'fednova' = "
+                         "tau-normalized averaging (arXiv:2007.07481)")
+    ap.add_argument("--qffl_q", type=float, default=1.0,
+                    help="q-FedAvg fairness exponent q (only with "
+                         "--weight_by qffl)")
+    ap.add_argument("--afl_eta", type=float, default=0.1,
+                    help="AFL mixture-weight ascent step size (only with "
+                         "--weight_by afl)")
+    ap.add_argument("--loss_sample", type=int, default=2048,
+                    help="max training pairs per client for the broadcast-"
+                         "point loss estimate (qffl/afl only; deterministic "
+                         "per round)")
     ap.add_argument("--save_states", action="store_true",
                     help="save per-client + global adapter states each round "
                          "(needed for mechanism diagnostics, e.g. principal "
@@ -272,8 +289,23 @@ def main():
     print_scores("frozen", R["frozen"], args.slices, args.metrics)
     dump_json(out, jpath)
 
+    ADAPTIVE = ("maxmin", "qffl", "afl", "mgda", "fednova")
+    afl_lam = [1.0 / len(args.slices)] * len(args.slices)
+
     for rnd in range(args.num_rounds):
         print(f"  --- round {rnd+1}/{args.num_rounds} ---")
+        label = f"round_{rnd+1}"
+        # qffl/afl evaluate F_k at the broadcast point, BEFORE local training
+        losses = None
+        if args.weighted and args.weight_by in ("qffl", "afl"):
+            losses = estimate_client_losses(
+                model, global_state, data, args.slices, q_prefix, d_prefix,
+                args.loss_sample, args.eval_batch_size,
+                rng_seed=args.seed * 1000 + rnd)
+            out.setdefault("client_losses", {})[label] = \
+                dict(zip(args.slices, [round(x, 5) for x in losses]))
+            print(f"  broadcast-point losses: "
+                  f"{[round(x, 3) for x in losses]}")
         states, n_examples, client_stats = [], [], {}
         for s in args.slices:
             st, n_ex, n_steps = client_train(model, global_state, data[s],
@@ -284,20 +316,44 @@ def main():
             states.append(st)
             n_examples.append(n_ex)
             client_stats[s] = {"num_examples": n_ex, "num_steps": n_steps}
-        if args.weighted:
-            if args.weight_by == "maxmin":
-                weights = maxmin_weights(states, global_state)
-            elif args.weight_by == "corpus":
-                weights = [len(data[s]["corpus"]) for s in args.slices]
-            else:
-                weights = n_examples
-        else:
+        # --- aggregation dispatch ---------------------------------------
+        # simplex schemes feed fedavg; delta-space schemes (v need not sum
+        # to 1) feed apply_delta_weights. n_k/corpus/uniform unchanged.
+        delta_v = None
+        if not args.weighted:
             weights = None
-        if args.weighted and args.weight_by == "maxmin":
-            wn = weights if weights is not None else [1.0 / len(states)] * len(states)
-            out.setdefault("round_weights", {})[f"round_{rnd+1}"] = [round(w, 4) for w in wn]
-            print(f"  maxmin weights: {[round(w, 3) for w in wn]}")
-        global_state = fedavg(states, weights=weights)
+        elif args.weight_by == "maxmin":
+            weights = maxmin_weights(states, global_state)
+        elif args.weight_by == "mgda":
+            weights = mgda_weights(states, global_state)
+        elif args.weight_by == "afl":
+            afl_lam = afl_update(afl_lam, losses, args.afl_eta)
+            weights = afl_lam
+        elif args.weight_by == "qffl":
+            sq_norms = np.diag(update_gram(states, global_state)).tolist()
+            delta_v = qffl_delta_weights(losses, sq_norms, q=args.qffl_q,
+                                         L=1.0 / args.lr)
+        elif args.weight_by == "fednova":
+            delta_v = fednova_delta_weights(
+                n_examples, [client_stats[s]["num_steps"]
+                             for s in args.slices])
+        elif args.weight_by == "corpus":
+            weights = [len(data[s]["corpus"]) for s in args.slices]
+        else:
+            weights = n_examples
+        if args.weighted and args.weight_by in ADAPTIVE:
+            wn = (delta_v if delta_v is not None else
+                  (weights if weights is not None
+                   else [1.0 / len(states)] * len(states)))
+            out.setdefault("round_weights", {})[label] = \
+                [round(w, 5) for w in wn]
+            if delta_v is not None:
+                out["weight_space"] = "delta"
+            print(f"  {args.weight_by} weights: {[round(w, 3) for w in wn]}")
+        if delta_v is not None:
+            global_state = apply_delta_weights(global_state, states, delta_v)
+        else:
+            global_state = fedavg(states, weights=weights)
         label = f"round_{rnd+1}"
         out["clients"][label] = client_stats
         if args.save_states:

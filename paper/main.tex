@@ -1,0 +1,127 @@
+\documentclass[sigconf,anonymous,review]{acmart}
+\usepackage{booktabs}
+
+\newcommand{\ndcg}{\mathrm{nDCG@10}}
+\newcommand{\rc}[1]{\mathrm{recall@#1}}
+\newcommand{\BWT}{\mathrm{BWT}}
+\newcommand{\system}{FedCRAG}
+\newcommand{\repair}{FedSpan}
+
+\title[Weight-Skew Erosion in Federated Retriever Fine-Tuning]{Weight-Skew Erosion in Federated Retriever Fine-Tuning:\\ Measurement, Mechanism, and Conflict-Aware Repair}
+
+\author{Anonymous Author(s)}
+\affiliation{\institution{Anonymous Institution}\city{}\country{}}
+
+\begin{document}
+
+\begin{abstract}
+Organizations that cannot pool documents increasingly want to share retrieval competence: a single dense retriever, fine-tuned federatedly with parameter-efficient adapters, serving retrieval-augmented generation over private, evolving corpora. We present the first ranking-level study of what federated averaging does to such a retriever, at per-client, per-depth resolution. Across a work-regime~$\times$~weighting grid (three seeds per cell in the capped regime), we find that federation itself is benign: under uniform aggregation every client improves in every regime we test. The pathology is the \emph{deployment default}. Size-proportional (FedAvg $n_k$) weighting silently erodes under-weighted clients' top-of-ranking precision --- damage that attenuates with depth and is invisible to coverage metrics --- while Pareto-dominated by uniform weighting for \emph{every} client, including the largest. When clients additionally train to local saturation each round, the default configuration turns net-destructive for all participants ($\BWT=-0.053$), six times the mild-regime damage: local work and weight skew interact multiplicatively. We explain the effect with a margin-censored perturbation theory for ranking metrics, and trace it to measured update-conflict geometry: under $n_k$ the aggregate update is 97--98\% the dominant client's direction, minority alignment turns negative exactly as erosion begins, and the bilinear factor-aggregation residual --- the natural alternative mechanism --- measures negligible. The diagnosis implies the repair: a per-round max--min linear program over the Gram matrix of client adapter updates, exact on a frozen shared subspace. It eliminates minority erosion in the capped regime and rescues the catastrophic cell ($-0.053\rightarrow+0.039$), deriving uniform-grade protection from update geometry alone rather than assuming it.
+\end{abstract}
+
+\begin{CCSXML}
+<ccs2012>
+<concept><concept_id>10002951.10003317</concept_id><concept_desc>Information systems~Information retrieval</concept_desc><concept_significance>500</concept_significance></concept>
+<concept><concept_id>10010147.10010257</concept_id><concept_desc>Computing methodologies~Machine learning</concept_desc><concept_significance>300</concept_significance></concept>
+</ccs2012>
+\end{CCSXML}
+\ccsdesc[500]{Information systems~Information retrieval}
+\ccsdesc[300]{Computing methodologies~Machine learning}
+\keywords{federated learning, dense retrieval, retrieval-augmented generation, catastrophic forgetting, LoRA, aggregation fairness}
+
+\maketitle
+
+\section{Introduction}
+Retrieval-augmented generation (RAG) has made the dense retriever shared infrastructure: the component that decides which evidence an agent, an assistant, or a pipeline ever sees. The 2026 agent-memory stack --- from research systems to the managed offerings of every major platform --- achieves knowledge persistence \emph{non-parametrically}: evolving stores, graphs, and consolidation loops built over embedding encoders that are never updated. Meanwhile, the organizations whose corpora are most valuable --- hospitals, banks, law firms --- cannot pool documents at all. Where relevance justifies it, industry already pays for encoder adaptation on evolving collections; regulation forbids exactly the centralization that would make it easy. Federated fine-tuning of parameter-efficient adapters is the natural middle ground: share LoRA deltas, never documents.
+
+This paper asks what actually happens to the \emph{ranking} when K organizations do this --- a question no prior work has measured. Federated RAG research federates retrieval at inference time or trains retrievers on static corpora with endpoint-only evaluation; continual-retrieval research is centralized; federated continual learning is classification-centric; and federated online learning-to-rank reports only globally averaged metrics under fixed default weights. Whether the standard recipe --- FedAvg over LoRA factors, weighted by client data size --- preserves each client's ranking quality over rounds has been unexamined at any depth resolution, for any client, anywhere. We examine it, and the answer is unexpectedly sharp:
+
+\textbf{Federation is benign; the default weights are the pathology.} Under uniform aggregation, every client improves in every regime we test --- even with full local epochs per round. Under the deployment-default size-proportional weights, under-weighted clients' $\ndcg$ peaks within three rounds and then erodes while their $\rc{100}$ barely moves --- damage concentrated precisely in the ranks RAG consumes, invisible to coverage monitoring --- and the weighting is \emph{lose--lose}: uniform Pareto-dominates it for every client including the one holding 87\% of the weight. When local work per round is also large, the interaction is multiplicative: the default configuration destroys value for all participants ($\BWT=-0.053$; the smallest client collapses by 0.15 $\ndcg$), a regime our margin theory anticipates and our repair reverses.
+
+Our contributions:
+\begin{enumerate}
+\item \textbf{Phenomenon} (\S\ref{sec:phenomenon}): the first per-client, per-depth characterization of federated retriever fine-tuning, over a work-regime~$\times$~weighting grid, three seeds per capped cell, with a pre-registered narrative protocol and an adversarially audited claim set. Findings: depth-attenuated minority erosion under skewed weights; Pareto dominance of uniform; multiplicative work~$\times$~skew interaction; mild, order-governed sequential forgetting on healthy backbones.
+\item \textbf{Theory} (\S\ref{sec:theory}): a margin-censored perturbation bound for $\ndcg$ under embedding drift and a two-threshold window theorem separating top-$k$ vulnerability from coverage stability --- to our knowledge the first drift-to-ranking-metric bounds of this form --- plus the exact algebra of factor aggregation on a frozen shared subspace.
+\item \textbf{Mechanism} (\S\ref{sec:mechanism}): direct measurement, from per-round adapter states, of the conflict geometry that produces the erosion: aggregate-direction capture by the dominant client, minority anti-alignment coinciding with erosion onset, and a negligible bilinear aggregation residual --- adjudicating between candidate mechanisms rather than assuming one.
+\item \textbf{Repair} (\S\ref{sec:repair}): a per-round max--min linear program over the Gram matrix of client updates --- exact and geometry-faithful on the frozen span --- that eliminates minority erosion and rescues the catastrophic cell, discovering near-uniform protective weights from update geometry alone.
+\end{enumerate}
+
+\section{Related Work}\label{sec:related}
+\paragraph{Continual and lifelong retrieval.} L2R and CLEVER established retrieval forgetting centrally at CIKM'23; FlowRAG brought continual retriever adaptation to RAG (WWW'26) via per-task prompt isolation; CREAM (KDD'26) studies streaming corpora with soft-memory replay. All are centralized; forgetting metrics, where present, are computed on answer-level or recall-only signals. L2R evaluates session-resolved ranking metrics but with replay, full fine-tuning, and no federation; none reports signed backward transfer on graded top-rank metrics or depth-resolved damage structure.
+\paragraph{Federated RAG and federated retriever training.} FeB4RAG, RAGRoute, and C-FedRAG federate \emph{retrieval} at inference time over frozen per-silo indices. FedE4RAG and the fed-rag framework train retrievers federatedly but on static corpora with endpoint-only, globally averaged evaluation. A systematic mapping of federated RAG (EMNLP'25 Findings) identifies per-client heterogeneity analysis as an open gap; we fill it at ranking-depth resolution.
+\paragraph{Federated LoRA aggregation.} That factor-wise averaging mismatches matrix-space aggregation is established (FedEx-LoRA, FLoRA), with gauge-aware and alignment-based refinements (GLoRA, FedRot-LoRA) and, in the months preceding submission, exact-then-recompress and sketch-based constructions (FraQ, SeFoRA) and side-selection analyses (FedAS-LoRA). None evaluates retrieval or continual arrival, and our measurements show the residual these methods target is \emph{not} the operative mechanism in our setting --- directional conflict is.
+\paragraph{Fairness and weighting in FL.} Fairness-in-FL formalizes worst-case mixture loss (AFL, DRFA), accuracy uniformity (q-FFL, TERM), personalization (Ditto), and Pareto-stationary common descent (FedMGDA+, FedFV, AdaFed) --- all on classification loss. A parallel line shows size-proportional weights suboptimal for the global model (FedNova, FedLAW, FedDisco). Federated online LTR measures nDCG but globally averaged with $n_k$ fixed. To our knowledge no prior work documents a lose--lose outcome for $n_k$ weighting, per-client ranking-depth damage, or aggregation weights chosen by a max--min program over update Gram matrices.
+\paragraph{Non-parametric memory.} An influential line argues corpus evolution should be absorbed by stores, not weights (HippoRAG-2's ``non-parametric continual learning''; GSW; Panini), and the entire commercial agent-memory stack is frozen-encoder. These systems compose with, rather than compete with, parametric adaptation: they assume an adequate encoder, offer no cross-silo training mechanism, and their answer-level metrics cannot see the effects we measure. Where encoders must adapt without centralization, our setting is the complement they leave open.
+
+\section{Problem Setting}\label{sec:setting}
+$K$ clients hold private, evolving corpora $C_k(t)$ and query--document supervision $P_k(t)$. They jointly maintain one retriever: a frozen backbone $f_{\theta_0}$ with LoRA adapters $\Delta W_\ell = B_\ell A_\ell$ per adapted module $\ell$. Constraints: \textbf{(C1)}~raw data never leaves silos --- only adapter parameters and $O(1)$ scalars are communicated; \textbf{(C2)}~no data replay across sessions --- only $o(|\mathrm{data}|)$ statistics persist; \textbf{(C3)}~one global model --- no personalization. Each round $r$, every client trains its local adapter copy on its own pairs (contrastive InfoNCE with in-batch negatives; a fixed local-step budget, the standard fixed-local-work convention) and the server aggregates factor-wise: $\bar A = \sum_k w_k A_k$, $\bar B = \sum_k w_k B_k$. The deployment-default weighting is $w_k \propto n_k$ (local pair count); we study $\{$uniform, $n_k$, corpus-size, and our conflict-aware $w^\ast\}$.
+
+\textbf{Instruments.} After every round we evaluate every client's ranking on its own held-out queries at multiple depths ($\ndcg$, $\rc{10}$, $\rc{100}$), yielding a round-resolved R-matrix per client. We report signed backward transfer $\BWT$ (final minus round-1, averaged over clients), per-client peak-minus-final erosion $E$, and depth structure across the three metrics. Sequential (single-client) forgetting uses GEM-style signed BWT and peak-minus-final Forget over a domain sequence.
+
+\section{Theory}\label{sec:theory}
+We state the two results that organize the empirical sections; proofs, the aggregation algebra, and five further results appear in the appendix.
+
+\textbf{Margin-censored perturbation bound.} For unit-normalized embeddings with per-checkpoint drift budgets $\varepsilon_q,\varepsilon_D$ and $\rho=\varepsilon_q+\varepsilon_D$: no document pair with score margin above $2\rho$ can invert, and per query
+\[ |\Delta\ndcg| \;\le\; \frac{L_k}{\mathrm{IDCG}_k}\sum_{i<j}|g_i-g_j|\,\mathbf{1}\{m_{ij}\le 2\rho\}, \]
+with $L_k$ the largest adjacent discount gap. Damage is \emph{censored by the margin profile}: only tightly separated pairs are at risk.
+
+\textbf{Depth window.} If the top-$k$ margin floor $\alpha_k$ satisfies $\alpha_k \le 2\rho < \beta_K$ (the coverage-boundary margin floor at depth $K$), then $\ndcg$ at depth $k$ is perturbable while $\rc{K}$ cannot decrease. Because top-rank margins are empirically tight and coverage boundaries wide, drift damages precision before coverage --- predicting the \emph{depth-attenuated} damage we measure (and, on clients whose recall boundary is not slack, predicting that recall erodes too, which we confirm).
+
+\textbf{Aggregation algebra.} Factor averaging deviates from matrix-space averaging by exactly the factor cross-covariance $\sum_k w_k (B_k-\bar B)(A_k-\bar A)$ --- zero when a factor is shared (sufficient, not necessary). With a frozen shared $A^\ast$ (orthonormal rows), aggregation is exact and linear in $B$; the Frobenius Gram matrix of communicated $B$-updates equals that of the true weight-space updates, which is what makes the server-side program of \S\ref{sec:repair} geometry-faithful while seeing only adapters.
+
+\section{Experimental Setup}\label{sec:setup}
+Four BEIR domains as clients --- NFCorpus, FiQA-2018, SciFact, ArguAna ($n_k \approx$ 110k/14k/0.9k/0.7k pairs; corpora 3.6k/57k/5k/8.7k docs) --- proxying medical/financial/scientific/argumentation silos. Backbone: Contriever (110M), selected by a headroom gate (independent fine-tuning must beat frozen on every domain; the gate rejects saturated backbones on which ``forgetting'' conflates recipe damage --- our pilot's bge-m3 failed it on two of four domains). LoRA rank 16 on attention and FFN modules; MTEB-convention self-retrieval exclusion; three seeds for every capped-regime cell; per-round full re-encoding and evaluation; commit-stamped result files. The work-regime grid: \emph{capped} (500 local steps/round, $R{=}15$) and \emph{saturation} (full local epochs, $R{=}8$). We report the pre-registered protocol (narrative branches and the saturation prediction were written before the data) in the appendix.
+
+\section{The Phenomenon}\label{sec:phenomenon}
+\subsection{Sequential baseline: mild, order-governed}
+Sequentially fine-tuning one model through the four domains (three seeded orders) yields signed BWT of $-0.025$, $-0.003$, $+0.001$ $\ndcg$ --- real but mild, with damage concentrated when the largest domain trains last; peak-minus-final Forget is consistently positive ($+0.048/+0.045/+0.023$). On backbones with genuine headroom, sequential forgetting is not catastrophic; claims built on saturated backbones overstate it.
+
+\subsection{Federated: the weighting decides who pays}
+Table~\ref{tab:capped} shows the capped regime. Under uniform weighting all clients improve monotonically or plateau at peak (BWT $+0.072$--$+0.074$ across seeds; max client erosion $\le 0.006$). Under $n_k$, the under-weighted SciFact peaks at round 3 in \emph{all three seeds} and erodes ($E = +0.025/+0.033/+0.025$) while its $\rc{100}$ stays near-flat; under corpus-size weighting the under-weighted NFCorpus erodes in \emph{both} precision and recall ($E_{\rc{100}} = +0.011/+0.013/+0.011$ across seeds) --- on the one eroding client far from recall ceiling, recall falls nearly proportionally, which is why we name the structure \emph{depth-attenuated erosion} rather than a dissociation. Erosion is forgone federation gain, not net harm versus going alone (eroded clients still beat their independent baselines; the single exception, FiQA under $n_k$, never reaches its independent baseline and we report it). Critically, the weighting is lose--lose: at round 15, uniform beats $n_k$ for \emph{every} client, including the 87\%-weight NFCorpus.
+
+\begin{table}[t]
+\caption{Capped regime ($R{=}15$, 500 steps/round), $\BWT$ $\ndcg$ by seed, and the replicated minority-erosion signature.}
+\label{tab:capped}
+\begin{tabular}{lccc l}
+\toprule
+Weighting & s42 & s123 & s2024 & minority erosion (3 seeds)\\
+\midrule
+uniform & $+0.073$ & $+0.074$ & $+0.072$ & none (max $E{\le}0.006$)\\
+$n_k$ & $+0.018$ & $+0.021$ & $+0.019$ & SciFact $E{=}.025/.033/.025$\\
+corpus & $+0.025$ & $+0.024$ & $+0.024$ & NFCorpus $E_{\rc{100}}{=}.011/.013/.011$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{The interaction: work $\times$ skew}
+Table~\ref{tab:grid} completes the grid. Saturation alone is benign (uniform, full epochs: $+0.051$, no erosion). Skew alone is damaging but bounded. Together they are catastrophic: $\BWT=-0.053$, every client eroding from its early peak --- SciFact by $0.150$ $\ndcg$, six times the capped-regime damage, monotonically from round 1 --- including the weight-dominant client. The interaction was a registered prediction (larger local drift magnifies the conflict the skewed aggregate imposes); the factor of six was measured, not predicted.
+
+\begin{table}[t]
+\caption{The work-regime $\times$ weighting grid (seed 42): $\BWT$ $\ndcg$, with the repair column previewing \S\ref{sec:repair}.}
+\label{tab:grid}
+\begin{tabular}{lccc}
+\toprule
+ & uniform & $n_k$ & max--min $w^\ast$\\
+\midrule
+capped & $+0.073$ & $+0.018$ & $+0.071$\\
+full epochs & $+0.051$ & $\mathbf{-0.053}$ & $+0.039$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Mechanism}\label{sec:mechanism}
+From per-round adapter states we compute, in factor space, the cosine Gram matrix of client weight-space updates, each client's alignment with the aggregate direction, and the bilinear aggregation residual. Three findings adjudicate the mechanism. (1)~Under $n_k$ the aggregate update is 97--98\% aligned with the dominant client every round; SciFact's alignment decays from $+0.21$ to \emph{negative} from round 6 --- each aggregation step actively opposes its local objective --- and per-client alignment correlates with next-round $\ndcg$ change at $+0.62$/$+0.73$. Under uniform, every alignment stays positive and nobody erodes. (2)~The bilinear factor-aggregation residual --- the mechanism the federated-LoRA literature repairs --- measures $0.001$--$0.005$ relative throughout: negligible, exonerated by measurement. (3)~Client $A$-row-spaces sit essentially inside the aggregate span (residual $10^{-4}$) while $B$-side residuals run $\sim$50$\times$ higher: the shared subspace is the input side, empirically supporting freeze-$A$ designs. The max--min program of the next section, run offline on these states, chooses near-uniform weights with worst-client alignment $\gamma^\ast \in [0.28, 0.39]$ --- predicting the repair's effect before running it.
+
+\section{The Repair}\label{sec:repair}
+Each round the server solves $w^\ast = \arg\max_{w \in \Delta_K} \min_i (Gw)_i$ over the cosine Gram $G$ of client updates --- a $K{\times}K$ linear program, milliseconds at cross-silo scale, exact on the frozen span, requiring only the communicated adapters (compatible with C1; we delimit that it is incompatible with sum-only secure aggregation). Deployed live: in the capped regime it eliminates minority erosion (SciFact $E{=}+0.003$, finishing above every other arm's final value; $\BWT{=}+0.071$, matching uniform); in the catastrophic cell it swings $\BWT$ by $+0.092$ to $+0.039$, rescuing three clients completely (residual SciFact erosion $+0.024$ remains, comparable to mild-regime $n_k$). The chosen weights are stable and near-uniform ($\approx[0.31,0.22,0.24,0.22]$), matching the offline prediction. We state the honest conclusion: in this symmetric testbed, uniform weighting is an equally effective and simpler cure; the program's value is that it \emph{derives} the protective weights from update geometry rather than assuming symmetry --- the property that matters when clients are adversarial, duplicated, or asymmetric, which we leave to future validation.
+
+\section{Limitations}\label{sec:limitations}
+Single backbone family (Contriever; a saturated bge-m3 pilot is reported as the motivating anomaly); $K{=}4$ proxy silos with one seed set per saturation cell; the peak-then-erode phenotype is strongest on one client (the equally under-weighted ArguAna is harmed via an early dip and the largest final deficit versus uniform --- harm signatures are client-dependent); recall ceilings limit depth analysis on two domains (we rely on the far-from-ceiling client for the depth claim); erosion under skew is forgone gain rather than net harm with one exception; the repair's advantage over uniform is adaptivity, not score, in this testbed; evolving-session (multi-session) composition and the EDGAR-based realistic instantiation are evaluated at reduced scale in the appendix; no differential-privacy or secure-aggregation claims.
+
+\section{Conclusion}
+Measured at the resolution RAG actually consumes, federated retriever fine-tuning is safe --- until the default weights meet real heterogeneity in data scale and local work, at which point the smallest stakeholders pay first and, at saturation, everyone pays. The cure is cheap, geometric, and derivable from the updates themselves. As agent-memory stacks push evolving knowledge onto frozen encoders, the silos that cannot centralize deserve aggregation that provably does not sacrifice them.
+
+\nocite{*}% v0.1: render the verified citation base; inline \cite wiring is the next pass
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{refs}
+
+\end{document}

@@ -164,6 +164,7 @@ def test_driver_normmaxmin_dispatch_persists_exact_round_record(
         "--weighted",
         "--weight_by", "normmaxmin",
         "--lora_mode", "frozen-a",
+        "--frozen_a_row_scale", "unit",
         "--fedspan_step_policy", step_policy,
         "--fedspan_direction_policy", "minnorm",
         "--save_states",
@@ -392,6 +393,37 @@ def test_driver_records_per_client_delta_norms_for_every_e0_cell(
         assert recorded[name] == pytest.approx(float(expected), rel=1e-6)
 
 
+@pytest.mark.parametrize("row_scale_c", [1.0, 0.5773502691896258, 3.0])
+def test_driver_records_true_effective_step_norms_at_any_frozen_row_scale(
+        monkeypatch, tmp_path, row_scale_c):
+    """The frozen-A row scale c must be counted exactly once, not twice.
+
+    ``client_delta_norms`` and ``fedspan_diagnostics.client_norms`` are two
+    records of one quantity written in the same round. They agree only when
+    the materialized-space record is scaled by the bare PEFT sigma, since the
+    materialized update already contains A and therefore already contains c.
+    """
+    result, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        row_scale_c=row_scale_c)
+    payload, _ = driver_harness.load_round_states(tmp_path)
+
+    states = [payload["clients"][name] for name in driver_harness.SLICES]
+    _, truth = driver_harness.cosine_gram(states, payload["broadcast"])
+
+    recorded = result["client_delta_norms"]["round_1"]
+    for name, expected in zip(driver_harness.SLICES, truth):
+        assert recorded[name] == pytest.approx(float(expected), rel=1e-9)
+
+    # The raw-B record reaches the same quantity through the float64 geometry
+    # scale sigma*c rather than through the float32 A the state carries, so it
+    # agrees only to float32 resolution in c (measured gap 1.8e-08 at
+    # c = 0.5773502691896258).
+    solver_norms = result["fedspan_diagnostics"]["round_1"]["client_norms"]
+    for reported, expected in zip(solver_norms, truth):
+        assert reported == pytest.approx(float(expected), rel=1e-6)
+
+
 def test_driver_rejects_normmaxmin_without_a_direction_policy(
         monkeypatch, capsys, tmp_path):
     driver_harness.install_mocks(monkeypatch)
@@ -450,7 +482,8 @@ def test_driver_direction_policy_changes_the_configuration_hash(
 # ------------------------------------------------------ provenance refusal
 
 
-@pytest.mark.parametrize("commit", ["abc123def456-dirty", "unknown"])
+@pytest.mark.parametrize("commit", ["abc123def456-dirty", "unknown",
+                                    "abc123def456-unknown-worktree"])
 def test_normmaxmin_refuses_unclean_source_provenance(
         monkeypatch, capsys, tmp_path, commit):
     driver_harness.install_mocks(monkeypatch, commit=commit)
@@ -464,26 +497,8 @@ def test_normmaxmin_refuses_unclean_source_provenance(
     assert not list(tmp_path.glob("federated_*.json"))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="federated_forgetting.py tests only for 'unknown' and a '-dirty' "
-           "suffix, so a commit whose worktree cleanliness could not be "
-           "determined ('-unknown-worktree', produced by get_git_commit when "
-           "git status itself fails) still launches a paper-grade normmaxmin "
-           "run. validate_e0.py already refuses that provenance after the "
-           "fact. Remove this marker once the launch gate covers it too.")
-def test_normmaxmin_refuses_undetermined_worktree_provenance(
-        monkeypatch, tmp_path):
-    driver_harness.install_mocks(
-        monkeypatch, commit="abc123def456-unknown-worktree")
-    monkeypatch.setattr(sys, "argv", driver_harness.build_argv(
-        tmp_path, "frozen-a", "normmaxmin"))
-
-    with pytest.raises(SystemExit, match="2"):
-        driver.main()
-
-
-@pytest.mark.parametrize("commit", ["abc123def456-dirty", "unknown"])
+@pytest.mark.parametrize("commit", ["abc123def456-dirty", "unknown",
+                                    "abc123def456-unknown-worktree"])
 def test_explicit_override_permits_unclean_provenance_and_records_it(
         monkeypatch, tmp_path, commit):
     result, _ = driver_harness.run_driver(
@@ -501,3 +516,50 @@ def test_unclean_provenance_is_permitted_for_non_normmaxmin_arms(
         commit="abc123def456-dirty")
     assert result["commit"] == "abc123def456-dirty"
     assert result["method_contract"]["dirty_provenance_override"] is False
+
+
+# ------------------------------------------- explicit frozen-A row scale
+
+
+def test_driver_requires_an_explicit_row_scale_for_frozen_a(
+        monkeypatch, capsys, tmp_path):
+    """Defaulting to 'unit' silently reintroduces the sqrt(3) confound."""
+    driver_harness.install_mocks(monkeypatch)
+    monkeypatch.setattr(sys, "argv", driver_harness.build_argv(
+        tmp_path, "frozen-a", "uniform", row_scale=None))
+
+    with pytest.raises(SystemExit, match="2"):
+        driver.main()
+
+    assert "--frozen_a_row_scale is required" in capsys.readouterr().err
+    assert not list(tmp_path.glob("federated_*.json"))
+
+
+@pytest.mark.parametrize("row_scale", ["unit", "peft-init"])
+def test_driver_records_the_row_scale_it_was_given(
+        monkeypatch, tmp_path, row_scale):
+    result, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "uniform", row_scale=row_scale)
+    contract = result["method_contract"]
+
+    assert contract["frozen_a_row_scale"] == row_scale
+    assert contract["frozen_a_row_scale_specified"] is True
+    assert result["args"]["frozen_a_row_scale"] == row_scale
+
+
+# --------------------------------------------------- fallback visibility
+
+
+def test_driver_warns_when_fedspan_falls_back_to_a_zero_update(
+        monkeypatch, capsys, tmp_path):
+    """Every other arm prints on fallback; a silent FedSpan no-op arm would
+    report the frozen baseline's retention under the FedSpan label."""
+    idle = {name: driver_harness.broadcast_state()
+            for name in driver_harness.SLICES}
+    result, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin", clients=idle)
+
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    assert diagnostic["fallback"] == "zero_update"
+    assert "WARNING: normmaxmin fell back to zero_update" in \
+        capsys.readouterr().out

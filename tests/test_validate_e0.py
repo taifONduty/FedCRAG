@@ -7,6 +7,7 @@ case: the older hash gates cannot see it, so only the independent aggregate
 recomputation can.
 """
 import copy
+import math
 import json
 import sys
 from pathlib import Path
@@ -488,3 +489,137 @@ def test_truncated_round_timings_are_refused(monkeypatch, tmp_path):
     with pytest.raises(E0ValidationError, match="one finite elapsed time"):
         validate_run_directory(
             tmp_path, manifest_row=manifest_row(tmp_path, num_rounds=2))
+
+
+# ------------------------------------- the attribution axes themselves
+
+
+def test_manifest_row_scale_drift_is_refused(monkeypatch, tmp_path):
+    """e0-frozen-a-uniform-full and its unit-scale twin differ in this alone."""
+    build_run(monkeypatch, tmp_path, "frozen-a", "uniform")
+    write_resource_record(tmp_path)
+
+    drifted = manifest_row(tmp_path, arm="uniform")
+    index = drifted["argv"].index("--frozen_a_row_scale") + 1
+    drifted["argv"][index] = "peft-init"
+    with pytest.raises(E0ValidationError,
+                       match="launched frozen_a_row_scale='peft-init'"):
+        validate_run_directory(tmp_path, manifest_row=drifted)
+
+
+def test_manifest_direction_policy_drift_is_refused(monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+
+    drifted = manifest_row(tmp_path)
+    index = drifted["argv"].index("--fedspan_direction_policy") + 1
+    drifted["argv"][index] = "maxmin-lp"
+    with pytest.raises(E0ValidationError,
+                       match="launched fedspan_direction_policy='maxmin-lp'"):
+        validate_run_directory(tmp_path, manifest_row=drifted)
+
+
+def test_frozen_a_run_that_defaulted_its_row_scale_is_refused(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(monkeypatch, tmp_path, "frozen-a", "uniform")
+    with result_path.open() as handle:
+        result = json.load(handle)
+    result["method_contract"]["frozen_a_row_scale_specified"] = False
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError,
+                       match="row scale was not specified explicitly"):
+        validate_run_directory(tmp_path)
+
+
+# ------------------------------------------- the applied step magnitude
+
+
+def test_resolved_step_norm_must_equal_the_median_active_client_norm(
+        monkeypatch, tmp_path):
+    """The c double-count made these two persisted numbers disagree by 1.73x.
+
+    They document one quantity in one file and nothing compared them.
+    """
+    _, result_path = build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    validate_run_directory(tmp_path)
+
+    with result_path.open() as handle:
+        result = json.load(handle)
+    norms = result["client_delta_norms"]["round_1"]
+    result["client_delta_norms"]["round_1"] = {
+        name: value / math.sqrt(3.0) for name, value in norms.items()}
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError,
+                       match="median active client delta norm"):
+        validate_run_directory(tmp_path)
+
+
+def test_a_self_consistent_but_wrong_step_magnitude_is_refused(
+        monkeypatch, tmp_path):
+    """Every number the run wrote about itself is rescaled together."""
+    _, result_path = build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    with result_path.open() as handle:
+        result = json.load(handle)
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    diagnostic["resolved_step_norm"] *= 1.5
+    diagnostic["requested_step_norm"] = diagnostic["resolved_step_norm"]
+    diagnostic["application"]["applied_step_norm"] *= 1.5
+    result["client_delta_norms"]["round_1"] = {
+        name: value * 1.5
+        for name, value in result["client_delta_norms"]["round_1"].items()}
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError,
+                       match="applied step norm recomputed from the persisted"):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "field", ["solved_effective_step_sha256", "applied_effective_step_sha256"])
+def test_a_forged_effective_step_hash_is_refused(
+        monkeypatch, tmp_path, field):
+    """These were only length-checked, so any 64 hex characters passed."""
+    _, result_path = build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    with result_path.open() as handle:
+        result = json.load(handle)
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    target = (diagnostic if field in diagnostic
+              else diagnostic["application"])
+    target[field] = "0" * 64
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match=f"{field} does not match"):
+        validate_run_directory(tmp_path)
+
+
+# --------------------------------------------------- the no-op FedSpan arm
+
+
+def idle_clients():
+    """Clients that trained to exactly the broadcast: every round no-ops."""
+    return {name: driver_harness.broadcast_state()
+            for name in driver_harness.SLICES}
+
+
+def test_a_fedspan_arm_that_never_applied_anything_is_refused(
+        monkeypatch, tmp_path):
+    """Worst silent outcome available to E0: the frozen baseline's numbers
+    reported under the FedSpan label, at the healthiest possible headroom."""
+    driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin", num_rounds=2,
+        clients=idle_clients())
+
+    with pytest.raises(E0ValidationError,
+                       match="never applied a nonzero update"):
+        validate_run_directory(tmp_path)
+
+
+def test_a_healthy_fedspan_run_reports_its_fallback_count(
+        monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin", num_rounds=2)
+    report = validate_run_directory(tmp_path)
+
+    assert report["fedspan_fallback_rounds"] == 0
+    assert report["fedspan_applied_rounds"] == 2

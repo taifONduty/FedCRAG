@@ -52,6 +52,11 @@ E0_ROWS=(
   "e0-frozen-a-unitscale-uniform-full|frozen-a|uniform|full|0|unit"
 )
 
+# The declared size of the frozen campaign. Every count printed or checked
+# below derives from E0_ROWS itself; this constant exists only so that an
+# accidental edit to the grid is refused rather than silently launched.
+E0_EXPECTED_ROWS=11
+
 build_command() {
   local run_id=$1
   local coordinate=$2
@@ -81,9 +86,11 @@ build_command() {
   # frozen-A rows declare their row scale explicitly. 'peft-init' keeps
   # A A^T = c^2 I at PEFT's own initialization scale (c ~ 0.5774), so the
   # frozen-A rows share the trainable-A+B rows' B->dW step scale and any
-  # difference between the two coordinates is attributable to the freeze
-  # rather than to a 1.73x rescale. The single 'unit' row isolates that
-  # rescale on its own.
+  # difference between the two coordinates is attributable to the
+  # frozen-orthonormal-A coordinate rather than to a 1.73x rescale. That
+  # coordinate bundles the freeze with A-spectrum whitening; the two are not
+  # separated by this grid. The single 'unit' row isolates the rescale on its
+  # own, in the full-work regime only.
   if [ "$coordinate" = "frozen-a" ]; then
     if [ "$row_scale" = "-" ] || [ -z "$row_scale" ]; then
       printf 'frozen-a row %s must declare a row scale\n' "$run_id" >&2
@@ -150,14 +157,16 @@ build_manifest_file() {
   local destination=$1
   local commit stream
   commit=$(git rev-parse --short=12 HEAD)
+  require_expected_row_count
   stream=$(mktemp)
   manifest_stream > "$stream"
-  "$PYTHON" - "$commit" "$destination" "$stream" <<'PY'
+  "$PYTHON" - "$commit" "$destination" "$stream" "$E0_EXPECTED_ROWS" <<'PY'
 import json
 import sys
 import time
 
 commit, destination, stream = sys.argv[1], sys.argv[2], sys.argv[3]
+expected = int(sys.argv[4])
 with open(stream, "rb") as handle:
     fields = [chunk.decode() for chunk in handle.read().split(b"\0")]
 rows = []
@@ -177,8 +186,8 @@ while index < len(fields):
         "argv": fields[index + 7:index + 7 + count],
     })
     index += 7 + count
-if len(rows) != 10:
-    sys.exit(f"expected 10 manifest rows, built {len(rows)}")
+if len(rows) != expected:
+    sys.exit(f"expected {expected} manifest rows, built {len(rows)}")
 with open(destination, "w") as handle:
     json.dump({
         "schema": "fedcrag-e0-manifest/1",
@@ -418,13 +427,23 @@ verify_environment() {
     tests -q -p no:cacheprovider
 }
 
+require_expected_row_count() {
+  if [[ ${#E0_ROWS[@]} -ne $E0_EXPECTED_ROWS ]]; then
+    printf 'E0 grid drift: E0_ROWS holds %d rows but the frozen campaign '\
+'declares %d. Restore the grid, or change E0_EXPECTED_ROWS deliberately.\n' \
+      "${#E0_ROWS[@]}" "$E0_EXPECTED_ROWS" >&2
+    exit 2
+  fi
+}
+
 verify_all() {
   require_clean_provenance
   require_external_output_root
-  [[ ${#E0_ROWS[@]} -eq 10 ]]
+  require_expected_row_count
   print_manifest
   verify_environment
-  printf 'E0 verification complete: 10 frozen commands; no run launched.\n'
+  printf 'E0 verification complete: %d frozen commands; no run launched.\n' \
+    "${#E0_ROWS[@]}"
 }
 
 campaign() {
@@ -470,8 +489,8 @@ campaign() {
     execute_row "$run_id" "$coordinate" "$arm" "$max_steps"
   done
   write_completion_marker
-  printf 'E0 COMPLETE: all ten rows executed and contract-validated (%s).\n' \
-    "$E0_COMPLETE"
+  printf 'E0 COMPLETE: all %d rows executed and contract-validated (%s).\n' \
+    "${#E0_ROWS[@]}" "$E0_COMPLETE"
 }
 
 case "${1:-}" in

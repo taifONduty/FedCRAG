@@ -38,7 +38,7 @@ from aggregation_schemes import (SchemeResult, afl_update, apply_delta_weights,
                                  apply_fedspan_update,
                                  apply_frozen_b_delta_weights,
                                  client_update_norms,
-                                 configure_frozen_lora_a,
+                                 configure_frozen_lora_a, peft_scales,
                                  fednova_delta_weights,
                                  fedspan_delta_weights, maxmin_weights,
                                  frozen_a_state_diagnostics,
@@ -528,10 +528,18 @@ def main():
     if args.frozen_a_row_scale is not None and args.lora_mode != "frozen-a":
         ap.error("--frozen_a_row_scale is legal only with "
                  "--lora_mode frozen-a")
-    row_scale = args.frozen_a_row_scale or "unit"
+    if args.lora_mode == "frozen-a" and args.frozen_a_row_scale is None:
+        # No default is safe here: 'unit' rescales the B->dW step by ~1.73x
+        # relative to trainable-A+B, which is the exact confound the frozen-A
+        # coordinate axis exists to isolate.
+        ap.error("--frozen_a_row_scale is required with --lora_mode frozen-a; "
+                 "declare 'peft-init' to match the trainable-A+B step scale "
+                 "or 'unit' to measure the rescale itself")
+    row_scale = args.frozen_a_row_scale
     commit = get_git_commit()
     if (canonical_weight_by == "normmaxmin"
-            and (commit == "unknown" or commit.endswith("-dirty"))
+            and (commit == "unknown" or commit.endswith("-dirty")
+                 or commit.endswith("-unknown-worktree"))
             and not args.allow_dirty_provenance):
         ap.error("normmaxmin refuses unknown/dirty source provenance; commit "
                  "the exact implementation or use --allow_dirty_provenance "
@@ -548,6 +556,11 @@ def main():
         args.model, model_path, args.lora_rank, fp16,
         lora_mode=args.lora_mode, grad_ckpt=not args.no_grad_ckpt,
         row_scale=row_scale)
+    # Two scale families, one per geometry. Raw-B space needs the frozen-A row
+    # constant c supplied explicitly (sigma*c); any space that materializes
+    # B A - B_g A_g contracts the real A and already carries c, so it takes
+    # sigma alone. Mixing them counts c twice.
+    materialized_scales = peft_scales(module_scales)
     global_state = get_adapter_state(model)
 
     # Preserve historical trainable-A+B filenames. New frozen-A runs add a
@@ -654,7 +667,7 @@ def main():
         # fact. Cheap: the trace identity keeps this to r x r products.
         try:
             delta_norms = client_update_norms(
-                states, round_broadcast, module_scales=module_scales)
+                states, round_broadcast, module_scales=materialized_scales)
             out.setdefault("client_delta_norms", {})[label] = dict(
                 zip(args.slices, delta_norms))
         except Exception as exc:
@@ -680,7 +693,7 @@ def main():
             weights = None
         elif args.weight_by in ("maxmin", "rawmaxmin"):
             weights = maxmin_weights(
-                states, round_broadcast, module_scales=module_scales)
+                states, round_broadcast, module_scales=materialized_scales)
             scheme_result = weights
         elif args.weight_by == "normmaxmin":
             fedspan = fedspan_delta_weights(
@@ -708,9 +721,16 @@ def main():
                   f"achieved={fedspan['achieved_min_direction_cosine']} "
                   f"optimal={fedspan['min_norm_value']} "
                   f"shortfall={fedspan['direction_solver_shortfall']}")
+            if fedspan["fallback"] is not None:
+                # Symmetric with every other arm's fallback notice: an arm
+                # that no-ops for a whole run otherwise reports the frozen
+                # baseline's numbers under the FedSpan label.
+                print(f"  WARNING: normmaxmin fell back to "
+                      f"{fedspan['fallback']} ({fedspan['status']}): "
+                      f"{fedspan['solver_message']}")
         elif args.weight_by == "mgda":
             weights = mgda_weights(
-                states, round_broadcast, module_scales=module_scales)
+                states, round_broadcast, module_scales=materialized_scales)
             scheme_result = weights
         elif args.weight_by == "afl":
             afl_lam = afl_update(afl_lam, losses, args.afl_eta)
@@ -721,7 +741,7 @@ def main():
             # inner products, and the float32 default loses the small client
             # delta once the broadcast dominates it.
             sq_norms = np.diag(update_gram(
-                states, round_broadcast, module_scales=module_scales,
+                states, round_broadcast, module_scales=materialized_scales,
                 dtype=torch.float64)).tolist()
             delta_v = qffl_delta_weights(losses, sq_norms, q=args.qffl_q,
                                          L=1.0 / args.lr)

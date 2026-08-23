@@ -243,6 +243,35 @@ def configure_frozen_lora_a(model, adapter_name="default", row_scale="unit"):
     return scales
 
 
+def peft_scales(module_scales):
+    """The bare PEFT scales ``sigma`` behind a frozen-A geometry mapping.
+
+    ``configure_frozen_lora_a`` returns ``sigma * c`` because raw-B space has
+    to supply the row constant itself. A materialized update
+    ``B A - B_g A_g`` contracts the real A and therefore already carries c, so
+    it must be scaled by ``sigma`` alone; applying ``sigma * c`` there counts c
+    twice. Mappings with no measurement records carry no row constant — a
+    scalar ``alpha/r``, or a caller-supplied dict — and are returned unchanged.
+    """
+    records = getattr(module_scales, "records", None)
+    if not records:
+        return module_scales
+    bare = {}
+    for name in module_scales:
+        scale = (records.get(name) or {}).get("peft_scale")
+        try:
+            value = float(scale)
+        except (TypeError, ValueError):
+            value = float("nan")
+        if not math.isfinite(value) or value <= 0:
+            raise FedSpanContractError(
+                f"module '{name}' has a geometry scale but no usable PEFT "
+                f"scale ({scale!r}), so the frozen-A row constant cannot be "
+                "removed")
+        bare[name] = value
+    return bare
+
+
 def _module_pairs(state, dtype=torch.float32):
     mods = {}
     for k, v in state.items():
@@ -289,6 +318,13 @@ def update_gram(client_states, broadcast_state, normalize=False,
     inner products otherwise. Exact in factor space via the trace identity.
     ``dtype`` is the accumulation precision; float64 is required whenever the
     client delta is small next to the broadcast it is subtracted from.
+
+    CONTRACT: ``module_scales`` must be bare PEFT scales ``sigma``, NEVER the
+    frozen-A geometry scales ``sigma * c`` that ``configure_frozen_lora_a``
+    returns. The trace identity contracts the real A tensors, so the update
+    this function scales already carries the row constant c; passing
+    ``sigma * c`` reports ``c`` times the truth and reweights the cosine Gram
+    by ``c_l^2`` per module. Use ``peft_scales()`` on a frozen-A mapping.
     """
     stacks = _update_stacks(client_states, broadcast_state, dtype=dtype)
     module_names = sorted(set().union(*(set(stack) for stack in stacks)))
@@ -315,6 +351,8 @@ def client_update_norms(client_states, broadcast_state, module_scales=None):
     Arm-agnostic: it uses the full B A - B_g A_g update, so it is defined for
     trainable-A arms as well as frozen-A ones, which is what makes per-round
     step magnitudes comparable across arms.
+
+    ``module_scales`` are bare PEFT scales; see ``update_gram``'s contract.
     """
     gram = update_gram(client_states, broadcast_state, normalize=False,
                        module_scales=module_scales, dtype=torch.float64)
@@ -337,6 +375,8 @@ def maxmin_weights(client_states, broadcast_state, module_scales=None,
     residue of either sign — so the guard is relative to the largest
     diagonal, not a bare sign test. Normalizing such a row would divide the
     cosine Gram by the square root of that residue.
+
+    ``module_scales`` are bare PEFT scales; see ``update_gram``'s contract.
     """
     from scipy.optimize import linprog
     G = update_gram(client_states, broadcast_state, normalize=False,
@@ -380,6 +420,8 @@ def mgda_weights(client_states, broadcast_state, iters=500, tol=1e-9,
     specialized to our exact factor-space Gram). Raw — not cosine — inner
     products: MGDA operates on unnormalized task gradients by definition,
     which is exactly the property the paper contrasts with the max-min LP.
+
+    ``module_scales`` are bare PEFT scales; see ``update_gram``'s contract.
     """
     G = update_gram(client_states, broadcast_state, normalize=False,
                     module_scales=module_scales)

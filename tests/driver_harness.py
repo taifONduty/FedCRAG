@@ -14,6 +14,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import federated_forgetting as driver  # noqa: E402
+from aggregation_schemes import ModuleScales  # noqa: E402
 
 MODULE = "encoder.layer0.query"
 A_KEY = f"{MODULE}.lora_A.weight"
@@ -32,21 +33,47 @@ CLIENT_B_BLOCKS = {
 }
 
 
-def broadcast_state():
-    """Shared row-orthonormal A and a zero B, as frozen-A initialization."""
+def broadcast_state(row_scale_c=1.0):
+    """Shared A with ``A A^T = c^2 I`` and a zero B, as frozen-A init.
+
+    ``row_scale_c`` defaults to 1 for the historical fixtures. Any value other
+    than 1 is what makes the geometry scale ``sigma*c`` numerically distinct
+    from the bare PEFT scale ``sigma``.
+    """
     return {
-        A_KEY: torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        A_KEY: float(row_scale_c) * torch.tensor(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
         B_KEY: torch.zeros(3, 2),
     }
 
 
-def client_states():
-    base = broadcast_state()
+def client_states(row_scale_c=1.0):
+    base = broadcast_state(row_scale_c)
     return {
         name: {A_KEY: base[A_KEY].clone(),
                B_KEY: torch.tensor(block)}
         for name, block in CLIENT_B_BLOCKS.items()
     }
+
+
+def module_scales(lora_mode, row_scale_c=1.0):
+    """What ``new_model`` hands back: geometry scales for frozen-A, sigma else.
+
+    Mirrors ``configure_frozen_lora_a``: the mapping is ``sigma*c`` and the
+    per-module records carry the bare ``sigma`` that materialized spaces need.
+    """
+    if lora_mode != "frozen-a":
+        return MODULE_SCALE
+    c = float(row_scale_c)
+    scales = ModuleScales({MODULE: MODULE_SCALE * c})
+    scales.records[MODULE] = {
+        "peft_scale": MODULE_SCALE,
+        "row_scale_mode": "constant",
+        "row_scale_c": c,
+        "measured_init_row_rms": c,
+        "geometry_scale": MODULE_SCALE * c,
+    }
+    return scales
 
 
 def effective_updates(states, broadcast):
@@ -65,9 +92,10 @@ def cosine_gram(states, broadcast):
     return (stacked @ stacked.T) / np.outer(norms, norms), norms
 
 
-def install_mocks(monkeypatch, commit=CLEAN_COMMIT, clients=None):
-    clients = clients or client_states()
-    base = broadcast_state()
+def install_mocks(monkeypatch, commit=CLEAN_COMMIT, clients=None,
+                  row_scale_c=1.0):
+    clients = clients or client_states(row_scale_c)
+    base = broadcast_state(row_scale_c)
 
     monkeypatch.setattr(driver, "get_git_commit", lambda: commit)
     monkeypatch.setattr(
@@ -79,7 +107,10 @@ def install_mocks(monkeypatch, commit=CLEAN_COMMIT, clients=None):
         driver, "resolve_local", lambda name: ("fake-model", "", "", False))
     monkeypatch.setattr(
         driver, "new_model",
-        lambda *args, **kwargs: (object(), {MODULE: MODULE_SCALE}))
+        lambda *args, **kwargs: (
+            object(),
+            module_scales(kwargs.get("lora_mode", "trainable-ab"),
+                          row_scale_c)))
     monkeypatch.setattr(
         driver, "get_adapter_state",
         lambda model: {key: value.clone() for key, value in base.items()})
@@ -101,7 +132,7 @@ def install_mocks(monkeypatch, commit=CLEAN_COMMIT, clients=None):
 
 
 def build_argv(out_directory, lora_mode, arm, num_rounds=1,
-               direction_policy="minnorm", extra=()):
+               direction_policy="minnorm", extra=(), row_scale="unit"):
     argv = [
         "federated_forgetting.py",
         "--slices", *SLICES,
@@ -111,6 +142,8 @@ def build_argv(out_directory, lora_mode, arm, num_rounds=1,
         "--save_states",
         "--out", str(out_directory),
     ]
+    if lora_mode == "frozen-a" and row_scale is not None:
+        argv.extend(["--frozen_a_row_scale", row_scale])
     if arm != "uniform":
         argv.extend(["--weighted", "--weight_by", arm])
     if arm == "normmaxmin":
@@ -122,12 +155,14 @@ def build_argv(out_directory, lora_mode, arm, num_rounds=1,
 
 def run_driver(monkeypatch, out_directory, lora_mode, arm, num_rounds=1,
                direction_policy="minnorm", commit=CLEAN_COMMIT, extra=(),
-               clients=None):
+               clients=None, row_scale_c=1.0, row_scale="unit"):
     """Run one driver invocation; returns (result dict, result path)."""
-    install_mocks(monkeypatch, commit=commit, clients=clients)
+    install_mocks(monkeypatch, commit=commit, clients=clients,
+                  row_scale_c=row_scale_c)
     monkeypatch.setattr(sys, "argv", build_argv(
         out_directory, lora_mode, arm, num_rounds=num_rounds,
-        direction_policy=direction_policy, extra=extra))
+        direction_policy=direction_policy, extra=extra,
+        row_scale=row_scale))
     driver.main()
 
     paths = list(Path(out_directory).glob("federated_*.json"))

@@ -1,5 +1,12 @@
-"""Static contract tests for the frozen E0 attribution launcher."""
+"""Contract tests for the frozen E0 attribution launcher.
+
+``manifest`` and ``bash -n`` cannot see a guard that aborts before any row is
+launched, so ``verify`` — the subcommand ``run`` and ``resume`` both begin
+with — is exercised here for real, in a hermetic clean worktree.
+"""
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -116,6 +123,91 @@ def test_e0_commands_freeze_shared_scientific_contract():
             assert "--fedspan_step_norm" not in command
             # The driver rejects the direction policy on any other arm.
             assert "--fedspan_direction_policy" not in command
+
+
+# -------------------------------------------------- the verify subcommand
+
+
+def _clean_launcher_tree(tmp_path, source=None):
+    """A one-commit Git worktree holding only the launcher.
+
+    ``verify`` refuses a dirty tree, and a development checkout normally is
+    one, so the subcommand can only be exercised somewhere hermetic.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "run_e0.sh").write_text(
+        SCRIPT.read_text() if source is None else source)
+    identity = ["-c", "user.email=e0@test", "-c", "user.name=E0 Test"]
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git"] + identity + ["add", "-A"], cwd=root, check=True)
+    subprocess.run(["git"] + identity + ["commit", "-qm", "launcher"],
+                   cwd=root, check=True)
+    return root
+
+
+def _stub_python(tmp_path):
+    """Production Python for every call except the nested suite invocation.
+
+    ``verify`` runs the whole test suite; letting it do so from inside that
+    same suite would recurse without bound.
+    """
+    path = tmp_path / "python-stub"
+    path.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-m" ] && [ "$2" = "pytest" ]; then\n'
+        '  echo "stub: nested suite not re-run"\n'
+        "  exit 0\n"
+        "fi\n"
+        'exec "$REAL_PYTHON" "$@"\n')
+    path.chmod(0o755)
+    return path
+
+
+def _run_verify(tmp_path, source=None):
+    root = _clean_launcher_tree(tmp_path, source=source)
+    environment = dict(
+        os.environ,
+        PYTHON=str(_stub_python(tmp_path)),
+        REAL_PYTHON=sys.executable,
+        E0_OUT=str(tmp_path / "out"))
+    return subprocess.run(
+        ["bash", "run_e0.sh", "verify"], cwd=root,
+        capture_output=True, text=True, env=environment)
+
+
+def test_verify_accepts_the_grid_the_launcher_actually_ships(tmp_path):
+    """The launcher and the grid must agree, or E0 cannot start at all."""
+    expected = len(manifest_rows())
+    completed = _run_verify(tmp_path)
+
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert f"{expected} frozen commands" in completed.stdout
+    printed = [line for line in completed.stdout.splitlines() if "\t" in line]
+    assert len(printed) == expected
+    assert not (tmp_path / "out").exists()
+
+
+def test_verify_reports_a_row_count_drift_instead_of_exiting_silently(
+        tmp_path):
+    """A bare ``[[ ]]`` guard under ``set -e`` aborts with no output at all."""
+    drifted = SCRIPT.read_text().replace(
+        "E0_ROWS=(\n",
+        'E0_ROWS=(\n  "e0-drift|frozen-a|uniform|full|0|unit"\n', 1)
+    assert drifted != SCRIPT.read_text()
+    completed = _run_verify(tmp_path, source=drifted)
+
+    assert completed.returncode != 0
+    assert completed.stderr.strip(), "the abort explained nothing"
+    assert str(len(manifest_rows()) + 1) in completed.stderr
+
+
+def test_launcher_never_hardcodes_the_grid_size_in_operator_text():
+    """The COMPLETE record is a claim about the campaign; it must be true."""
+    source = SCRIPT.read_text()
+    assert "all ten rows" not in source
+    assert "10 frozen commands" not in source
+    assert '"${#E0_ROWS[@]}"' in source
 
 
 def test_e0_launcher_is_syntax_clean_and_never_provisions_cloud():

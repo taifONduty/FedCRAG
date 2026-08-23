@@ -5,9 +5,11 @@ production aggregation functions would only re-run the code under test, which
 cannot detect a persisted global that the production code never produced.
 """
 import argparse
+import hashlib
 import json
 import math
 import re
+import statistics
 import sys
 from pathlib import Path
 
@@ -27,6 +29,15 @@ _AGGREGATE_RTOL = 1e-5
 
 _SUPPORTED_ARMS = (None, "rawmaxmin", "normmaxmin")
 _DIRECTION_POLICIES = ("minnorm", "maxmin-lp")
+
+# The applied step norm and the median active client norm reach the same
+# quantity by different routes: one through the float64 geometry scale
+# sigma*c, the other through the float32 A the adapter state carries. The
+# measured gap on a float32 frozen-A state is 1.8e-08 relative; the defect
+# class this gate exists for (a lost divisor, a median over the wrong set, a
+# double-counted row constant) is an O(1) fraction of the norm.
+_STEP_NORM_RTOL = 1e-5
+_APPLIED_NORM_RTOL = 1e-9
 
 _MANIFEST_SCHEMA = "fedcrag-e0-manifest/1"
 _RESOURCE_SCHEMA = "fedcrag-e0-resources/1"
@@ -103,6 +114,12 @@ def _assert_finite_state(state, label):
             nonfinite == 0,
             f"{label}: '{key}' has {nonfinite} of {tensor.numel()} "
             "nonfinite entries")
+
+
+def _states_are_identical(left, right):
+    if left is None or right is None or set(left) != set(right):
+        return False
+    return all(torch.equal(left[key], right[key]) for key in left)
 
 
 def _validate_finite_states(payload, round_label):
@@ -304,6 +321,141 @@ def _validate_direction_policy(diagnostic, round_label):
              "iterations)")
 
 
+def _fedspan_module_scales(diagnostic, module_names, round_label):
+    """The per-module raw-B geometry scales the run recorded, validated."""
+    scales = diagnostic.get("module_scales")
+    _require(
+        isinstance(scales, dict) and sorted(scales) == sorted(module_names),
+        f"{round_label}: fedspan diagnostics record no module scale for every "
+        "LoRA module")
+    resolved = {}
+    for name in module_names:
+        value = scales[name]
+        _require(_finite(value) and float(value) > 0,
+                 f"{round_label}: invalid module scale for '{name}': {value!r}")
+        resolved[name] = float(value)
+    return resolved
+
+
+def _raw_b_delta_blocks(broadcast_state, state, scales, modules):
+    """``{module: scale * (B_state - B_broadcast)}`` in float64.
+
+    Mirrors the arithmetic the aggregation performs so the recomputation can
+    be compared bit-for-bit against the persisted effective-step hashes, but
+    reads every operand out of the state files rather than out of the run.
+    """
+    return {
+        name: scales[name] * (
+            state[modules[name]["B"]].detach().cpu().double()
+            - broadcast_state[modules[name]["B"]].detach().cpu().double())
+        for name in sorted(modules)
+    }
+
+
+def _effective_step_sha256(blocks):
+    digest = hashlib.sha256()
+    for name in sorted(blocks):
+        tensor = blocks[name].detach().cpu().double().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _block_norm(blocks):
+    return math.sqrt(sum(float(torch.sum(value ** 2).item())
+                         for value in blocks.values()))
+
+
+def _validate_median_active_step(result, diagnostic, round_label):
+    """The step the server took must be the median of what the clients took.
+
+    ``resolved_step_norm`` and ``client_delta_norms`` are two records of one
+    quantity written into one file by two different computations. Comparing
+    them is the only check that sees a scale leaking into one and not the
+    other.
+    """
+    if diagnostic.get("step_policy") != "median-active":
+        return
+    active = diagnostic.get("active_indices") or []
+    resolved = diagnostic.get("resolved_step_norm")
+    if not active or not _finite(resolved) or float(resolved) <= 0:
+        return
+    slices = list(result["slices"])
+    norms = (result.get("client_delta_norms") or {}).get(round_label) or {}
+    _require(
+        all(0 <= index < len(slices) for index in active),
+        f"{round_label}: active client index is outside the slice list")
+    values = []
+    for index in active:
+        value = norms.get(slices[index])
+        _require(_finite(value),
+                 f"{round_label}: active client {slices[index]} has no finite "
+                 "recorded delta norm to compare the server step against")
+        values.append(float(value))
+    median = statistics.median(values)
+    resolved = float(resolved)
+    tolerance = _STEP_NORM_RTOL * max(1.0, abs(resolved))
+    _require(
+        abs(median - resolved) <= tolerance,
+        f"{round_label}: resolved step norm {resolved:.10g} is not the median "
+        f"active client delta norm {median:.10g} (ratio "
+        f"{resolved / median if median else float('inf'):.10g})")
+
+
+def _validate_recomputed_fedspan_step(result, payload, diagnostic,
+                                      round_label):
+    """Rebuild the applied and solved effective steps from the state files."""
+    application = diagnostic["application"]
+    modules = _lora_modules(payload["broadcast"], f"{round_label} broadcast")
+    scales = _fedspan_module_scales(diagnostic, sorted(modules), round_label)
+    slices = list(result["slices"])
+    coefficients = [float(value) for value in diagnostic["delta_weights"]]
+    _require(len(coefficients) == len(slices),
+             f"{round_label}: recorded delta weights do not cover every client")
+
+    applied_blocks = _raw_b_delta_blocks(
+        payload["broadcast"], payload["global"], scales, modules)
+    applied_norm = _block_norm(applied_blocks)
+    recorded_norm = float(application["applied_step_norm"])
+    tolerance = _APPLIED_NORM_RTOL * max(1.0, applied_norm)
+    _require(
+        abs(applied_norm - recorded_norm) <= tolerance,
+        f"{round_label}: applied step norm recomputed from the persisted "
+        f"states is {applied_norm:.10g}, but the run recorded "
+        f"{recorded_norm:.10g}")
+    _require(
+        application.get("applied_effective_step_sha256")
+        == _effective_step_sha256(applied_blocks),
+        f"{round_label}: applied_effective_step_sha256 does not match the "
+        "effective step implied by the persisted broadcast and global")
+
+    solved_hash = diagnostic.get("solved_effective_step_sha256")
+    if solved_hash is None:
+        return applied_norm
+    client_blocks = [
+        _raw_b_delta_blocks(
+            payload["broadcast"], payload["clients"][name], scales, modules)
+        for name in slices
+    ]
+    active = diagnostic.get("active_indices") or []
+    _require(
+        active and all(0 <= index < len(slices) for index in active),
+        f"{round_label}: a solved effective step was recorded but the active "
+        f"client set {active!r} cannot produce one")
+    solved_blocks = {
+        name: sum(coefficients[index] * client_blocks[index][name]
+                  for index in active)
+        for name in sorted(modules)
+    }
+    _require(
+        solved_hash == _effective_step_sha256(solved_blocks),
+        f"{round_label}: solved_effective_step_sha256 does not match the "
+        "coefficient mixture implied by the persisted client states")
+    return applied_norm
+
+
 def _validate_fedspan_round(result, payload, round_label):
     diagnostic = result["fedspan_diagnostics"][round_label]
     application = diagnostic["application"]
@@ -372,6 +524,13 @@ def _validate_fedspan_round(result, payload, round_label):
                     for value in diagnostic["delta_weights"]),
             f"{round_label}: fallback has a nonzero applied coefficient")
 
+    # Independent of everything above: rebuild the step from the state files
+    # rather than comparing two numbers the run wrote about itself.
+    _validate_median_active_step(result, diagnostic, round_label)
+    recomputed_norm = _validate_recomputed_fedspan_step(
+        result, payload, diagnostic, round_label)
+    return {"fallback": fallback, "applied_step_norm": recomputed_norm}
+
 
 # ------------------------------------------------------- launch provenance
 
@@ -405,6 +564,9 @@ def _validate_manifest_row(result, row, run_id):
         f"run commit {result['commit']} differs from the manifest commit "
         f"{row['commit']}")
 
+    # Two of the grid's axes live only in these flags: e0-frozen-a-uniform-full
+    # and e0-frozen-a-unitscale-uniform-full differ in the row scale alone, and
+    # the direction policy is a declared part of the normmaxmin method.
     launched = {
         "seed": int(_argv_value(argv, "--seed", required=True)),
         "num_rounds": int(_argv_value(argv, "--num_rounds", required=True)),
@@ -414,12 +576,16 @@ def _validate_manifest_row(result, row, run_id):
         "slices": _argv_values(argv, "--slices"),
         "weight_by": (_argv_value(argv, "--weight_by")
                       if "--weighted" in argv else None),
+        "frozen_a_row_scale": _argv_value(argv, "--frozen_a_row_scale"),
+        "fedspan_direction_policy": _argv_value(
+            argv, "--fedspan_direction_policy"),
     }
     _require(launched["slices"], "manifest command omits --slices")
     arguments = result.get("args")
     _require(isinstance(arguments, dict)
              and "max_steps_per_round" in arguments,
              "result records no argument namespace to compare")
+    contract = result.get("method_contract") or {}
     recorded = {
         "seed": int(result["seed"]),
         "num_rounds": int(result["num_rounds"]),
@@ -427,6 +593,8 @@ def _validate_manifest_row(result, row, run_id):
         "max_steps_per_round": int(arguments["max_steps_per_round"]),
         "slices": list(result["slices"]),
         "weight_by": result["weight_by"],
+        "frozen_a_row_scale": contract.get("frozen_a_row_scale"),
+        "fedspan_direction_policy": contract.get("fedspan_direction_policy"),
     }
     for field, expected in sorted(launched.items()):
         _require(
@@ -525,6 +693,16 @@ def validate_run_directory(run_directory, manifest_row=None):
         len(state_paths) == num_rounds,
         f"expected {num_rounds} state files, found {len(state_paths)}")
 
+    contract = result.get("method_contract") or {}
+    if result["lora_mode"] == "frozen-a":
+        # An implicit 'unit' default silently reintroduces the ~1.73x B->dW
+        # rescale the frozen-A coordinate axis exists to isolate.
+        _require(
+            contract.get("frozen_a_row_scale_specified") is True,
+            "frozen-A run's row scale was not specified explicitly, so the "
+            f"recorded scale {contract.get('frozen_a_row_scale')!r} is an "
+            "implicit default")
+
     launched = None
     resources = None
     if manifest_row is not None:
@@ -534,6 +712,10 @@ def validate_run_directory(run_directory, manifest_row=None):
 
     worst_ratio = 0.0
     worst_round = None
+    fallback_rounds = 0
+    applied_rounds = 0
+    first_broadcast = None
+    final_global = None
     for round_number in range(1, num_rounds + 1):
         round_label = f"round_{round_number}"
         state_path = _single(
@@ -555,13 +737,35 @@ def validate_run_directory(run_directory, manifest_row=None):
         _validate_client_delta_norms(result, round_label, result["slices"])
         if result["lora_mode"] == "frozen-a":
             _validate_fixed_a(payload, round_label)
-        if result.get("weight_by_canonical") == "normmaxmin":
-            _validate_fedspan_round(result, payload, round_label)
         recomputation = _validate_recomputed_global(
             result, payload, round_label)
+        if result.get("weight_by_canonical") == "normmaxmin":
+            step = _validate_fedspan_round(result, payload, round_label)
+            if step["fallback"] is not None:
+                fallback_rounds += 1
+            elif step["applied_step_norm"] > 0.0:
+                applied_rounds += 1
+        if first_broadcast is None:
+            first_broadcast = payload["broadcast"]
+        final_global = payload["global"]
         if recomputation["max_tolerance_ratio"] > worst_ratio:
             worst_ratio = recomputation["max_tolerance_ratio"]
             worst_round = round_label
+
+    if result.get("weight_by_canonical") == "normmaxmin":
+        # A normmaxmin arm that no-ops for its whole life reports the frozen
+        # baseline's retention under the FedSpan label, and does so at the
+        # healthiest possible recomputation headroom, because nothing was
+        # aggregated to deviate.
+        _require(
+            applied_rounds > 0,
+            f"the normmaxmin arm never applied a nonzero update: all "
+            f"{fallback_rounds} of {num_rounds} rounds fell back to a zero "
+            "step, so this run carries the frozen baseline's numbers")
+        _require(
+            not _states_are_identical(first_broadcast, final_global),
+            "the normmaxmin arm's final global is bit-identical to the "
+            "round-1 broadcast, so no server update survived the campaign")
 
     report = {
         "result_path": str(result_path),
@@ -571,6 +775,8 @@ def validate_run_directory(run_directory, manifest_row=None):
         "weight_by_canonical": result.get("weight_by_canonical"),
         "aggregate_recomputation_worst_tolerance_ratio": worst_ratio,
         "aggregate_recomputation_worst_round": worst_round,
+        "fedspan_fallback_rounds": fallback_rounds,
+        "fedspan_applied_rounds": applied_rounds,
         "manifest_verified": manifest_row is not None,
     }
     if launched is not None:

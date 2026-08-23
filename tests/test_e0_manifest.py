@@ -27,7 +27,7 @@ def manifest_rows():
     return rows
 
 
-def test_e0_manifest_is_exact_ten_row_cartesian_product():
+def test_e0_manifest_is_the_attribution_grid_plus_row_scale_control():
     rows = manifest_rows()
     expected = {
         (coordinate, arm, regime, max_steps)
@@ -42,9 +42,30 @@ def test_e0_manifest_is_exact_ten_row_cartesian_product():
         (row["coordinate"], row["arm"], row["regime"], row["max_steps"])
         for row in rows
     }
-    assert len(rows) == 10
-    assert len({row["run_id"] for row in rows}) == 10
+    assert len(rows) == 11
+    assert len({row["run_id"] for row in rows}) == 11
     assert observed == expected
+
+
+def test_frozen_a_rows_declare_a_row_scale_and_isolate_the_rescale():
+    # frozen-A rows must be step-scale matched to trainable-A+B (peft-init),
+    # or they confound the freeze with a ~1.73x B->dW rescale; exactly one
+    # unit-scale row exists to measure that rescale on its own.
+    rows = manifest_rows()
+    frozen = [row for row in rows if row["coordinate"] == "frozen-a"]
+    trainable = [row for row in rows if row["coordinate"] == "trainable-ab"]
+    assert frozen and trainable
+    for row in trainable:
+        assert "--frozen_a_row_scale" not in row["command"]
+    scales = [
+        "unit" if "--frozen_a_row_scale unit" in row["command"] else
+        "peft-init" if "--frozen_a_row_scale peft-init" in row["command"]
+        else None
+        for row in frozen
+    ]
+    assert None not in scales
+    assert scales.count("unit") == 1
+    assert scales.count("peft-init") == len(frozen) - 1
 
 
 def test_e0_commands_freeze_shared_scientific_contract():
@@ -79,6 +100,10 @@ def test_e0_commands_freeze_shared_scientific_contract():
         if row["arm"] == "normmaxmin":
             for required in (
                 "--fedspan_step_policy median-active",
+                # D1: the direction solver is a declared part of the method,
+                # and the driver refuses normmaxmin without it. Omitting it
+                # here would abort the campaign at CLI parse.
+                "--fedspan_direction_policy minnorm",
                 "--fedspan_active_abs_tol 1e-12",
                 "--fedspan_active_rel_tol 1e-8",
                 "--fedspan_mixture_norm_tol 1e-6",
@@ -89,6 +114,8 @@ def test_e0_commands_freeze_shared_scientific_contract():
         else:
             assert "--fedspan_step_policy" not in command
             assert "--fedspan_step_norm" not in command
+            # The driver rejects the direction policy on any other arm.
+            assert "--fedspan_direction_policy" not in command
 
 
 def test_e0_launcher_is_syntax_clean_and_never_provisions_cloud():

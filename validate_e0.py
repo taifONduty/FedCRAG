@@ -1,12 +1,36 @@
-"""Validate persisted E0 result/state contracts without evaluating metrics."""
+"""Validate persisted E0 result/state contracts without evaluating metrics.
+
+The aggregate recomputation below is written inline on purpose. Calling the
+production aggregation functions would only re-run the code under test, which
+cannot detect a persisted global that the production code never produced.
+"""
 import argparse
 import json
 import math
+import re
+import sys
 from pathlib import Path
 
 import torch
 
 from aggregation_schemes import state_dict_sha256
+
+_LORA_KEY = re.compile(r"(.*)\.lora_(A|B)\.weight$")
+
+# Server aggregates are stored as float32, so an independent recomputation in
+# float64 agrees only to float32 resolution. Tolerance is relative to the
+# largest magnitude in the expected tensor, floored at 1 so near-zero blocks
+# keep an absolute floor. Measured worst deviation/tolerance ratio across the
+# five E0 aggregation paths on four-client rounds: 1.0e-02 (trainable-ab), and
+# exactly 0 on every frozen-A path. A global rescaled by 1.5x scores 5.0e+04.
+_AGGREGATE_RTOL = 1e-5
+
+_SUPPORTED_ARMS = (None, "rawmaxmin", "normmaxmin")
+_DIRECTION_POLICIES = ("minnorm", "maxmin-lp")
+
+_MANIFEST_SCHEMA = "fedcrag-e0-manifest/1"
+_RESOURCE_SCHEMA = "fedcrag-e0-resources/1"
+_RESOURCE_FILENAME = "e0_resources.json"
 
 
 class E0ValidationError(RuntimeError):
@@ -24,8 +48,30 @@ def _single(paths, label):
     return paths[0]
 
 
+def _finite(value):
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def _a_keys(state):
     return sorted(key for key in state if ".lora_A.weight" in key)
+
+
+def _lora_modules(state, label):
+    """{module: {"A": key, "B": key}} for every complete LoRA factor pair."""
+    modules = {}
+    for key in state:
+        match = _LORA_KEY.match(key)
+        if match:
+            modules.setdefault(match.group(1), {})[match.group(2)] = key
+    _require(modules, f"{label}: state contains no LoRA A/B factor keys")
+    incomplete = sorted(name for name, factors in modules.items()
+                        if set(factors) != {"A", "B"})
+    _require(not incomplete,
+             f"{label}: incomplete LoRA factor keys for modules {incomplete}")
+    return modules
 
 
 def _validate_fixed_a(payload, round_label):
@@ -44,6 +90,220 @@ def _validate_fixed_a(payload, round_label):
                 f"{round_label}: client {client_name} A changed at {key}")
 
 
+# ------------------------------------------------------------- finiteness
+
+
+def _assert_finite_state(state, label):
+    for key in sorted(state):
+        tensor = state[key]
+        if not tensor.is_floating_point():
+            continue
+        nonfinite = int((~torch.isfinite(tensor)).sum().item())
+        _require(
+            nonfinite == 0,
+            f"{label}: '{key}' has {nonfinite} of {tensor.numel()} "
+            "nonfinite entries")
+
+
+def _validate_finite_states(payload, round_label):
+    _assert_finite_state(payload["broadcast"], f"{round_label} broadcast")
+    _assert_finite_state(payload["global"], f"{round_label} global")
+    for name, state in sorted(payload["clients"].items()):
+        _assert_finite_state(state, f"{round_label} client {name}")
+
+
+# --------------------------------------------- independent recomputation
+
+
+def _reference_weighted_average(client_states, weights):
+    """Simplex average of complete client states (the trainable-A+B path)."""
+    out = {}
+    for key in client_states[0]:
+        accumulator = None
+        for weight, state in zip(weights, client_states):
+            term = weight * state[key].detach().cpu().double()
+            accumulator = term if accumulator is None else accumulator + term
+        out[key] = accumulator.float()
+    return out
+
+
+def _reference_frozen_b_delta(broadcast_state, client_states, coefficients):
+    """Raw-B delta application with A copied bit-for-bit (the frozen-A path)."""
+    out = {key: value.detach().cpu().clone()
+           for key, value in broadcast_state.items()}
+    modules = _lora_modules(broadcast_state, "broadcast")
+    for factors in modules.values():
+        b_key = factors["B"]
+        base = broadcast_state[b_key].detach().cpu().double()
+        accumulator = base.clone()
+        for coefficient, state in zip(coefficients, client_states):
+            if coefficient == 0.0:
+                continue
+            accumulator += coefficient * (
+                state[b_key].detach().cpu().double() - base)
+        out[b_key] = accumulator.float()
+    return out
+
+
+def _compare_aggregates(expected, actual, label):
+    """Worst (deviation, deviation/tolerance, key); raises past tolerance."""
+    _require(set(expected) == set(actual),
+             f"{label}: recomputed aggregate has a different key set")
+    worst_deviation = 0.0
+    worst_ratio = 0.0
+    worst_key = None
+    for key in sorted(expected):
+        want = expected[key].detach().cpu().double()
+        got = actual[key].detach().cpu().double()
+        _require(tuple(want.shape) == tuple(got.shape),
+                 f"{label}: recomputed aggregate shape differs at '{key}'")
+        if not want.numel():
+            continue
+        deviation = float(torch.max(torch.abs(want - got)).item())
+        scale = float(torch.max(torch.abs(want)).item())
+        tolerance = _AGGREGATE_RTOL * max(1.0, scale)
+        _require(
+            deviation <= tolerance,
+            f"{label}: persisted global disagrees with the aggregate implied "
+            f"by the recorded weights at '{key}': max |delta| = "
+            f"{deviation:.6g} exceeds tolerance {tolerance:.6g}")
+        ratio = deviation / tolerance
+        if ratio > worst_ratio:
+            worst_deviation, worst_ratio, worst_key = deviation, ratio, key
+    return worst_deviation, worst_ratio, worst_key
+
+
+def _simplex_from_recorded(weights, label):
+    weights = [float(value) for value in weights]
+    _require(all(_finite(value) for value in weights),
+             f"{label}: recorded weights contain a nonfinite value")
+    _require(min(weights) >= 0.0,
+             f"{label}: recorded simplex weights contain a negative value")
+    total = sum(weights)
+    _require(total > 0.0, f"{label}: recorded simplex weights sum to {total}")
+    return [value / total for value in weights]
+
+
+def _round_coefficients(result, round_label, num_clients):
+    """(kind, coefficients) the record says were applied for this round."""
+    arm = result.get("weight_by_canonical")
+    frozen = result["lora_mode"] == "frozen-a"
+    kind = "frozen-b-delta" if frozen else "fedavg"
+    _require(arm in _SUPPORTED_ARMS,
+             f"{round_label}: no recomputation reference for arm '{arm}'")
+
+    if arm is None:
+        _require(not result.get("weighted"),
+                 f"{round_label}: weighted run records no weighting arm")
+        return kind, [1.0 / num_clients] * num_clients
+
+    if arm == "normmaxmin":
+        _require(frozen,
+                 f"{round_label}: normmaxmin requires the frozen-A coordinate")
+        diagnostics = result.get("fedspan_diagnostics") or {}
+        diagnostic = diagnostics.get(round_label)
+        _require(diagnostic is not None,
+                 f"{round_label}: normmaxmin round has no fedspan diagnostics")
+        _require("delta_weights" in diagnostic,
+                 f"{round_label}: fedspan diagnostics record no delta weights")
+        coefficients = [float(value)
+                        for value in diagnostic["delta_weights"]]
+        _require(len(coefficients) == num_clients,
+                 f"{round_label}: recorded delta weights do not cover every "
+                 "client")
+        _require(all(_finite(value) for value in coefficients),
+                 f"{round_label}: recorded delta weights contain a nonfinite "
+                 "value")
+        return kind, coefficients
+
+    diagnostics = result.get("scheme_diagnostics") or {}
+    record = diagnostics.get(round_label)
+    _require(record is not None,
+             f"{round_label}: {arm} round has no scheme diagnostics, so the "
+             "applied weights are not recorded at full precision")
+    _require(record.get("scheme") == arm,
+             f"{round_label}: scheme diagnostics name "
+             f"'{record.get('scheme')}', not '{arm}'")
+    weights = record.get("weights")
+    _require(isinstance(weights, list) and len(weights) == num_clients,
+             f"{round_label}: scheme diagnostics do not record one weight "
+             "per client")
+    return kind, _simplex_from_recorded(weights, round_label)
+
+
+def _validate_recomputed_global(result, payload, round_label):
+    slices = list(result["slices"])
+    clients = payload["clients"]
+    _require(sorted(clients) == sorted(slices),
+             f"{round_label}: persisted client states do not match the slices")
+    client_states = [clients[name] for name in slices]
+    kind, coefficients = _round_coefficients(result, round_label, len(slices))
+    if kind == "fedavg":
+        expected = _reference_weighted_average(client_states, coefficients)
+    else:
+        expected = _reference_frozen_b_delta(
+            payload["broadcast"], client_states, coefficients)
+    deviation, ratio, key = _compare_aggregates(
+        expected, payload["global"], round_label)
+    return {"kind": kind, "max_abs_deviation": deviation,
+            "max_tolerance_ratio": ratio, "worst_key": key}
+
+
+# ------------------------------------------------------- scheme contracts
+
+
+def _validate_scheme_round(result, round_label):
+    diagnostics = result.get("scheme_diagnostics") or {}
+    record = diagnostics.get(round_label)
+    if record is None:
+        return
+    _require(
+        record.get("fallback") is None,
+        f"{round_label}: {record.get('scheme')} fell back to "
+        f"{record.get('fallback')} ({record.get('status')}): "
+        f"{record.get('solver_message')}")
+    _require(record.get("status") != "unreported",
+             f"{round_label}: {record.get('scheme')} reported no solver "
+             "status")
+
+
+def _validate_client_delta_norms(result, round_label, slices):
+    norms = (result.get("client_delta_norms") or {}).get(round_label)
+    _require(norms is not None,
+             f"{round_label}: run records no per-client effective delta "
+             "norms")
+    _require("error" not in norms,
+             f"{round_label}: per-client delta norms failed: "
+             f"{norms.get('error')}")
+    _require(sorted(norms) == sorted(slices),
+             f"{round_label}: per-client delta norms do not cover every "
+             "client")
+    for name, value in sorted(norms.items()):
+        _require(_finite(value) and float(value) >= 0.0,
+                 f"{round_label}: client {name} has an invalid delta norm "
+                 f"{value}")
+
+
+def _validate_direction_policy(diagnostic, round_label):
+    _require(
+        diagnostic.get("direction_policy_specified") is True,
+        f"{round_label}: the FedSpan direction policy was not specified "
+        "explicitly, so the recorded direction is an implicit default")
+    _require(
+        diagnostic.get("direction_policy") in _DIRECTION_POLICIES,
+        f"{round_label}: unknown FedSpan direction policy "
+        f"'{diagnostic.get('direction_policy')}'")
+    for field in ("achieved_min_direction_cosine", "min_norm_value",
+                  "direction_solver_shortfall"):
+        _require(_finite(diagnostic.get(field)),
+                 f"{round_label}: invalid {field}")
+    solver = diagnostic.get("min_norm_solver") or {}
+    _require(solver.get("converged") is True,
+             f"{round_label}: the min-norm reference solver did not converge "
+             f"(gap {solver.get('gap')} after {solver.get('iterations')} "
+             "iterations)")
+
+
 def _validate_fedspan_round(result, payload, round_label):
     diagnostic = result["fedspan_diagnostics"][round_label]
     application = diagnostic["application"]
@@ -51,6 +311,10 @@ def _validate_fedspan_round(result, payload, round_label):
         diagnostic["step_policy"]
         == result["method_contract"]["fedspan_step_policy"],
         f"{round_label}: step policy differs from method contract")
+    _require(
+        diagnostic.get("direction_policy")
+        == result["method_contract"].get("fedspan_direction_policy"),
+        f"{round_label}: direction policy differs from method contract")
     _require(
         application["broadcast_state_sha256"]
         == payload["broadcast_state_sha256"],
@@ -71,6 +335,7 @@ def _validate_fedspan_round(result, payload, round_label):
     fallback = diagnostic.get("fallback")
     applied_norm = float(application["applied_step_norm"])
     if fallback is None:
+        _validate_direction_policy(diagnostic, round_label)
         resolved = diagnostic.get("resolved_step_norm")
         _require(
             resolved is not None and math.isfinite(float(resolved))
@@ -108,7 +373,139 @@ def _validate_fedspan_round(result, payload, round_label):
             f"{round_label}: fallback has a nonzero applied coefficient")
 
 
-def validate_run_directory(run_directory):
+# ------------------------------------------------------- launch provenance
+
+
+def _argv_value(argv, flag, required=False):
+    if flag not in argv:
+        _require(not required, f"manifest command omits {flag}")
+        return None
+    index = argv.index(flag)
+    _require(index + 1 < len(argv), f"manifest command truncates {flag}")
+    return argv[index + 1]
+
+
+def _argv_values(argv, flag):
+    if flag not in argv:
+        return None
+    values = []
+    for token in argv[argv.index(flag) + 1:]:
+        if token.startswith("--"):
+            break
+        values.append(token)
+    return values
+
+
+def _validate_manifest_row(result, row, run_id):
+    argv = list(row["argv"])
+    _require(row["run_id"] == run_id,
+             f"manifest row is for '{row['run_id']}', not '{run_id}'")
+    _require(
+        result["commit"] == row["commit"],
+        f"run commit {result['commit']} differs from the manifest commit "
+        f"{row['commit']}")
+
+    launched = {
+        "seed": int(_argv_value(argv, "--seed", required=True)),
+        "num_rounds": int(_argv_value(argv, "--num_rounds", required=True)),
+        "lora_mode": _argv_value(argv, "--lora_mode", required=True),
+        "max_steps_per_round": int(
+            _argv_value(argv, "--max_steps_per_round", required=True)),
+        "slices": _argv_values(argv, "--slices"),
+        "weight_by": (_argv_value(argv, "--weight_by")
+                      if "--weighted" in argv else None),
+    }
+    _require(launched["slices"], "manifest command omits --slices")
+    arguments = result.get("args")
+    _require(isinstance(arguments, dict)
+             and "max_steps_per_round" in arguments,
+             "result records no argument namespace to compare")
+    recorded = {
+        "seed": int(result["seed"]),
+        "num_rounds": int(result["num_rounds"]),
+        "lora_mode": result["lora_mode"],
+        "max_steps_per_round": int(arguments["max_steps_per_round"]),
+        "slices": list(result["slices"]),
+        "weight_by": result["weight_by"],
+    }
+    for field, expected in sorted(launched.items()):
+        _require(
+            recorded[field] == expected,
+            f"manifest row '{run_id}' launched {field}={expected!r} but the "
+            f"result records {recorded[field]!r}")
+    _require(row["coordinate"] == recorded["lora_mode"],
+             f"manifest row '{run_id}' coordinate differs from --lora_mode")
+    expected_arm = None if row["arm"] == "uniform" else row["arm"]
+    _require(recorded["weight_by"] == expected_arm,
+             f"manifest row '{run_id}' arm '{row['arm']}' differs from the "
+             f"recorded weighting {recorded['weight_by']!r}")
+    return launched
+
+
+def _load_manifest_row(manifest_path, run_id):
+    with Path(manifest_path).open() as handle:
+        manifest = json.load(handle)
+    _require(manifest.get("schema") == _MANIFEST_SCHEMA,
+             f"manifest schema is {manifest.get('schema')!r}, expected "
+             f"{_MANIFEST_SCHEMA!r}")
+    commit = manifest.get("commit")
+    _require(isinstance(commit, str) and commit != "unknown"
+             and not commit.endswith("-dirty")
+             and not commit.endswith("-unknown-worktree"),
+             f"manifest does not have clean Git provenance: {commit!r}")
+    rows = [row for row in manifest["rows"] if row["run_id"] == run_id]
+    _require(len(rows) == 1,
+             f"manifest has {len(rows)} rows for run id '{run_id}'")
+    return {**rows[0], "commit": commit}
+
+
+def _validate_resource_record(run_directory, result):
+    path = Path(run_directory) / _RESOURCE_FILENAME
+    _require(path.is_file(),
+             f"run directory has no {_RESOURCE_FILENAME}, so its GPU-hour "
+             "and determinism claims are unauditable")
+    with path.open() as handle:
+        record = json.load(handle)
+    _require(record.get("schema") == _RESOURCE_SCHEMA,
+             f"{_RESOURCE_FILENAME} schema is {record.get('schema')!r}, "
+             f"expected {_RESOURCE_SCHEMA!r}")
+    elapsed = record.get("elapsed_seconds")
+    _require(_finite(elapsed) and float(elapsed) > 0,
+             f"{_RESOURCE_FILENAME} has an invalid elapsed_seconds "
+             f"{elapsed!r}")
+    rounds = record.get("round_elapsed_seconds")
+    _require(isinstance(rounds, list)
+             and len(rounds) == int(result["num_rounds"])
+             and all(_finite(value) and float(value) >= 0
+                     for value in rounds),
+             f"{_RESOURCE_FILENAME} does not carry one finite elapsed time "
+             f"for each of the {result['num_rounds']} rounds")
+    _require(isinstance(record.get("deterministic_algorithms"), bool),
+             f"{_RESOURCE_FILENAME} does not record whether deterministic "
+             "algorithms were enabled")
+    _require(isinstance(record.get("gpu_available"), bool),
+             f"{_RESOURCE_FILENAME} does not record GPU availability")
+    peak = record.get("peak_gpu_memory_mib")
+    if record["gpu_available"]:
+        _require(_finite(peak) and float(peak) > 0,
+                 f"{_RESOURCE_FILENAME} reports a GPU but no positive peak "
+                 f"memory: {peak!r}")
+    else:
+        _require(peak is None,
+                 f"{_RESOURCE_FILENAME} reports no GPU but a peak memory "
+                 f"{peak!r}")
+    return {
+        "elapsed_seconds": float(elapsed),
+        "peak_gpu_memory_mib": (float(peak) if record["gpu_available"]
+                                else None),
+        "deterministic_algorithms": record["deterministic_algorithms"],
+    }
+
+
+# ------------------------------------------------------------- entry point
+
+
+def validate_run_directory(run_directory, manifest_row=None):
     run_directory = Path(run_directory)
     result_path = _single(
         run_directory.glob("federated_*.json"), "federated result JSON")
@@ -118,7 +515,8 @@ def validate_run_directory(run_directory):
     commit = result.get("commit")
     _require(
         isinstance(commit, str) and commit != "unknown"
-        and not commit.endswith("-dirty"),
+        and not commit.endswith("-dirty")
+        and not commit.endswith("-unknown-worktree"),
         "result does not have clean Git provenance")
 
     num_rounds = int(result["num_rounds"])
@@ -127,6 +525,15 @@ def validate_run_directory(run_directory):
         len(state_paths) == num_rounds,
         f"expected {num_rounds} state files, found {len(state_paths)}")
 
+    launched = None
+    resources = None
+    if manifest_row is not None:
+        launched = _validate_manifest_row(
+            result, manifest_row, run_directory.name)
+        resources = _validate_resource_record(run_directory, result)
+
+    worst_ratio = 0.0
+    worst_round = None
     for round_number in range(1, num_rounds + 1):
         round_label = f"round_{round_number}"
         state_path = _single(
@@ -143,28 +550,64 @@ def validate_run_directory(run_directory):
             == payload["global_state_sha256"],
             f"{round_label}: persisted global hash is invalid")
 
+        _validate_finite_states(payload, round_label)
+        _validate_scheme_round(result, round_label)
+        _validate_client_delta_norms(result, round_label, result["slices"])
         if result["lora_mode"] == "frozen-a":
             _validate_fixed_a(payload, round_label)
         if result.get("weight_by_canonical") == "normmaxmin":
             _validate_fedspan_round(result, payload, round_label)
+        recomputation = _validate_recomputed_global(
+            result, payload, round_label)
+        if recomputation["max_tolerance_ratio"] > worst_ratio:
+            worst_ratio = recomputation["max_tolerance_ratio"]
+            worst_round = round_label
 
-    return {
+    report = {
         "result_path": str(result_path),
         "commit": commit,
         "rounds_validated": num_rounds,
         "lora_mode": result["lora_mode"],
         "weight_by_canonical": result.get("weight_by_canonical"),
+        "aggregate_recomputation_worst_tolerance_ratio": worst_ratio,
+        "aggregate_recomputation_worst_round": worst_round,
+        "manifest_verified": manifest_row is not None,
     }
+    if launched is not None:
+        report["launched"] = launched
+    if resources is not None:
+        report["resources"] = resources
+    return report
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("run_directory")
+    parser.add_argument("--manifest",
+                        help="frozen E0 manifest that launched this run")
+    parser.add_argument("--run_id",
+                        help="manifest run id (default: directory name)")
+    parser.add_argument(
+        "--allow_missing_manifest", action="store_true",
+        help="validate contracts only; the report records that the run was "
+             "not checked against the manifest that launched it")
     args = parser.parse_args()
-    report = validate_run_directory(args.run_directory)
+
+    run_id = args.run_id or Path(args.run_directory).name
+    manifest_row = None
+    if args.manifest:
+        manifest_row = _load_manifest_row(args.manifest, run_id)
+    elif not args.allow_missing_manifest:
+        parser.error(
+            "--manifest is required; pass --allow_missing_manifest to "
+            "validate a run whose launch manifest is unavailable")
+
+    report = validate_run_directory(args.run_directory, manifest_row)
+    if not report["manifest_verified"]:
+        print("WARNING: run was not checked against a launch manifest",
+              file=sys.stderr)
     print(json.dumps(report, sort_keys=True))
 
 
 if __name__ == "__main__":
     main()
-

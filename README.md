@@ -4,11 +4,21 @@ A research codebase for studying **catastrophic forgetting in dense retrievers u
 temporally evolving / federated client knowledge**, and for building a continual
 adapter-based federated retriever that prevents it without sharing raw documents.
 
-> Status: **candidate implemented, not empirically validated.** Historical runs used
-> ordinary trainable-A+B LoRA. The driver now contains a separate frozen-A,
-> norm-consistent `normmaxmin` FedSpan path with fail-closed diagnostics, but E0 and the
-> predeclared experiment campaign have not been run. Do not treat historical max-min
-> results as validation of this implementation.
+> ## Status: implemented, NOT validated
+>
+> **No E0 run and no E1–E5 run exists in this repository.** The frozen-A,
+> norm-consistent `normmaxmin` (FedSpan) path is implemented with fail-closed
+> diagnostics and covered by CPU unit tests, and nothing more. No claim about whether
+> it works is supported by a completed experiment.
+>
+> - Everything in `results/` is a **historical `bge-m3` trainable-A+B run**. `bge-m3`
+>   fails this repo's own headroom gate (below), so those files are not paper evidence.
+> - **Historical max-min results must not be read as validating frozen-A FedSpan.**
+>   They were produced by a different coordinate (`trainable-ab`) and a different
+>   aggregation rule (`rawmaxmin`, which applies simplex weights to raw states).
+> - The E0 grid in `run_e0.sh` is a **correctness-attribution** grid, not a results
+>   grid, and its 5 rounds do not match the paper-scale regime (see
+>   [E0 correctness grid](#e0-correctness-grid)).
 
 ---
 
@@ -25,8 +35,17 @@ retrieval on earlier corpus slices degrades. This repo:
    FlowRAG, WWW'26) vs. the **federated-aggregation interference** that arises when
    adapters from clients with disagreeing corpora are averaged. The federated axis is the
    intended novelty.
-3. (Planned) **Fixes it** with the FedCRAG method: per-client LoRA adapters + EWC
-   consolidation + forgetting-severity-aware aggregation.
+3. **Implements a candidate fix** — FedSpan (`--weight_by normmaxmin`): **one** global
+   LoRA adapter, one **shared row-orthonormal frozen** LoRA A, and conflict-aware
+   norm-consistent aggregation applied to the **B deltas only**. Whether it fixes
+   anything is untested (see Status).
+
+   What FedSpan is *not*, so the description above cannot be misread: there are **no
+   per-client or personalized adapters** (every client receives and returns the same
+   global adapter), **no EWC and no Fisher information**, and **no replay buffer**.
+   None of those appear anywhere in this codebase — `grep -riE 'ewc|fisher|personaliz'`
+   over the sources returns nothing. The design constraints are C1 (only adapter
+   parameters leave a silo), C2 (no replay), C3 (one global model).
 
 ### How forgetting is measured
 
@@ -58,8 +77,9 @@ checkpoint after training through stage `i`. From it:
 `run_all_paper.sh` orchestrates the four paper runs (pilot, controls, federated
 unweighted, federated weighted) with per-run logs in `logs/`.
 
-**Planned (see `task.tsv`):** the evolving-corpus / federated-temporal environment, and
-the FedCRAG method plus a FlowRAG baseline.
+**Planned (see `task.tsv`):** the evolving-corpus / federated-temporal environment, a
+FlowRAG baseline, and the experiment campaign that would tell us whether the implemented
+FedSpan aggregation helps.
 
 ---
 
@@ -101,7 +121,7 @@ seconds rather than after an overnight job):
 python -c "
 from sentence_transformers import SentenceTransformer
 from peft import LoraConfig, TaskType, get_peft_model_state_dict, set_peft_model_state_dict
-m = SentenceTransformer('BAAI/bge-m3')
+m = SentenceTransformer('facebook/contriever')
 inner = m[0].auto_model
 names = {n.split('.')[-1] for n,_ in inner.named_modules()}
 print('targets:', [x for x in ['query','key','value','dense'] if x in names])
@@ -122,8 +142,21 @@ the flags `--model`, `--slices`, `--metrics`, `--seed`, `--batch_size`, `--lora_
 `--data_root`, `--out` (federated adds `--num_rounds`, `--local_epochs`, `--weighted`;
 the other two use `--epochs`). `benchmark_retrievers` is separate — it takes
 `--local_models`/`--api_models` instead of `--model` and does no training. Model names
-resolve through the registry in `fedcrag_common.py` (e.g. `bge-m3`, `bge-small`,
-`e5-large`) or fall through as a raw HF path.
+resolve through the registry in `fedcrag_common.py` (e.g. `contriever`, `bge-m3`,
+`bge-small`, `e5-large`) or fall through as a raw HF path.
+
+**Backbone: use `contriever`.** `bge-m3` was the pilot backbone and it **fails the
+headroom gate** — reproduce with the archived controls file in this repo:
+
+```bash
+python check_headroom.py results/controls_bge-m3_seed42.json   # exits 1
+```
+
+which reports `independent − frozen` of **−0.0124** on nfcorpus and **−0.0139** on fiqa
+(ndcg@10, seed 42): fine-tuning makes those slices *worse*, so a later drop would partly
+measure recipe-induced degradation rather than forgetting. `contriever` is the campaign
+backbone (`run_e0.sh`, `run_w3.sh`, `GPU_SETUP.md`); `bge-m3` survives only as a
+historical pilot and a possible appendix run.
 
 ### 1. Zero-shot benchmark — *which retriever is strongest?*
 ```bash
@@ -137,21 +170,21 @@ clearly top `bge-m3`; pick one strong + one cheap model to carry into training e
 
 ### 2. Pilot — *does forgetting happen?* (centralized sequential)
 ```bash
-python pilot_forgetting.py --model bge-m3 --slices nfcorpus fiqa scifact arguana --seed 42
+python pilot_forgetting.py --model contriever --slices nfcorpus fiqa scifact arguana --seed 42
 ```
 **Expectation:** negative BWT / positive Forgetting on early slices, robust across seeds
 42/123/2024 (each reshuffles the training order). This is the existence proof.
 
 ### 3. Controls — *how much headroom is there?*
 ```bash
-python controls.py --model bge-m3 --slices nfcorpus fiqa scifact arguana --seed 42
+python controls.py --model contriever --slices nfcorpus fiqa scifact arguana --seed 42
 ```
 **Expectation:** sequential-final sits below `independent` and `joint`. The gap is what a
 method can recover. No gap ⇒ no phenomenon worth fixing.
 
 ### 4. Federated — *does aggregation make it worse?* (the novel claim)
 ```bash
-python federated_forgetting.py --model bge-m3 --slices nfcorpus fiqa scifact arguana \
+python federated_forgetting.py --model contriever --slices nfcorpus fiqa scifact arguana \
     --num_rounds 5 --seed 42            # add --weighted for weighted FedAvg
 ```
 Flags specific to this script:
@@ -169,17 +202,53 @@ Flags specific to this script:
 
   ```bash
   python federated_forgetting.py \
-      --model bge-m3 --slices nfcorpus fiqa scifact arguana \
+      --model contriever --slices nfcorpus fiqa scifact arguana \
       --num_rounds 5 --seed 42 --weighted \
       --lora_mode frozen-a --weight_by normmaxmin \
       --fedspan_step_policy median-active \
+      --fedspan_direction_policy minnorm \
       --save_states
   ```
 
-  The step policy is always explicit. `median-active` sets each round's true effective-B
-  norm to the median finite active-client update norm after activity gating. The
-  alternative `fixed` policy requires a positive finite `--fedspan_step_norm`;
-  `median-active` rejects that constant. `--save_states` is mandatory. The command refuses
+  Both policies are always explicit; there is no implicit default, and omitting either
+  is a CLI error before any data work.
+
+  `--fedspan_step_policy` fixes the *magnitude*. `median-active` sets each round's true
+  effective-B norm to the median finite active-client update norm after activity gating.
+  The alternative `fixed` policy requires a positive finite `--fedspan_step_norm`;
+  `median-active` rejects that constant.
+
+  `--fedspan_direction_policy` fixes the *direction*, and the two choices do not optimize
+  the same thing:
+
+  - `minnorm` (the campaign default) maximizes the worst-case cosine of the direction
+    **actually applied** — the *normalized* mixture. It is solved as the min-norm point
+    of the convex hull of the unit client directions.
+    **Disclosure: this primitive is not novel.** It is equivalent to **FedMGDA+**
+    ([arXiv:2006.11489](https://arxiv.org/abs/2006.11489), Hu, Shaloudegi, Zhang & Yu,
+    *Federated Learning Meets Multi-objective Optimization*) at `epsilon = 1`, here
+    applied to the cosine Gram of normalized client updates. Any novelty claim must rest
+    on the surrounding construction (shared frozen row-orthonormal A, raw-B delta
+    coefficients, true-effective-step normalization), never on this solver.
+  - `maxmin-lp` is the historical LP. It maximizes `min_i (Cw)_i` over the simplex, but
+    the applied direction is normalized, so the LP's objective is **not** the applied
+    quantity. It is retained only as a recorded ablation.
+
+  Whichever is selected, **both** values are computed and logged every round, so the gap
+  is measured rather than assumed: `achieved_min_direction_cosine`, `min_norm_value`,
+  `direction_solver_shortfall`, and `min_norm_solver{gap,iterations,converged,tol}` land
+  in `fedspan_diagnostics`, alongside `direction_policy` and `direction_policy_specified`.
+
+  `--frozen_a_row_scale` (frozen-A only) sets the row constant `c` in `A Aᵀ = c² I`.
+  `unit` (`c = 1`) is the default and today's behavior; `peft-init` rescales the
+  orthonormal rows to the module's own measured pre-orthogonalization row RMS, matching
+  PEFT's initialization scale. **The two are separate arms, not interchangeable
+  settings** — switching rescales every client's effective step, so they must be declared
+  and run separately. The resolved value, its explicitness, and the per-module record are
+  written to `method_contract`, folded into the configuration hash, and tagged into the
+  output filename so the two arms cannot overwrite each other.
+
+  `--save_states` is mandatory. The command refuses
   unknown or dirty Git provenance unless `--allow_dirty_provenance` is supplied for a
   development-only run. That override
   is recorded and must not count as paper-grade E0--E5 evidence.
@@ -210,16 +279,51 @@ Flags specific to this script:
 - **above** (positive transfer) ⇒ reframe around "when federation helps vs. hurts".
 Run this before committing the narrative.
 
-The frozen ten-row E0 correctness grid is exposed separately:
+<a id="e0-correctness-grid"></a>
+### E0 correctness grid
+
+The frozen ten-row E0 grid is exposed separately:
 
 ```bash
 bash run_e0.sh manifest  # print the exact ten commands; no tests or training
 bash run_e0.sh verify    # require clean provenance and run CPU gates; no training
 bash run_e0.sh run       # execute only after cloud spend is explicitly authorized
+bash run_e0.sh resume    # continue an interrupted campaign against its frozen manifest
 ```
 
 `run_e0.sh` never provisions cloud resources. Its output root defaults outside the Git
-worktree so completed rows cannot dirty provenance for later rows.
+worktree so completed rows cannot dirty provenance for later rows. `run` freezes a
+`manifest.json` and refuses to start on top of an existing one; `resume` refuses to
+continue if the manifest's commit or rows no longer match the tree.
+
+**E0 numbers are not comparable to the paper's cells. Do not quote them as results.**
+
+- **E0 runs 5 rounds** (`ROUNDS=5` in `run_e0.sh`). The repo's paper-scale federated
+  matrix runs **15** (`ROUNDS=${ROUNDS:-15}` in `run_w3.sh`, with the same 500-step cap).
+  Drift, BWT, and forgetting all accumulate with the round count, so an E0 drift number
+  and a paper drift number are different quantities, not a small and a large sample of
+  one quantity. E0 exists to attribute *correctness* — does each arm do what its contract
+  says — not to measure retrieval outcomes.
+- **The `capped-500` step cap binds on exactly one client.** At the campaign
+  `--batch_size 32`, the per-round step counts of the four E0 slices are approximately:
+
+  | slice | train pairs | steps/round @ bs 32 | capped at 500? |
+  |---|---|---|---|
+  | nfcorpus | ~110,600 | ~3,455 | **yes** (~3,455 → 500) |
+  | fiqa | ~14,160 | 442 | no |
+  | scifact | ~912 | 28 | no |
+  | arguana | ~696 | 21 | no |
+
+  So `capped-500` vs `full` is a **single-client** intervention: it changes only how much
+  nfcorpus trains, and leaves the other three clients bit-identical in workload. Read the
+  two regimes as "nfcorpus dominance on/off", not as a global compute knob.
+
+  Provenance of those figures: derived from the archived `logs/f42.log`
+  (`train_samples_per_second × train_runtime` per client, floor-divided by 32, matching
+  `NoDuplicatesDataLoader.__len__`). The nfcorpus figure is the least precise of the four
+  because the log rates are rounded — but it is an order of magnitude above the cap, so
+  its exact value does not affect which client binds. No E0 run exists to read these off
+  directly.
 
 ### API retrievers (OpenRouter / OpenAI / Cohere / Voyage)
 Benchmark-only — no weight access, so API models **cannot** be LoRA-trained and never enter
@@ -262,10 +366,16 @@ effect); for realism, the planned temporal setup uses within-domain snapshots (e
 | 2024 | nfcorpus→scifact | +0.0015 | near-zero (SciFact too small to overwrite NFCorpus) |
 
 Forgetting is **asymmetric** and scales with the *subsequent* slice's training volume
-(NFCorpus drove ~3,455 steps vs. SciFact's 28). This directly motivates
-**forgetting-severity-aware aggregation**: in federation, large-corpus clients dominate the
-averaged adapter and overwrite small-corpus clients' representations. The cluster runs with
-`bge-m3` + 4 balanced slices produce the actual paper numbers.
+(at `--batch_size 32` NFCorpus drives ~3,455 steps vs. SciFact's 28). This is the
+motivation for **conflict-aware aggregation**: in federation, large-corpus clients
+dominate the averaged adapter and can overwrite small-corpus clients' representations.
+It is a motivation, not evidence that FedSpan addresses it.
+
+This is a **pilot on `bge-small` over 2 slices** — it is not a paper cell, and no run in
+this repository is. The paper numbers are to be produced by the **`contriever`** campaign
+(`run_w3.sh`, 4 slices, 3 seeds, R=15), which **has not been run**. `bge-m3` is not the
+paper backbone: it fails the headroom gate on nfcorpus and fiqa (see
+[Usage](#usage) — reproduce with `check_headroom.py`).
 
 ---
 

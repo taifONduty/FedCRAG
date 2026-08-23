@@ -15,6 +15,8 @@ import torch
 from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reference_solvers import maximin_reference  # noqa: E402
 from aggregation_schemes import (  # noqa: E402
     FedSpanContractError,
     afl_update,
@@ -81,12 +83,33 @@ def frozen_a_federation(rng, client_deltas, module_scales=None):
 
 
 def effective_b_delta(state, broadcast, module_scales):
+    # Widen before subtracting: the difference of two float32 tensors loses
+    # about 1e-7 absolute, which is coarser than the quantities being pinned.
     return torch.cat([
         module_scales[m]
-        * (state[f"{m}.lora_B.weight"]
-           - broadcast[f"{m}.lora_B.weight"]).double().reshape(-1)
+        * (state[f"{m}.lora_B.weight"].double()
+           - broadcast[f"{m}.lora_B.weight"].double()).reshape(-1)
         for m in MODULES
     ])
+
+
+def fixture_client_norms(clients, broadcast, module_scales):
+    """Effective client norms read off the fixture, not off any solve."""
+    return [
+        float(torch.linalg.vector_norm(
+            effective_b_delta(state, broadcast, module_scales)).item())
+        for state in clients
+    ]
+
+
+def fixture_cosine_gram(clients, broadcast, module_scales):
+    directions = np.stack([
+        (effective_b_delta(state, broadcast, module_scales)
+         / torch.linalg.vector_norm(
+             effective_b_delta(state, broadcast, module_scales))).numpy()
+        for state in clients
+    ])
+    return directions @ directions.T
 
 
 @pytest.fixture
@@ -281,11 +304,29 @@ def test_fedspan_exact_true_step_with_unequal_norms_and_module_scales(rng):
     assert diag["max_effective_block_error"] < 2e-6
     assert result["solver_simplex_residual"] < 1e-7
     assert result["solver_constraint_violation"] < 1e-7
-    assert result["proposed_delta_weights"] == result["delta_weights"]
-    assert diag["applied_delta_weights"] == result["delta_weights"]
+    # The applied coefficients must equal the closed form
+    #   c_k = s w_k / (r_k sqrt(w^T C w))
+    # built from the fixture's own geometry and an independently solved w,
+    # not merely equal some other field of the same record.
+    gram = fixture_cosine_gram(clients, broadcast, scales)
+    norms = fixture_client_norms(clients, broadcast, scales)
+    _, reference_w = maximin_reference(gram)
+    mixture_norm = math.sqrt(float(reference_w @ gram @ reference_w))
+    expected_coefficients = [
+        0.413 * weight / (norm * mixture_norm)
+        for weight, norm in zip(reference_w, norms)
+    ]
+    assert result["simplex_weights"] == pytest.approx(
+        list(reference_w), abs=1e-6)
+    assert result["delta_weights"] == pytest.approx(
+        expected_coefficients, rel=1e-5)
+    assert result["proposed_delta_weights"] == pytest.approx(
+        expected_coefficients, rel=1e-5)
+    assert diag["applied_delta_weights"] == pytest.approx(
+        expected_coefficients, rel=1e-5)
     assert diag["applied_min_active_cosine"] is not None
     assert diag["applied_min_active_cosine"] == pytest.approx(
-        result["certified_min_direction_cosine"], abs=2e-6)
+        result["achieved_min_direction_cosine"], abs=2e-6)
     json.dumps({"solve": result, "application": diag})
     assert len(diag["broadcast_state_sha256"]) == 64
     assert len(diag["applied_state_sha256"]) == 64
@@ -578,9 +619,14 @@ def test_fedspan_median_active_randomized_permutation_invariance():
             step_policy="median-active", active_rel_tol=0.0)
         applied, diag = apply_fedspan_update(
             broadcast, clients, result, module_scales=scales)
-        expected_median = float(np.median(result["client_norms"]))
+        # The expected median comes from the fixture's own client updates, so
+        # a resolved step norm computed from the wrong set of clients fails.
+        expected_median = float(np.median(
+            fixture_client_norms(clients, broadcast, scales)))
+        assert result["client_norms"] == pytest.approx(
+            fixture_client_norms(clients, broadcast, scales), rel=1e-9)
         assert result["resolved_step_norm"] == pytest.approx(
-            expected_median, rel=1e-12)
+            expected_median, rel=1e-9)
         assert diag["applied_step_norm"] == pytest.approx(
             expected_median, rel=3e-5, abs=3e-6)
 

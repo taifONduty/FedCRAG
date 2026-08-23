@@ -1,5 +1,6 @@
 """CPU-only integration tests for FedSpan driver provenance and persistence."""
 import json
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,12 +9,15 @@ import torch
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import federated_forgetting as driver  # noqa: E402
 from federated_forgetting import (  # noqa: E402
     _data_fingerprints,
     _frozen_run_configuration_sha256,
     dump_torch,
 )
+import driver_harness  # noqa: E402
+from reference_solvers import maximin_reference, min_norm_reference  # noqa: E402
 
 
 def frozen_args(**overrides):
@@ -161,6 +165,7 @@ def test_driver_normmaxmin_dispatch_persists_exact_round_record(
         "--weight_by", "normmaxmin",
         "--lora_mode", "frozen-a",
         "--fedspan_step_policy", step_policy,
+        "--fedspan_direction_policy", "minnorm",
         "--save_states",
         "--out", str(tmp_path),
     ]
@@ -231,6 +236,7 @@ def test_driver_rejects_illegal_normmaxmin_step_policy_before_data_work(
         "--weighted",
         "--weight_by", "normmaxmin",
         "--lora_mode", "frozen-a",
+        "--fedspan_direction_policy", "minnorm",
         "--save_states",
         *extra_args,
     ])
@@ -267,3 +273,231 @@ def test_driver_rejects_fedspan_policy_for_non_normmaxmin_arm(
     assert "FedSpan step options are legal only with --weight_by normmaxmin" \
         in capsys.readouterr().err
     assert touched_data is False
+
+
+# ------------------------------------- the real E0 coordinate x arm product
+
+
+E0_CELLS = [
+    ("trainable-ab", "uniform"),
+    ("trainable-ab", "rawmaxmin"),
+    ("frozen-a", "uniform"),
+    ("frozen-a", "rawmaxmin"),
+    ("frozen-a", "normmaxmin"),
+]
+
+
+def _independent_simplex_weights(states, broadcast, arm):
+    """Weights the recorded arm implies, from an oracle rather than the run."""
+    gram, norms = driver_harness.cosine_gram(states, broadcast)
+    if arm == "uniform":
+        return [1.0 / len(states)] * len(states), gram, norms
+    _, weights = maximin_reference(gram)
+    return list(weights), gram, norms
+
+
+@pytest.mark.parametrize(("lora_mode", "arm"), E0_CELLS)
+def test_driver_e0_cross_product_applies_a_hand_computed_aggregate(
+        monkeypatch, tmp_path, lora_mode, arm):
+    """Every legal E0 cell must persist the global its recorded arm implies.
+
+    The expected global is rebuilt here from the client states and weights
+    derived by the independent oracle, never from the driver's own record, so
+    an aggregation that silently reverts to uniform weights fails.
+    """
+    result, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path, lora_mode, arm)
+    payload, _ = driver_harness.load_round_states(tmp_path)
+
+    broadcast = payload["broadcast"]
+    states = [payload["clients"][name] for name in driver_harness.SLICES]
+    expected_weights, gram, _ = _independent_simplex_weights(
+        states, broadcast, arm)
+
+    assert result["lora_mode"] == lora_mode
+    assert result["weight_by_canonical"] == (None if arm == "uniform" else arm)
+
+    if arm == "normmaxmin":
+        diagnostic = result["fedspan_diagnostics"]["round_1"]
+        optimum, min_norm_w = min_norm_reference(gram)
+        assert diagnostic["direction_policy"] == "minnorm"
+        assert diagnostic["direction_policy_specified"] is True
+        assert diagnostic["achieved_min_direction_cosine"] == pytest.approx(
+            math.sqrt(optimum), abs=1e-6)
+        assert diagnostic["direction_solver_shortfall"] == pytest.approx(
+            0.0, abs=1e-6)
+        assert diagnostic["simplex_weights"] == pytest.approx(
+            list(min_norm_w), abs=1e-6)
+        # Non-simplex true-step coefficients, applied to raw B deltas only.
+        coefficients = diagnostic["delta_weights"]
+        expected_b = broadcast[driver_harness.B_KEY].double().clone()
+        for coefficient, state in zip(coefficients, states):
+            expected_b += coefficient * (
+                state[driver_harness.B_KEY].double()
+                - broadcast[driver_harness.B_KEY].double())
+        assert torch.allclose(
+            payload["global"][driver_harness.B_KEY].double(),
+            expected_b, atol=1e-6)
+        assert torch.equal(payload["global"][driver_harness.A_KEY],
+                           broadcast[driver_harness.A_KEY])
+        return
+
+    if arm == "rawmaxmin":
+        recorded = result["scheme_diagnostics"]["round_1"]
+        assert recorded["scheme"] == "rawmaxmin"
+        assert recorded["fallback"] is None
+        assert recorded["weights"] == pytest.approx(expected_weights, abs=1e-6)
+        # The fixture must actually discriminate: uniform weights would give a
+        # materially different aggregate.
+        assert max(abs(value - 1.0 / len(states))
+                   for value in expected_weights) > 0.05
+
+    if lora_mode == "frozen-a":
+        expected_b = broadcast[driver_harness.B_KEY].double().clone()
+        for weight, state in zip(expected_weights, states):
+            expected_b += weight * (
+                state[driver_harness.B_KEY].double()
+                - broadcast[driver_harness.B_KEY].double())
+        assert torch.allclose(
+            payload["global"][driver_harness.B_KEY].double(),
+            expected_b, atol=1e-6)
+        assert torch.equal(payload["global"][driver_harness.A_KEY],
+                           broadcast[driver_harness.A_KEY])
+    else:
+        for key in broadcast:
+            expected = sum(
+                weight * state[key].double()
+                for weight, state in zip(expected_weights, states))
+            assert torch.allclose(
+                payload["global"][key].double(), expected, atol=1e-6)
+
+    assert payload["global_state_sha256"] == driver.state_dict_sha256(
+        payload["global"])
+
+
+@pytest.mark.parametrize(("lora_mode", "arm"), E0_CELLS)
+def test_driver_records_per_client_delta_norms_for_every_e0_cell(
+        monkeypatch, tmp_path, lora_mode, arm):
+    """D2a audit trail: the effective step magnitudes must exist everywhere."""
+    result, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path, lora_mode, arm)
+    payload, _ = driver_harness.load_round_states(tmp_path)
+
+    states = [payload["clients"][name] for name in driver_harness.SLICES]
+    _, expected_norms = driver_harness.cosine_gram(states, payload["broadcast"])
+
+    recorded = result["client_delta_norms"]["round_1"]
+    assert sorted(recorded) == sorted(driver_harness.SLICES)
+    for name, expected in zip(driver_harness.SLICES, expected_norms):
+        assert recorded[name] == pytest.approx(float(expected), rel=1e-6)
+
+
+def test_driver_rejects_normmaxmin_without_a_direction_policy(
+        monkeypatch, capsys, tmp_path):
+    driver_harness.install_mocks(monkeypatch)
+    monkeypatch.setattr(sys, "argv", [
+        "federated_forgetting.py",
+        "--weighted", "--weight_by", "normmaxmin",
+        "--lora_mode", "frozen-a", "--save_states",
+        "--fedspan_step_policy", "median-active",
+        "--out", str(tmp_path),
+    ])
+    with pytest.raises(SystemExit, match="2"):
+        driver.main()
+    assert "requires --fedspan_direction_policy" in capsys.readouterr().err
+
+
+def test_driver_rejects_direction_policy_on_a_non_normmaxmin_arm(
+        monkeypatch, capsys, tmp_path):
+    driver_harness.install_mocks(monkeypatch)
+    monkeypatch.setattr(sys, "argv", [
+        "federated_forgetting.py",
+        "--weighted", "--weight_by", "rawmaxmin",
+        "--lora_mode", "frozen-a",
+        "--fedspan_direction_policy", "minnorm",
+        "--out", str(tmp_path),
+    ])
+    with pytest.raises(SystemExit, match="2"):
+        driver.main()
+    assert "--fedspan_direction_policy is legal only with" in \
+        capsys.readouterr().err
+
+
+@pytest.mark.parametrize("policy", ["minnorm", "maxmin-lp"])
+def test_driver_separates_direction_policies_in_filename_and_hash(
+        monkeypatch, tmp_path, policy):
+    result, path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        direction_policy=policy)
+    assert f"-dir{policy}" in path.name
+    assert result["method_contract"]["fedspan_direction_policy"] == policy
+    assert result["fedspan_diagnostics"]["round_1"]["direction_policy"] == \
+        policy
+
+
+def test_driver_direction_policy_changes_the_configuration_hash(
+        monkeypatch, tmp_path):
+    left, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path / "a", "frozen-a", "normmaxmin",
+        direction_policy="minnorm")
+    right, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path / "b", "frozen-a", "normmaxmin",
+        direction_policy="maxmin-lp")
+    assert (left["method_contract"]["run_configuration_sha256"]
+            != right["method_contract"]["run_configuration_sha256"])
+
+
+# ------------------------------------------------------ provenance refusal
+
+
+@pytest.mark.parametrize("commit", ["abc123def456-dirty", "unknown"])
+def test_normmaxmin_refuses_unclean_source_provenance(
+        monkeypatch, capsys, tmp_path, commit):
+    driver_harness.install_mocks(monkeypatch, commit=commit)
+    monkeypatch.setattr(sys, "argv", driver_harness.build_argv(
+        tmp_path, "frozen-a", "normmaxmin"))
+
+    with pytest.raises(SystemExit, match="2"):
+        driver.main()
+
+    assert "refuses unknown/dirty source provenance" in capsys.readouterr().err
+    assert not list(tmp_path.glob("federated_*.json"))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="federated_forgetting.py tests only for 'unknown' and a '-dirty' "
+           "suffix, so a commit whose worktree cleanliness could not be "
+           "determined ('-unknown-worktree', produced by get_git_commit when "
+           "git status itself fails) still launches a paper-grade normmaxmin "
+           "run. validate_e0.py already refuses that provenance after the "
+           "fact. Remove this marker once the launch gate covers it too.")
+def test_normmaxmin_refuses_undetermined_worktree_provenance(
+        monkeypatch, tmp_path):
+    driver_harness.install_mocks(
+        monkeypatch, commit="abc123def456-unknown-worktree")
+    monkeypatch.setattr(sys, "argv", driver_harness.build_argv(
+        tmp_path, "frozen-a", "normmaxmin"))
+
+    with pytest.raises(SystemExit, match="2"):
+        driver.main()
+
+
+@pytest.mark.parametrize("commit", ["abc123def456-dirty", "unknown"])
+def test_explicit_override_permits_unclean_provenance_and_records_it(
+        monkeypatch, tmp_path, commit):
+    result, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin", commit=commit,
+        extra=["--allow_dirty_provenance"])
+
+    assert result["commit"] == commit
+    assert result["method_contract"]["dirty_provenance_override"] is True
+
+
+def test_unclean_provenance_is_permitted_for_non_normmaxmin_arms(
+        monkeypatch, tmp_path):
+    result, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "rawmaxmin",
+        commit="abc123def456-dirty")
+    assert result["commit"] == "abc123def456-dirty"
+    assert result["method_contract"]["dirty_provenance_override"] is False

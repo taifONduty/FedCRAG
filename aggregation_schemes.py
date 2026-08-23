@@ -16,7 +16,12 @@ Three families, matching how federated_forgetting.py applies them:
       fednova_delta_weights — tau-normalized averaging (2007.07481)
   * frozen-A exact direction + application:
       fedspan_delta_weights / apply_fedspan_update — PEFT-scale-aware,
-      true-step-normalized norm-maxmin with fail-closed edge cases
+      true-step-normalized norm-maxmin with fail-closed edge cases, under a
+      selectable direction policy ("minnorm" = FedMGDA+ (2006.11489) at
+      epsilon = 1 on the cosine Gram, "maxmin-lp" = the LP ablation)
+
+Every scheme returns a ``SchemeResult``/record carrying the solver status, so
+a caller can persist why a set of weights was produced, not only which.
 """
 import hashlib
 import math
@@ -32,16 +37,139 @@ class FedSpanContractError(ValueError):
     """The communicated adapter states cannot represent frozen-A FedSpan."""
 
 
-def configure_frozen_lora_a(model, adapter_name="default"):
-    """Row-orthonormalize and freeze every PEFT LoRA A for one adapter.
+class ModuleScales(dict):
+    """Per-module geometry scales plus the measurements that produced them.
+
+    Compares and serializes as the plain ``{module: scale}`` mapping every
+    consumer already expects; ``records`` carries the PEFT scale, the row
+    constant ``c``, and the measured pre-orthogonalization row RMS.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.records = {}
+
+
+class SchemeResult(list):
+    """Aggregation weights carrying the solver status that produced them.
+
+    Behaves as the plain weight list every call site already consumes, so a
+    scheme can report *why* it produced a value without changing what is
+    applied. ``fallback`` is None only when the scheme's own solution was
+    used; a non-None ``fallback`` means the listed weights are a substitute.
+    """
+
+    def __new__(cls, weights, **_):
+        return super().__new__(cls, weights)
+
+    def __init__(self, weights, status="ok", solver_status=None,
+                 solver_message="", fallback=None):
+        super().__init__(weights)
+        self.status = status
+        self.solver_status = solver_status
+        self.solver_message = solver_message
+        self.fallback = fallback
+
+    def record(self):
+        """A fresh JSON-serializable trace of this solve."""
+        return {
+            "weights": [float(value) for value in self],
+            "status": self.status,
+            "solver_status": self.solver_status,
+            "solver_message": self.solver_message,
+            "fallback": self.fallback,
+        }
+
+
+def _min_norm_simplex_weights(gram, max_iters=20000, tol=1e-14):
+    """Away-step Frank-Wolfe for  min_{w in simplex} w^T C w.
+
+    The minimizer is the min-norm point of the convex hull of the client
+    directions whose Gram is ``gram``; its value ``sqrt(w^T C w)`` is, by
+    minimax duality, the largest worst-case cosine any normalized mixture can
+    attain. Away steps are required rather than cosmetic: plain Frank-Wolfe
+    zig-zags between vertices and stalls short of the optimum, and the value
+    itself is reported.
+
+    Returns ``(w, info)`` with ``info["gap"]`` the Frank-Wolfe duality gap
+    ``w^T C w - min_i (C w)_i``, which upper-bounds the suboptimality, and
+    ``info["converged"]``. ``sqrt(w^T C w)`` is an UPPER bound on the
+    attainable worst-case cosine and equals it only once converged, so the
+    flag has to travel with the value.
+    """
+    C = np.asarray(gram, dtype=np.float64)
+    M = C.shape[0]
+    w = np.zeros(M, dtype=np.float64)
+    w[int(np.argmin(np.diag(C)))] = 1.0
+    gap = float("inf")
+    iterations = 0
+    for iterations in range(1, int(max_iters) + 1):
+        g = C @ w
+        value = float(w @ g)
+        toward = int(np.argmin(g))
+        gap = value - float(g[toward])
+        if gap <= tol:
+            break
+        support = np.flatnonzero(w > 0.0)
+        away = int(support[int(np.argmax(g[support]))])
+        gap_away = float(g[away]) - value
+        if gap >= gap_away:
+            direction = -w.copy()
+            direction[toward] += 1.0
+            max_step = 1.0
+        else:
+            direction = w.copy()
+            direction[away] -= 1.0
+            max_step = (w[away] / (1.0 - w[away]) if w[away] < 1.0
+                        else float("inf"))
+        denominator = float(direction @ C @ direction)
+        numerator = -float(direction @ g)
+        if denominator <= 0.0:
+            step = max_step
+        else:
+            step = min(max(numerator / denominator, 0.0), max_step)
+        if not math.isfinite(step) or step <= 0.0:
+            break
+        w = np.clip(w + step * direction, 0.0, None)
+        total = float(w.sum())
+        if total <= 0.0:
+            break
+        w = w / total
+    return w, {"gap": float(gap), "iterations": int(iterations),
+               "converged": bool(gap <= tol), "tol": float(tol)}
+
+
+def configure_frozen_lora_a(model, adapter_name="default", row_scale="unit"):
+    """Row-orthogonalize and freeze every PEFT LoRA A for one adapter.
 
     The operation is performed once, immediately after ``add_adapter`` and
     while LoRA B is still zero, so it does not change the initialized model
     function. QR is computed on CPU in float64 for deterministic, accurate
-    rows and copied back to the original device/dtype. Returns the exact
-    per-module PEFT ``alpha/r`` scales used by the effective-B geometry.
+    rows and copied back to the original device/dtype.
+
+    ``row_scale`` selects the constant ``c`` in ``A A^T = c^2 I``:
+      * ``"unit"``      — ``c = 1``.
+      * ``"peft-init"`` — ``c`` is the module's own pre-orthogonalization row
+        RMS, so the frozen rows keep the magnitude PEFT's kaiming init gave
+        them. Measured over 24 real PEFT LoRA modules (BERT query/key/value,
+        hidden 128-768, r 4-16) that RMS is 0.5773 +/- 0.0067, so unit rows
+        are a factor 1.7323 larger than the init PEFT would have used.
+      * a positive float — that constant for every module.
+
+    Returns per-module geometry scales ``sigma * c`` (``sigma = alpha/r``), so
+    ``scale * ||B||_F == ||sigma * B A||_F`` exactly and all downstream
+    geometry stays in true weight space. The returned mapping also carries a
+    ``.records`` breakdown of the measured quantities per module.
     """
-    scales = {}
+    if isinstance(row_scale, str):
+        if row_scale not in ("unit", "peft-init"):
+            raise ValueError(
+                "row_scale must be 'unit', 'peft-init', or a positive float")
+    else:
+        row_scale = float(row_scale)
+        if not math.isfinite(row_scale) or row_scale <= 0:
+            raise ValueError("numeric row_scale must be positive and finite")
+    scales = ModuleScales()
     for module_name, module in model.named_modules():
         lora_a = getattr(module, "lora_A", None)
         lora_b = getattr(module, "lora_B", None)
@@ -63,23 +191,35 @@ def configure_frozen_lora_a(model, adapter_name="default"):
                 f"LoRA A for '{module_name}' cannot have orthonormal rows: "
                 f"shape={tuple(weight.shape)}")
         source = weight.detach().cpu().double().T
+        row_rms = float(torch.sqrt(
+            torch.mean(torch.sum(source ** 2, dim=0))).item())
+        if row_scale == "unit":
+            c = 1.0
+        elif row_scale == "peft-init":
+            c = row_rms
+        else:
+            c = float(row_scale)
+        if not math.isfinite(c) or c <= 0:
+            raise FedSpanContractError(
+                f"row scale for '{module_name}' is not positive and finite: {c}")
         q, r = torch.linalg.qr(source, mode="reduced")
         # Canonicalize QR column signs so the same initial matrix produces the
         # same A independently of QR's otherwise arbitrary sign convention.
         diagonal = torch.diagonal(r)
         signs = torch.where(diagonal < 0, -torch.ones_like(diagonal),
                             torch.ones_like(diagonal))
-        orthonormal = (q * signs).T.to(
+        orthonormal = (c * (q * signs).T).to(
             device=weight.device, dtype=weight.dtype)
         with torch.no_grad():
             weight.copy_(orthonormal)
         weight.requires_grad_(False)
         gram = weight.detach().float() @ weight.detach().float().T
-        identity = torch.eye(weight.shape[0], device=gram.device,
-                             dtype=gram.dtype)
-        if not torch.allclose(gram, identity, atol=2e-5, rtol=2e-5):
+        identity = (c ** 2) * torch.eye(weight.shape[0], device=gram.device,
+                                        dtype=gram.dtype)
+        if not torch.allclose(gram, identity, atol=2e-5 * max(1.0, c ** 2),
+                              rtol=2e-5):
             raise FedSpanContractError(
-                f"row-orthonormalization verification failed for '{module_name}'")
+                f"row-orthogonalization verification failed for '{module_name}'")
         try:
             scale = float(scaling[adapter_name])
         except Exception as exc:
@@ -88,19 +228,27 @@ def configure_frozen_lora_a(model, adapter_name="default"):
         if not math.isfinite(scale) or scale <= 0:
             raise FedSpanContractError(
                 f"invalid PEFT scale for '{module_name}': {scale}")
-        scales[module_name] = scale
+        scales[module_name] = scale * c
+        scales.records[module_name] = {
+            "peft_scale": scale,
+            "row_scale_mode": (row_scale if isinstance(row_scale, str)
+                               else "constant"),
+            "row_scale_c": c,
+            "measured_init_row_rms": row_rms,
+            "geometry_scale": scale * c,
+        }
     if not scales:
         raise FedSpanContractError(
             f"no LoRA modules found for adapter '{adapter_name}'")
     return scales
 
 
-def _module_pairs(state):
+def _module_pairs(state, dtype=torch.float32):
     mods = {}
     for k, v in state.items():
         m = _LORA_KEY.match(k)
         if m:
-            mods.setdefault(m.group(1), {})[m.group(2)] = v.float()
+            mods.setdefault(m.group(1), {})[m.group(2)] = v.to(dtype)
     return {n: (ab["A"], ab["B"]) for n, ab in mods.items()
             if "A" in ab and "B" in ab}
 
@@ -122,11 +270,11 @@ def _stack_ip(s1, s2):
     return tot
 
 
-def _update_stacks(client_states, broadcast_state):
-    prev = _module_pairs(broadcast_state)
+def _update_stacks(client_states, broadcast_state, dtype=torch.float32):
+    prev = _module_pairs(broadcast_state, dtype=dtype)
     stacks = []
     for st in client_states:
-        mp = _module_pairs(st)
+        mp = _module_pairs(st, dtype=dtype)
         stacks.append({n: [(1.0, B, A)]
                        + ([(-1.0, prev[n][1], prev[n][0])] if n in prev else [])
                        for n, (A, B) in mp.items()})
@@ -134,13 +282,15 @@ def _update_stacks(client_states, broadcast_state):
 
 
 def update_gram(client_states, broadcast_state, normalize=False,
-                module_scales=None):
+                module_scales=None, dtype=torch.float32):
     """K x K Gram of weight-space client updates dW_k = B_k A_k - B_g A_g.
 
     ``normalize=True`` returns the cosine Gram (unit diagonal); raw Frobenius
     inner products otherwise. Exact in factor space via the trace identity.
+    ``dtype`` is the accumulation precision; float64 is required whenever the
+    client delta is small next to the broadcast it is subtracted from.
     """
-    stacks = _update_stacks(client_states, broadcast_state)
+    stacks = _update_stacks(client_states, broadcast_state, dtype=dtype)
     module_names = sorted(set().union(*(set(stack) for stack in stacks)))
     scales = ({name: 1.0 for name in module_names}
               if module_scales is None
@@ -159,25 +309,67 @@ def update_gram(client_states, broadcast_state, normalize=False,
     return G / np.outer(norms, norms)
 
 
-def maxmin_weights(client_states, broadcast_state, module_scales=None):
+def client_update_norms(client_states, broadcast_state, module_scales=None):
+    """Per-client effective weight-space delta norms ||dW_k||_F.
+
+    Arm-agnostic: it uses the full B A - B_g A_g update, so it is defined for
+    trainable-A arms as well as frozen-A ones, which is what makes per-round
+    step magnitudes comparable across arms.
+    """
+    gram = update_gram(client_states, broadcast_state, normalize=False,
+                       module_scales=module_scales, dtype=torch.float64)
+    diagonal = np.diag(gram)
+    return [(float(math.sqrt(value)) if math.isfinite(value) and value >= 0
+             else None) for value in diagonal]
+
+
+def maxmin_weights(client_states, broadcast_state, module_scales=None,
+                   min_rel_diagonal=1e-12):
     """Historical raw-maxmin control: solve the cosine-game simplex LP.
 
     These simplex weights do NOT include client-norm/true-step conversion and
-    therefore are not corrected FedSpan. Returns None (caller falls back to
-    uniform) if the LP fails.
+    therefore are not corrected FedSpan. A degenerate Gram or a failed LP is
+    rejected and reported; the returned weights are then uniform, which is
+    what the historical ``None`` return caused callers to apply.
+
+    A client that did not move has a diagonal that is zero only in exact
+    arithmetic — ``||BA||^2 - 2<BA,B_g A_g> + ||B_g A_g||^2`` cancels to a
+    residue of either sign — so the guard is relative to the largest
+    diagonal, not a bare sign test. Normalizing such a row would divide the
+    cosine Gram by the square root of that residue.
     """
     from scipy.optimize import linprog
-    Gc = update_gram(client_states, broadcast_state, normalize=True,
-                     module_scales=module_scales)
-    K = Gc.shape[0]
+    G = update_gram(client_states, broadcast_state, normalize=False,
+                    module_scales=module_scales, dtype=torch.float64)
+    K = G.shape[0]
+    uniform = [1.0 / K] * K
+    diagonal = np.diag(G)
+    largest = float(np.max(diagonal)) if np.all(np.isfinite(diagonal)) else 0.0
+    floor = max(0.0, float(min_rel_diagonal) * largest)
+    if not np.all(np.isfinite(G)) or largest <= 0 or np.min(diagonal) <= floor:
+        degenerate = [index for index, value in enumerate(diagonal)
+                      if not math.isfinite(value) or value <= floor]
+        print("  WARNING: degenerate update Gram; max-min falling back to "
+              "uniform weights")
+        return SchemeResult(
+            uniform, status="degenerate_gram", fallback="uniform",
+            solver_message=(
+                "Gram is nonfinite or has a vanishing diagonal for clients "
+                f"{degenerate}"))
+    norms = np.sqrt(diagonal)
+    Gc = G / np.outer(norms, norms)
     c = np.zeros(K + 1); c[-1] = -1.0
     res = linprog(c, A_ub=np.hstack([-Gc, np.ones((K, 1))]), b_ub=np.zeros(K),
                   A_eq=[[1.0] * K + [0.0]], b_eq=[1.0],
                   bounds=[(0, 1)] * K + [(None, None)], method="highs")
     if not res.success:
         print("  WARNING: max-min LP failed; falling back to uniform weights")
-        return None
-    return [float(x) for x in res.x[:K]]
+        return SchemeResult(
+            uniform, status="solver_failure", fallback="uniform",
+            solver_status=int(res.status), solver_message=str(res.message))
+    return SchemeResult([float(x) for x in res.x[:K]],
+                        status="optimal", solver_status=int(res.status),
+                        solver_message=str(res.message))
 
 
 def mgda_weights(client_states, broadcast_state, iters=500, tol=1e-9,
@@ -194,7 +386,9 @@ def mgda_weights(client_states, broadcast_state, iters=500, tol=1e-9,
     K = G.shape[0]
     if not np.all(np.isfinite(G)) or np.trace(G) <= 0:
         print("  WARNING: degenerate Gram; MGDA falling back to uniform")
-        return [1.0 / K] * K
+        return SchemeResult(
+            [1.0 / K] * K, status="degenerate_gram", fallback="uniform",
+            solver_message="Gram is nonfinite or has a nonpositive trace")
     w = np.ones(K) / K
     for _ in range(iters):
         grad = G @ w
@@ -207,7 +401,7 @@ def mgda_weights(client_states, broadcast_state, iters=500, tol=1e-9,
         if gamma * np.abs(d).max() < tol:
             break
         w = w + gamma * d
-    return [float(x) for x in w]
+    return SchemeResult([float(x) for x in w], status="optimal")
 
 
 def qffl_delta_weights(losses, sq_update_norms, q, L):
@@ -229,8 +423,12 @@ def qffl_delta_weights(losses, sq_update_norms, q, L):
     total = float(np.sum(h))
     if not np.isfinite(total) or total <= 0:
         print("  WARNING: q-FedAvg h-sum degenerate; falling back to uniform")
-        return [1.0 / len(losses)] * len(losses)
-    return [float(x) for x in (L * fq) / total]
+        return SchemeResult(
+            [1.0 / len(losses)] * len(losses), status="degenerate_h_sum",
+            fallback="uniform",
+            solver_message="q-FedAvg h-sum is nonfinite or nonpositive")
+    return SchemeResult([float(x) for x in (L * fq) / total],
+                        status="optimal")
 
 
 def fednova_delta_weights(n_examples, local_steps):
@@ -244,13 +442,15 @@ def fednova_delta_weights(n_examples, local_steps):
     active = tau > 0
     if not np.any(active):
         print("  WARNING: no client trained; FedNova returns zero weights")
-        return [0.0] * len(n)
+        return SchemeResult([0.0] * len(n), status="no_active",
+                            fallback="zero_update",
+                            solver_message="every client reported tau_k = 0")
     p = np.where(active, n, 0.0)
     p = p / max(p.sum(), 1e-12)
     tau_eff = float(np.sum(p[active] * tau[active]))
     v = np.zeros_like(n)
     v[active] = tau_eff * p[active] / tau[active]
-    return [float(x) for x in v]
+    return SchemeResult([float(x) for x in v], status="optimal")
 
 
 def afl_update(lam, losses, eta):
@@ -266,8 +466,11 @@ def afl_update(lam, losses, eta):
     total = new.sum()
     if not np.isfinite(total) or total <= 0:
         print("  WARNING: AFL update degenerate; resetting to uniform")
-        return [1.0 / len(lam)] * len(lam)
-    return [float(x) for x in new / total]
+        return SchemeResult(
+            [1.0 / len(lam)] * len(lam), status="degenerate_update",
+            fallback="uniform",
+            solver_message="AFL weight mass is nonfinite or nonpositive")
+    return SchemeResult([float(x) for x in new / total], status="optimal")
 
 
 def apply_delta_weights(broadcast_state, client_states, v):
@@ -412,17 +615,25 @@ def validate_frozen_a_states(client_states, broadcast_state, module_scales):
 
 
 def frozen_a_state_diagnostics(state, module_scales):
-    """Record per-module A orthonormality error and PEFT scale."""
+    """Record per-module A row-orthogonality error and geometry scale.
+
+    The row constant ``c`` in ``A A^T = c^2 I`` is measured from the state
+    itself rather than assumed, so the diagnostic is valid for both the
+    unit-row and the PEFT-init-scaled frozen A.
+    """
     modules = _factor_entries(state, "adapter_state")
     names = sorted(modules)
     scales = _resolve_module_scales(names, module_scales)
     records = {}
     for name in names:
         A = modules[name]["A"][1].detach().cpu().double()
+        gram = A @ A.T
+        c_squared = float(torch.mean(torch.diagonal(gram)).item())
         identity = torch.eye(A.shape[0], dtype=torch.float64)
-        error = torch.max(torch.abs(A @ A.T - identity)).item()
+        error = torch.max(torch.abs(gram - c_squared * identity)).item()
         records[name] = {
-            "peft_scale": scales[name],
+            "geometry_scale": scales[name],
+            "a_row_scale_c": math.sqrt(max(c_squared, 0.0)),
             "a_row_orthonormal_max_abs_error": float(error),
         }
     return records
@@ -486,11 +697,20 @@ def _zero_fedspan_result(status, client_norms, active_mask,
                          proposed_delta_weights=None,
                          proposed_max_abs_delta_weight=None,
                          delta_weight_limit=None,
-                         step_reconstruction_error=None):
+                         step_reconstruction_error=None,
+                         direction_policy=None,
+                         direction_policy_specified=None,
+                         min_norm_value=None, min_norm_solver=None,
+                         achieved_min_direction_cosine=None):
     K = len(client_norms)
+    shortfall = (None if (min_norm_value is None
+                          or achieved_min_direction_cosine is None)
+                 else float(min_norm_value - achieved_min_direction_cosine))
     return {
         "status": status,
         "fallback": fallback,
+        "direction_policy": direction_policy,
+        "direction_policy_specified": direction_policy_specified,
         "solver_status": solver_status,
         "solver_message": solver_message,
         "solver_objective_gamma": solver_objective_gamma,
@@ -515,7 +735,13 @@ def _zero_fedspan_result(status, client_norms, active_mask,
         "proposed_delta_weights": proposed_delta_weights,
         "gamma": gamma,
         "mixture_norm": mixture_norm,
-        "certified_min_direction_cosine": None,
+        "achieved_min_direction_cosine": achieved_min_direction_cosine,
+        "min_norm_value": min_norm_value,
+        "min_norm_solver": min_norm_solver,
+        "direction_solver_shortfall": shortfall,
+        # Deprecated alias for achieved_min_direction_cosine; the value was
+        # never a certificate of optimality, only of what was applied.
+        "certified_min_direction_cosine": achieved_min_direction_cosine,
         "max_abs_delta_weight": 0.0,
         "proposed_max_abs_delta_weight": proposed_max_abs_delta_weight,
         "delta_weight_limit": delta_weight_limit,
@@ -537,23 +763,45 @@ def _effective_vector_sha256(blocks):
 
 def fedspan_delta_weights(client_states, broadcast_state, module_scales,
                           step_norm=None, step_policy="fixed",
+                          direction_policy=None,
                           active_abs_tol=1e-12,
                           active_rel_tol=1e-8, mixture_norm_tol=1e-6,
                           max_abs_delta_weight=None):
-    """Exact frozen-A, norm-consistent max-min aggregation coefficients.
+    """Frozen-A, norm-consistent worst-case-cosine aggregation coefficients.
 
     Geometry is formed from concatenated effective PEFT blocks
-    ``sigma_l * (Braw_k,l - Braw_global,l)``. The LP is solved only over
-    finite, non-tiny clients. If ``w`` is its simplex solution and ``r_k``
-    the effective client norm, the raw-B delta coefficient is
+    ``sigma_l * (Braw_k,l - Braw_global,l)``. The direction is solved only
+    over finite, non-tiny clients. If ``w`` is the simplex solution and
+    ``r_k`` the effective client norm, the raw-B delta coefficient is
 
-      c_k = resolved_step_norm * w_k / (r_k * sqrt(w.T @ H @ w)).
+      c_k = resolved_step_norm * w_k / (r_k * sqrt(w.T @ H @ w)),
+
+    which is degree-0 homogeneous in ``w``, so both direction policies flow
+    through identical downstream machinery.
+
+    ``direction_policy``:
+      * ``"minnorm"``   — maximize the worst-case cosine of the APPLIED
+        (normalized) direction, i.e. minimize ``w^T C w`` over the simplex.
+        This is FedMGDA+ (arXiv:2006.11489) at epsilon = 1, run on the cosine
+        Gram of the effective client directions.
+      * ``"maxmin-lp"`` — maximize ``min_i (C w)_i`` over the simplex. The
+        applied direction is normalized, so this LP optimizes a quantity that
+        is not the one applied; it is retained as a recorded ablation.
+    Both are always measured: ``min_norm_value`` is the attainable optimum
+    (exact when ``min_norm_solver["converged"]``, an upper bound otherwise)
+    and ``direction_solver_shortfall`` is what the chosen policy gave up.
 
     Solver errors, invalid solutions, near cancellation, and an optional
     coefficient-limit violation fail closed to a zero server update. Contract
     violations such as trainable/non-shared A or malformed factor states raise
     ``FedSpanContractError`` and invalidate the run rather than falling back.
     """
+    direction_policy_specified = direction_policy is not None
+    if not direction_policy_specified:
+        direction_policy = "maxmin-lp"
+    if direction_policy not in ("minnorm", "maxmin-lp"):
+        raise ValueError(
+            "direction_policy must be 'minnorm' or 'maxmin-lp'")
     if step_policy not in ("fixed", "median-active"):
         raise ValueError(
             "step_policy must be 'fixed' or 'median-active'")
@@ -613,6 +861,8 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
         return _zero_fedspan_result(
             "no_active", client_norms, active_mask, inactive_reasons,
             declared_step_norm, threshold, step_policy=step_policy,
+            direction_policy=direction_policy,
+            direction_policy_specified=direction_policy_specified,
             declared_step_norm=declared_step_norm,
             active_indices=[], module_scales=scales,
             delta_weight_limit=max_abs_delta_weight)
@@ -627,6 +877,8 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
             "invalid_step_norm", client_norms, active_mask,
             inactive_reasons, resolved_step_norm, threshold,
             step_policy=step_policy,
+            direction_policy=direction_policy,
+            direction_policy_specified=direction_policy_specified,
             declared_step_norm=declared_step_norm,
             active_indices=active, module_scales=scales,
             solver_message="resolved step norm is nonpositive or nonfinite",
@@ -648,14 +900,50 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
     np.fill_diagonal(cosine, 1.0)
     cosine_list = cosine.tolist()
 
+    # The attainable optimum is measured for BOTH policies every round, so the
+    # shortfall of whichever policy is applied is always on the record.
+    min_norm_w, min_norm_info = _min_norm_simplex_weights(cosine)
+    min_norm_value = math.sqrt(max(
+        float(min_norm_w @ cosine @ min_norm_w), 0.0))
+
     if M == 1:
         active_w = np.ones(1, dtype=np.float64)
         solver_status = 0
-        solver_message = "singleton active set; LP not required"
+        solver_message = "singleton active set; no direction solve required"
         status = "singleton"
         solver_objective_gamma = 1.0
         solver_simplex_residual = 0.0
         solver_constraint_violation = 0.0
+    elif direction_policy == "minnorm":
+        active_w = np.asarray(min_norm_w, dtype=np.float64)
+        if (not np.all(np.isfinite(active_w)) or active_w.min() < -1e-9
+                or abs(active_w.sum() - 1.0) > 1e-9):
+            return _zero_fedspan_result(
+                "solver_invalid", client_norms, active_mask, inactive_reasons,
+                step_norm, threshold, solver_status="minnorm",
+                step_policy=step_policy,
+                direction_policy=direction_policy,
+                direction_policy_specified=direction_policy_specified,
+                declared_step_norm=declared_step_norm,
+                solver_message=(
+                    "min-norm Frank-Wolfe returned a nonsimplex point"),
+                active_indices=active, cosine_gram_active=cosine_list,
+                module_scales=scales, min_norm_value=min_norm_value,
+                min_norm_solver=min_norm_info,
+                delta_weight_limit=max_abs_delta_weight)
+        active_w = np.clip(active_w, 0.0, 1.0)
+        active_w = active_w / active_w.sum()
+        solver_status = 0
+        solver_message = (
+            f"away-step Frank-Wolfe "
+            f"{'converged' if min_norm_info['converged'] else 'STALLED'} at "
+            f"duality gap {min_norm_info['gap']:.3e} after "
+            f"{min_norm_info['iterations']} iterations")
+        solver_objective_gamma = float(np.min(cosine @ active_w))
+        solver_simplex_residual = float(abs(active_w.sum() - 1.0))
+        solver_constraint_violation = float(max(
+            0.0, np.max(solver_objective_gamma - cosine @ active_w)))
+        status = "optimal"
     else:
         from scipy.optimize import linprog
         objective = np.zeros(M + 1, dtype=np.float64)
@@ -672,9 +960,13 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
                 "solver_error", client_norms, active_mask, inactive_reasons,
                 step_norm, threshold, solver_status="exception",
                 step_policy=step_policy,
+                direction_policy=direction_policy,
+                direction_policy_specified=direction_policy_specified,
                 declared_step_norm=declared_step_norm,
                 solver_message=f"{type(exc).__name__}: {exc}",
                 active_indices=active, cosine_gram_active=cosine_list,
+                min_norm_value=min_norm_value,
+                min_norm_solver=min_norm_info,
                 module_scales=scales,
                 delta_weight_limit=max_abs_delta_weight)
         if not solved.success:
@@ -682,9 +974,13 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
                 "solver_failure", client_norms, active_mask, inactive_reasons,
                 step_norm, threshold, solver_status=int(solved.status),
                 step_policy=step_policy,
+                direction_policy=direction_policy,
+                direction_policy_specified=direction_policy_specified,
                 declared_step_norm=declared_step_norm,
                 solver_message=str(solved.message), active_indices=active,
                 cosine_gram_active=cosine_list, module_scales=scales,
+                min_norm_value=min_norm_value,
+                min_norm_solver=min_norm_info,
                 delta_weight_limit=max_abs_delta_weight)
         raw_w = np.asarray(solved.x[:M], dtype=np.float64)
         raw_gamma = float(solved.x[-1])
@@ -696,9 +992,13 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
                 "solver_invalid", client_norms, active_mask, inactive_reasons,
                 step_norm, threshold, solver_status=int(solved.status),
                 step_policy=step_policy,
+                direction_policy=direction_policy,
+                direction_policy_specified=direction_policy_specified,
                 declared_step_norm=declared_step_norm,
                 solver_message="LP returned an infeasible/nonfinite simplex point",
                 active_indices=active, cosine_gram_active=cosine_list,
+                min_norm_value=min_norm_value,
+                min_norm_solver=min_norm_info,
                 module_scales=scales,
                 delta_weight_limit=max_abs_delta_weight)
         solver_objective_gamma = raw_gamma
@@ -715,6 +1015,8 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
     gamma = float(np.min(payoffs))
     mixture_sq = float(active_w @ cosine @ active_w)
     mixture_norm = math.sqrt(max(mixture_sq, 0.0))
+    achieved_cosine = (None if mixture_norm <= 0.0
+                       else float(gamma / mixture_norm))
     simplex = [0.0] * K
     for local_index, client_index in enumerate(active):
         simplex[client_index] = float(active_w[local_index])
@@ -723,9 +1025,13 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
             "near_cancellation", client_norms, active_mask, inactive_reasons,
             step_norm, threshold, solver_status=solver_status,
             step_policy=step_policy,
+            direction_policy=direction_policy,
+            direction_policy_specified=direction_policy_specified,
             declared_step_norm=declared_step_norm,
             solver_message=solver_message, active_indices=active,
             cosine_gram_active=cosine_list, simplex_weights=simplex,
+            min_norm_value=min_norm_value,
+            min_norm_solver=min_norm_info,
             gamma=gamma, mixture_norm=mixture_norm, module_scales=scales,
             solver_objective_gamma=solver_objective_gamma,
             solver_simplex_residual=solver_simplex_residual,
@@ -744,13 +1050,18 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
             "coefficient_limit", client_norms, active_mask, inactive_reasons,
             step_norm, threshold, solver_status=solver_status,
             step_policy=step_policy,
+            direction_policy=direction_policy,
+            direction_policy_specified=direction_policy_specified,
             declared_step_norm=declared_step_norm,
             solver_message=solver_message, active_indices=active,
             cosine_gram_active=cosine_list, simplex_weights=simplex,
+            min_norm_value=min_norm_value,
+            min_norm_solver=min_norm_info,
             gamma=gamma, mixture_norm=mixture_norm, module_scales=scales,
             solver_objective_gamma=solver_objective_gamma,
             solver_simplex_residual=solver_simplex_residual,
             solver_constraint_violation=solver_constraint_violation,
+            achieved_min_direction_cosine=achieved_cosine,
             proposed_delta_weights=coefficients,
             proposed_max_abs_delta_weight=coefficient_max,
             delta_weight_limit=max_abs_delta_weight)
@@ -767,17 +1078,22 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
             "reconstruction_failure", client_norms, active_mask,
             inactive_reasons, step_norm, threshold,
             step_policy=step_policy,
+            direction_policy=direction_policy,
+            direction_policy_specified=direction_policy_specified,
             declared_step_norm=declared_step_norm,
             solver_status=solver_status,
             solver_message=(
                 f"coefficient reconstruction produced norm {solved_norm} "
                 f"instead of {step_norm}"),
             active_indices=active, cosine_gram_active=cosine_list,
+            min_norm_value=min_norm_value,
+            min_norm_solver=min_norm_info,
             simplex_weights=simplex, gamma=gamma,
             mixture_norm=mixture_norm, module_scales=scales,
             solver_objective_gamma=solver_objective_gamma,
             solver_simplex_residual=solver_simplex_residual,
             solver_constraint_violation=solver_constraint_violation,
+            achieved_min_direction_cosine=achieved_cosine,
             proposed_delta_weights=coefficients,
             proposed_max_abs_delta_weight=coefficient_max,
             delta_weight_limit=max_abs_delta_weight,
@@ -785,6 +1101,8 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
     return {
         "status": status,
         "fallback": None,
+        "direction_policy": direction_policy,
+        "direction_policy_specified": direction_policy_specified,
         "solver_status": solver_status,
         "solver_message": solver_message,
         "solver_objective_gamma": solver_objective_gamma,
@@ -806,7 +1124,15 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
         "proposed_delta_weights": coefficients,
         "gamma": gamma,
         "mixture_norm": mixture_norm,
-        "certified_min_direction_cosine": gamma / mixture_norm,
+        "achieved_min_direction_cosine": achieved_cosine,
+        "min_norm_value": min_norm_value,
+        "min_norm_solver": min_norm_info,
+        "direction_solver_shortfall": (
+            None if achieved_cosine is None
+            else float(min_norm_value - achieved_cosine)),
+        # Deprecated alias for achieved_min_direction_cosine; the value was
+        # never a certificate of optimality, only of what was applied.
+        "certified_min_direction_cosine": achieved_cosine,
         "max_abs_delta_weight": coefficient_max,
         "proposed_max_abs_delta_weight": coefficient_max,
         "delta_weight_limit": max_abs_delta_weight,

@@ -30,13 +30,14 @@ def set_adapter_state(model, state):
 
 
 # Gram/LP/QP/delta-space weighting machinery lives in aggregation_schemes.py
-# (pure math, unit-tested in tests/test_aggregation.py). NOTE: the corrected
-# trace identity there fixes a cross-pairing in the campaign-era inline copy;
-# measured effect on the shipped maxmin arms: weight shift <= 0.0025, gamma*
-# shift <= 0.0023 (results/gram_bug_audit.json) — below the seed noise floor.
-from aggregation_schemes import (afl_update, apply_delta_weights,
+# (pure math, unit-tested in tests/test_aggregation.py). The trace identity
+# used there is pinned by those tests against dense reconstruction; the
+# campaign-era inline copy it replaced is not present in this repository, so
+# no comparison against it can be checked from this tree.
+from aggregation_schemes import (SchemeResult, afl_update, apply_delta_weights,
                                  apply_fedspan_update,
                                  apply_frozen_b_delta_weights,
+                                 client_update_norms,
                                  configure_frozen_lora_a,
                                  fednova_delta_weights,
                                  fedspan_delta_weights, maxmin_weights,
@@ -44,6 +45,26 @@ from aggregation_schemes import (afl_update, apply_delta_weights,
                                  mgda_weights, qffl_delta_weights,
                                  state_dict_sha256, update_gram,
                                  validate_frozen_a_states)
+
+LORA_A_SUFFIX = ".lora_A.weight"
+
+
+def _assert_finite_state(state, context):
+    """Reject a nonfinite aggregated state, naming the offending tensor.
+
+    A single nonfinite entry in one client's factor propagates through
+    weighted averaging into every subsequent round, so the poisoned key has
+    to be named at the round that produced it rather than inferred later.
+    """
+    for key in sorted(state):
+        value = state[key]
+        finite = torch.isfinite(value)
+        if not bool(finite.all()):
+            bad = int(value.numel() - int(finite.sum()))
+            raise ValueError(
+                f"{context} produced a nonfinite aggregated tensor: "
+                f"'{key}' has {bad} of {value.numel()} nonfinite entries "
+                "(at least one client update was nonfinite)")
 
 
 def fedavg(states, weights=None):
@@ -59,7 +80,18 @@ def fedavg(states, weights=None):
     avg = {}
     for key in states[0]:
         avg[key] = sum(w * s[key].float() for w, s in zip(weights, states))
+    _assert_finite_state(avg, "FedAvg state averaging")
     return avg
+
+
+def lora_a_norms(state):
+    """Per-module ||A||_F of one adapter state, keyed by module name."""
+    return {
+        key[:-len(LORA_A_SUFFIX)]: float(
+            torch.linalg.vector_norm(value.detach().cpu().double()).item())
+        for key, value in sorted(state.items())
+        if key.endswith(LORA_A_SUFFIX)
+    }
 
 
 def make_examples(data, q_prefix, d_prefix):
@@ -75,7 +107,7 @@ def make_examples(data, q_prefix, d_prefix):
 
 
 def new_model(model_name, model_path, lora_rank, fp16,
-              lora_mode="trainable-ab", grad_ckpt=True):
+              lora_mode="trainable-ab", grad_ckpt=True, row_scale="unit"):
     model = SentenceTransformer(model_path, trust_remote_code=True)
     if fp16:
         model.half()
@@ -86,7 +118,7 @@ def new_model(model_name, model_path, lora_rank, fp16,
     model.add_adapter(cfg)
     if lora_mode == "frozen-a":
         module_scales = configure_frozen_lora_a(
-            model[0].auto_model, adapter_name="default")
+            model[0].auto_model, adapter_name="default", row_scale=row_scale)
     elif lora_mode == "trainable-ab":
         # All modules use this script's single LoraConfig, so alpha/r is
         # exactly common. Keep it explicit for PEFT-scale-aware Grams.
@@ -175,9 +207,16 @@ def _runtime_provenance(commit, requested_model, model_path, model,
     }
 
 
-def _frozen_run_configuration_sha256(args, data_sha256=None):
-    """Hash every result-affecting option for collision-safe frozen-A runs."""
+def _frozen_run_configuration_sha256(args, data_sha256=None, row_scale=None):
+    """Hash every result-affecting option for collision-safe frozen-A runs.
+
+    ``row_scale`` is passed resolved rather than read off ``args`` so that an
+    explicitly requested default hashes identically to an omitted one.
+    """
     fields = {
+        "frozen_a_row_scale": row_scale,
+        "fedspan_direction_policy": getattr(
+            args, "fedspan_direction_policy", None),
         "slices": args.slices,
         "metrics": args.metrics,
         "num_rounds": args.num_rounds,
@@ -354,6 +393,15 @@ def main():
                     help="'trainable-ab' preserves the historical ordinary-"
                          "LoRA coordinate; 'frozen-a' row-orthonormalizes one "
                          "shared A at initialization and trains B only")
+    ap.add_argument("--frozen_a_row_scale", choices=["unit", "peft-init"],
+                    default=None,
+                    help="row constant c in A A^T = c^2 I for --lora_mode "
+                         "frozen-a (default 'unit'). 'peft-init' rescales the "
+                         "orthonormal rows to the module's own measured "
+                         "pre-orthogonalization row RMS, so client effective "
+                         "step magnitudes are comparable with trainable-ab. "
+                         "The two modes are distinct arms, not interchangeable "
+                         "settings of one arm")
     ap.add_argument("--weighted", action="store_true")
     ap.add_argument("--weight_by",
                     choices=["examples", "corpus", "maxmin", "rawmaxmin",
@@ -388,6 +436,16 @@ def main():
                     choices=["fixed", "median-active"], default=None,
                     help="explicit true effective-B step policy required for "
                          "--weight_by normmaxmin")
+    ap.add_argument("--fedspan_direction_policy",
+                    choices=["minnorm", "maxmin-lp"], default=None,
+                    help="explicit direction solver required for --weight_by "
+                         "normmaxmin. 'minnorm' maximizes the worst-case "
+                         "cosine of the direction actually applied (the "
+                         "normalized mixture) and equals FedMGDA+ "
+                         "(arXiv:2006.11489) at epsilon=1 on the cosine Gram; "
+                         "'maxmin-lp' is the historical LP, whose objective is "
+                         "not the applied quantity, retained as a recorded "
+                         "ablation. Both values are measured every round")
     ap.add_argument("--fedspan_step_norm", type=float, default=None,
                     help="positive finite true effective-B step norm s, "
                          "required only with --fedspan_step_policy fixed")
@@ -437,6 +495,9 @@ def main():
         if args.fedspan_step_policy is None:
             ap.error("--weight_by normmaxmin requires "
                      "--fedspan_step_policy")
+        if args.fedspan_direction_policy is None:
+            ap.error("--weight_by normmaxmin requires "
+                     "--fedspan_direction_policy")
         if args.fedspan_step_policy == "fixed":
             if (args.fedspan_step_norm is None
                     or not np.isfinite(args.fedspan_step_norm)
@@ -461,6 +522,13 @@ def main():
           or args.fedspan_step_norm is not None):
         ap.error("FedSpan step options are legal only with "
                  "--weight_by normmaxmin")
+    elif args.fedspan_direction_policy is not None:
+        ap.error("--fedspan_direction_policy is legal only with "
+                 "--weight_by normmaxmin")
+    if args.frozen_a_row_scale is not None and args.lora_mode != "frozen-a":
+        ap.error("--frozen_a_row_scale is legal only with "
+                 "--lora_mode frozen-a")
+    row_scale = args.frozen_a_row_scale or "unit"
     commit = get_git_commit()
     if (canonical_weight_by == "normmaxmin"
             and (commit == "unknown" or commit.endswith("-dirty"))
@@ -478,7 +546,8 @@ def main():
 
     model, module_scales = new_model(
         args.model, model_path, args.lora_rank, fp16,
-        lora_mode=args.lora_mode, grad_ckpt=not args.no_grad_ckpt)
+        lora_mode=args.lora_mode, grad_ckpt=not args.no_grad_ckpt,
+        row_scale=row_scale)
     global_state = get_adapter_state(model)
 
     # Preserve historical trainable-A+B filenames. New frozen-A runs add a
@@ -490,12 +559,13 @@ def main():
             step_tag = format(args.fedspan_step_norm, ".8g").replace(".", "p")
         else:
             step_tag = "median-active"
-        basis += f"-s{step_tag}"
+        basis += f"-s{step_tag}-dir{args.fedspan_direction_policy}"
     frozen_config_sha256 = None
     if args.lora_mode == "frozen-a":
         frozen_config_sha256 = _frozen_run_configuration_sha256(
-            args, data_sha256=data_sha256)
-        basis = f"frozen-a_{basis}-cfg{frozen_config_sha256[:12]}"
+            args, data_sha256=data_sha256, row_scale=row_scale)
+        basis = (f"frozen-a-{row_scale}_{basis}"
+                 f"-cfg{frozen_config_sha256[:12]}")
     tag = f"{basis}_r{args.num_rounds}"
     model_safe = args.model.replace("/", "_")
     jpath = os.path.join(args.out,
@@ -515,8 +585,17 @@ def main():
                "coordinate": ("effective-b" if args.lora_mode == "frozen-a"
                               else "trainable-ab-factor-state"),
                "shared_row_orthonormal_a": args.lora_mode == "frozen-a",
+               "frozen_a_row_scale": (row_scale
+                                      if args.lora_mode == "frozen-a"
+                                      else None),
+               "frozen_a_row_scale_specified": (
+                   args.frozen_a_row_scale is not None),
+               "frozen_a_row_scale_records": (
+                   getattr(module_scales, "records", None)
+                   if args.lora_mode == "frozen-a" else None),
                "fedspan_step_policy": args.fedspan_step_policy,
                "fedspan_step_norm": args.fedspan_step_norm,
+               "fedspan_direction_policy": args.fedspan_direction_policy,
                "dirty_provenance_override": args.allow_dirty_provenance,
                "initial_adapter_state_sha256": state_dict_sha256(global_state),
                "frozen_a_diagnostics": (
@@ -569,22 +648,46 @@ def main():
         if args.lora_mode == "frozen-a":
             validate_frozen_a_states(
                 states, round_broadcast, module_scales=module_scales)
+        # Per-client effective step magnitudes, recorded for EVERY arm and
+        # coordinate. Without them the frozen-A vs trainable-A+B comparison
+        # cannot be separated from a pure step-scale difference after the
+        # fact. Cheap: the trace identity keeps this to r x r products.
+        try:
+            delta_norms = client_update_norms(
+                states, round_broadcast, module_scales=module_scales)
+            out.setdefault("client_delta_norms", {})[label] = dict(
+                zip(args.slices, delta_norms))
+        except Exception as exc:
+            print(f"  WARNING: client delta norms unavailable: {exc}")
+            out.setdefault("client_delta_norms", {})[label] = {
+                "error": f"{type(exc).__name__}: {exc}"}
+        if args.lora_mode == "trainable-ab":
+            # A moves in this coordinate, so the effective step depends on
+            # ||A|| as well as ||B||; both sides are needed to attribute it.
+            out.setdefault("client_lora_a_norms", {})[label] = {
+                name: lora_a_norms(state)
+                for name, state in zip(args.slices, states)}
+            out.setdefault("broadcast_lora_a_norms", {})[label] = \
+                lora_a_norms(round_broadcast)
         # --- aggregation dispatch ---------------------------------------
         # Trainable-A+B simplex schemes retain historical FedAvg. Every
         # frozen-A arm applies raw-B deltas so the broadcast A is copied
         # bit-for-bit; normmaxmin supplies non-simplex true-step coefficients.
         delta_v = None
         precomputed_state = None
+        scheme_result = None
         if not args.weighted:
             weights = None
         elif args.weight_by in ("maxmin", "rawmaxmin"):
             weights = maxmin_weights(
                 states, round_broadcast, module_scales=module_scales)
+            scheme_result = weights
         elif args.weight_by == "normmaxmin":
             fedspan = fedspan_delta_weights(
                 states, round_broadcast, module_scales=module_scales,
                 step_norm=args.fedspan_step_norm,
                 step_policy=args.fedspan_step_policy,
+                direction_policy=args.fedspan_direction_policy,
                 active_abs_tol=args.fedspan_active_abs_tol,
                 active_rel_tol=args.fedspan_active_rel_tol,
                 mixture_norm_tol=args.fedspan_mixture_norm_tol,
@@ -601,26 +704,53 @@ def main():
                   f"{fedspan['status']} gamma={fedspan['gamma']} "
                   f"mixture_norm={fedspan['mixture_norm']} "
                   f"applied_norm={applied['applied_step_norm']}")
+            print(f"  normmaxmin direction={fedspan['direction_policy']} "
+                  f"achieved={fedspan['achieved_min_direction_cosine']} "
+                  f"optimal={fedspan['min_norm_value']} "
+                  f"shortfall={fedspan['direction_solver_shortfall']}")
         elif args.weight_by == "mgda":
             weights = mgda_weights(
                 states, round_broadcast, module_scales=module_scales)
+            scheme_result = weights
         elif args.weight_by == "afl":
             afl_lam = afl_update(afl_lam, losses, args.afl_eta)
             weights = afl_lam
+            scheme_result = afl_lam
         elif args.weight_by == "qffl":
+            # float64: ||w_k - w^t||^2 is a difference of large nearly equal
+            # inner products, and the float32 default loses the small client
+            # delta once the broadcast dominates it.
             sq_norms = np.diag(update_gram(
-                states, round_broadcast,
-                module_scales=module_scales)).tolist()
+                states, round_broadcast, module_scales=module_scales,
+                dtype=torch.float64)).tolist()
             delta_v = qffl_delta_weights(losses, sq_norms, q=args.qffl_q,
                                          L=1.0 / args.lr)
+            scheme_result = delta_v
         elif args.weight_by == "fednova":
             delta_v = fednova_delta_weights(
                 n_examples, [client_stats[s]["num_steps"]
                              for s in args.slices])
+            scheme_result = delta_v
         elif args.weight_by == "corpus":
             weights = [len(data[s]["corpus"]) for s in args.slices]
         else:
             weights = n_examples
+        if scheme_result is not None:
+            # Symmetric with fedspan_diagnostics: a solver failure that
+            # degrades an arm to uniform must stay detectable in the record
+            # rather than only in the console log.
+            record = (scheme_result.record()
+                      if isinstance(scheme_result, SchemeResult)
+                      else {"weights": [float(w) for w in scheme_result],
+                            "status": "unreported", "solver_status": None,
+                            "solver_message": "scheme reported no status",
+                            "fallback": None})
+            record["scheme"] = canonical_weight_by
+            out.setdefault("scheme_diagnostics", {})[label] = record
+            if record["fallback"] is not None:
+                print(f"  WARNING: {canonical_weight_by} fell back to "
+                      f"{record['fallback']} ({record['status']}): "
+                      f"{record['solver_message']}")
         if args.weighted and args.weight_by in ADAPTIVE:
             wn = (delta_v if delta_v is not None else
                   (weights if weights is not None
@@ -642,6 +772,7 @@ def main():
             else:
                 global_state = apply_delta_weights(
                     round_broadcast, states, delta_v)
+                _assert_finite_state(global_state, "delta-space aggregation")
         elif args.lora_mode == "frozen-a":
             frozen_weights = ([1.0] * len(states)
                               if weights is None else list(weights))

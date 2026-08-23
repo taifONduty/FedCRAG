@@ -97,8 +97,11 @@ def amp_enabled():
 
 
 def get_git_commit(repo_dir=None):
-    # Best-effort provenance for result JSONs; never raises. The env guards
-    # match the known-good invocation on machines where bare `git` hangs
+    # Provenance for result JSONs; never raises, but never claims a clean tree
+    # it did not observe: a failed status query yields "unknown", not a
+    # clean-looking hash. --untracked-files=all matches run_e0.sh, so an
+    # unstaged new file marks the run dirty here too. The env guards match the
+    # known-good invocation on machines where bare `git` hangs
     # (system-config/pager issue observed on the student's Mac, 2026-08-18).
     import subprocess
     repo_dir = repo_dir or os.path.dirname(os.path.abspath(__file__))
@@ -109,12 +112,19 @@ def get_git_commit(repo_dir=None):
                            capture_output=True, text=True, timeout=10, env=env)
         commit = r.stdout.strip() if r.returncode == 0 else ""
         if not commit:
+            if r.returncode != 0 and r.stderr.strip():
+                print(f"  WARNING: git rev-parse failed: {r.stderr.strip()}")
             return "unknown"
-        r2 = subprocess.run(["git", "-C", repo_dir, "status", "--porcelain"],
+        r2 = subprocess.run(["git", "-C", repo_dir, "status", "--porcelain",
+                             "--untracked-files=all"],
                             capture_output=True, text=True, timeout=10, env=env)
-        dirty = "-dirty" if (r2.returncode == 0 and r2.stdout.strip()) else ""
-        return commit + dirty
-    except Exception:
+        if r2.returncode != 0:
+            print(f"  WARNING: git status failed ({r2.returncode}): "
+                  f"{r2.stderr.strip()}; tree cleanliness is unknown")
+            return commit + "-unknown-worktree"
+        return commit + ("-dirty" if r2.stdout.strip() else "")
+    except Exception as exc:
+        print(f"  WARNING: git provenance unavailable: {type(exc).__name__}: {exc}")
         return "unknown"
 
 

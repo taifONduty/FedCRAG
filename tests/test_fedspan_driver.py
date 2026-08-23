@@ -32,6 +32,7 @@ def frozen_args(**overrides):
         "afl_eta": 0.1,
         "loss_sample": 64,
         "max_steps_per_round": 10,
+        "fedspan_step_policy": "fixed",
         "fedspan_step_norm": 0.1,
         "fedspan_active_abs_tol": 1e-12,
         "fedspan_active_rel_tol": 1e-8,
@@ -52,12 +53,16 @@ def test_frozen_configuration_hash_is_stable_and_collision_sensitive():
         frozen_args(max_steps_per_round=11), data_sha256=data_hashes)
     different_step = _frozen_run_configuration_sha256(
         frozen_args(fedspan_step_norm=0.2), data_sha256=data_hashes)
+    different_policy = _frozen_run_configuration_sha256(
+        frozen_args(fedspan_step_policy="median-active",
+                    fedspan_step_norm=None), data_sha256=data_hashes)
     different_data = _frozen_run_configuration_sha256(
         frozen_args(), data_sha256={"nfcorpus": "changed", "fiqa": "b"})
     assert len(first) == 64
     assert first == second
     assert first != capped
     assert first != different_step
+    assert first != different_policy
     assert first != different_data
 
 
@@ -100,8 +105,9 @@ def test_dump_torch_is_atomic_and_roundtrips(tmp_path):
     assert loaded["label"] == "round"
 
 
+@pytest.mark.parametrize("step_policy", ["fixed", "median-active"])
 def test_driver_normmaxmin_dispatch_persists_exact_round_record(
-        monkeypatch, tmp_path):
+        monkeypatch, tmp_path, step_policy):
     module = "encoder.layer0.query"
     akey = f"{module}.lora_A.weight"
     bkey = f"{module}.lora_B.weight"
@@ -146,7 +152,7 @@ def test_driver_normmaxmin_dispatch_persists_exact_round_record(
                    for name in slices})
     monkeypatch.setattr(driver.torch.cuda, "empty_cache", lambda: None)
 
-    monkeypatch.setattr(sys, "argv", [
+    argv = [
         "federated_forgetting.py",
         "--slices", "c0", "c1",
         "--metrics", "ndcg@10",
@@ -154,10 +160,13 @@ def test_driver_normmaxmin_dispatch_persists_exact_round_record(
         "--weighted",
         "--weight_by", "normmaxmin",
         "--lora_mode", "frozen-a",
-        "--fedspan_step_norm", "0.1",
+        "--fedspan_step_policy", step_policy,
         "--save_states",
         "--out", str(tmp_path),
-    ])
+    ]
+    if step_policy == "fixed":
+        argv.extend(["--fedspan_step_norm", "0.1"])
+    monkeypatch.setattr(sys, "argv", argv)
     driver.main()
 
     result_paths = list(tmp_path.glob("federated_*.json"))
@@ -169,9 +178,88 @@ def test_driver_normmaxmin_dispatch_persists_exact_round_record(
     diagnostic = result["fedspan_diagnostics"]["round_1"]
     assert result["lora_mode"] == "frozen-a"
     assert result["weight_by_canonical"] == "normmaxmin"
+    assert result["method_contract"]["fedspan_step_policy"] == step_policy
+    assert diagnostic["step_policy"] == step_policy
     assert diagnostic["status"] == "optimal"
+    expected_step = 0.1
+    if step_policy == "median-active":
+        client_norms = [
+            2.0 * torch.linalg.vector_norm(clients[name][bkey]).item()
+            for name in ("c0", "c1")
+        ]
+        expected_step = sum(client_norms) / 2.0
+        assert "smedian-active" in result_paths[0].name
+    else:
+        assert "s0p1" in result_paths[0].name
+    assert diagnostic["resolved_step_norm"] == pytest.approx(
+        expected_step, abs=2e-6)
     assert diagnostic["application"]["applied_step_norm"] == pytest.approx(
-        0.1, abs=2e-6)
+        expected_step, abs=2e-6)
     saved = torch.load(state_paths[0], map_location="cpu", weights_only=True)
     assert torch.equal(saved["broadcast"][akey], broadcast[akey])
     assert torch.equal(saved["global"][akey], broadcast[akey])
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        ([], "requires --fedspan_step_policy"),
+        (["--fedspan_step_policy", "fixed"],
+         "fixed policy requires a positive finite --fedspan_step_norm"),
+        (["--fedspan_step_policy", "median-active",
+          "--fedspan_step_norm", "0.1"],
+         "median-active policy rejects --fedspan_step_norm"),
+    ],
+)
+def test_driver_rejects_illegal_normmaxmin_step_policy_before_data_work(
+        monkeypatch, capsys, extra_args, message):
+    touched_data = False
+
+    def unexpected_data_work(*args, **kwargs):
+        nonlocal touched_data
+        touched_data = True
+        raise AssertionError("data loading must not occur for illegal CLI")
+
+    monkeypatch.setattr(driver, "load_slice_with_train", unexpected_data_work)
+    monkeypatch.setattr(driver, "get_git_commit", lambda: "abc123def456")
+    monkeypatch.setattr(sys, "argv", [
+        "federated_forgetting.py",
+        "--weighted",
+        "--weight_by", "normmaxmin",
+        "--lora_mode", "frozen-a",
+        "--save_states",
+        *extra_args,
+    ])
+
+    with pytest.raises(SystemExit, match="2"):
+        driver.main()
+
+    assert message in capsys.readouterr().err
+    assert touched_data is False
+
+
+def test_driver_rejects_fedspan_policy_for_non_normmaxmin_arm(
+        monkeypatch, capsys):
+    touched_data = False
+
+    def unexpected_data_work(*args, **kwargs):
+        nonlocal touched_data
+        touched_data = True
+        raise AssertionError("data loading must not occur for illegal CLI")
+
+    monkeypatch.setattr(driver, "load_slice_with_train", unexpected_data_work)
+    monkeypatch.setattr(driver, "get_git_commit", lambda: "abc123def456")
+    monkeypatch.setattr(sys, "argv", [
+        "federated_forgetting.py",
+        "--weighted",
+        "--weight_by", "examples",
+        "--fedspan_step_policy", "fixed",
+        "--fedspan_step_norm", "0.1",
+    ])
+
+    with pytest.raises(SystemExit, match="2"):
+        driver.main()
+
+    assert "FedSpan step options are legal only with --weight_by normmaxmin" \
+        in capsys.readouterr().err
+    assert touched_data is False

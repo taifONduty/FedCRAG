@@ -194,6 +194,7 @@ def _frozen_run_configuration_sha256(args, data_sha256=None):
         "loss_sample": args.loss_sample,
         "max_steps_per_round": args.max_steps_per_round,
         "no_grad_ckpt": getattr(args, "no_grad_ckpt", False),
+        "fedspan_step_policy": args.fedspan_step_policy,
         "fedspan_step_norm": args.fedspan_step_norm,
         "fedspan_active_abs_tol": args.fedspan_active_abs_tol,
         "fedspan_active_rel_tol": args.fedspan_active_rel_tol,
@@ -365,8 +366,8 @@ def main():
                          "'maxmin'/'rawmaxmin' = historical-style cosine-game "
                          "simplex weights applied by state averaging; "
                          "'normmaxmin' = corrected FedSpan, legal only with "
-                         "--lora_mode frozen-a and an explicit positive "
-                         "--fedspan_step_norm; "
+                         "--lora_mode frozen-a and an explicit "
+                         "--fedspan_step_policy; "
                          "E2 external baselines: 'qffl' = q-FedAvg "
                          "(arXiv:1905.10497, loss^q with h_k normalization), "
                          "'afl' = agnostic-FL multiplicative-weights ascent "
@@ -383,9 +384,13 @@ def main():
                     help="max training pairs per client for the broadcast-"
                          "point loss estimate (qffl/afl only; deterministic "
                          "per round)")
+    ap.add_argument("--fedspan_step_policy",
+                    choices=["fixed", "median-active"], default=None,
+                    help="explicit true effective-B step policy required for "
+                         "--weight_by normmaxmin")
     ap.add_argument("--fedspan_step_norm", type=float, default=None,
-                    help="required true effective-B step norm s for "
-                         "--weight_by normmaxmin; no implicit scale is guessed")
+                    help="positive finite true effective-B step norm s, "
+                         "required only with --fedspan_step_policy fixed")
     ap.add_argument("--fedspan_active_abs_tol", type=float, default=1e-12,
                     help="absolute effective-update norm threshold")
     ap.add_argument("--fedspan_active_rel_tol", type=float, default=1e-8,
@@ -429,11 +434,17 @@ def main():
         if not args.save_states:
             ap.error("--weight_by normmaxmin requires --save_states so exact "
                      "broadcast/client/applied states are preserved")
-        if (args.fedspan_step_norm is None
-                or not np.isfinite(args.fedspan_step_norm)
-                or args.fedspan_step_norm <= 0):
-            ap.error("--weight_by normmaxmin requires a positive finite "
-                     "--fedspan_step_norm")
+        if args.fedspan_step_policy is None:
+            ap.error("--weight_by normmaxmin requires "
+                     "--fedspan_step_policy")
+        if args.fedspan_step_policy == "fixed":
+            if (args.fedspan_step_norm is None
+                    or not np.isfinite(args.fedspan_step_norm)
+                    or args.fedspan_step_norm <= 0):
+                ap.error("fixed policy requires a positive finite "
+                         "--fedspan_step_norm")
+        elif args.fedspan_step_norm is not None:
+            ap.error("median-active policy rejects --fedspan_step_norm")
         for option, value in (
                 ("--fedspan_active_abs_tol", args.fedspan_active_abs_tol),
                 ("--fedspan_active_rel_tol", args.fedspan_active_rel_tol),
@@ -446,6 +457,10 @@ def main():
                      or args.fedspan_max_abs_delta_weight <= 0)):
             ap.error("--fedspan_max_abs_delta_weight must be positive and "
                      "finite when supplied")
+    elif (args.fedspan_step_policy is not None
+          or args.fedspan_step_norm is not None):
+        ap.error("FedSpan step options are legal only with "
+                 "--weight_by normmaxmin")
     commit = get_git_commit()
     if (canonical_weight_by == "normmaxmin"
             and (commit == "unknown" or commit.endswith("-dirty"))
@@ -471,7 +486,10 @@ def main():
     # scientifically distinct settings cannot overwrite one another.
     basis = f"weighted-{args.weight_by}" if args.weighted else "unweighted"
     if canonical_weight_by == "normmaxmin":
-        step_tag = format(args.fedspan_step_norm, ".8g").replace(".", "p")
+        if args.fedspan_step_policy == "fixed":
+            step_tag = format(args.fedspan_step_norm, ".8g").replace(".", "p")
+        else:
+            step_tag = "median-active"
         basis += f"-s{step_tag}"
     frozen_config_sha256 = None
     if args.lora_mode == "frozen-a":
@@ -497,6 +515,7 @@ def main():
                "coordinate": ("effective-b" if args.lora_mode == "frozen-a"
                               else "trainable-ab-factor-state"),
                "shared_row_orthonormal_a": args.lora_mode == "frozen-a",
+               "fedspan_step_policy": args.fedspan_step_policy,
                "fedspan_step_norm": args.fedspan_step_norm,
                "dirty_provenance_override": args.allow_dirty_provenance,
                "initial_adapter_state_sha256": state_dict_sha256(global_state),
@@ -565,6 +584,7 @@ def main():
             fedspan = fedspan_delta_weights(
                 states, round_broadcast, module_scales=module_scales,
                 step_norm=args.fedspan_step_norm,
+                step_policy=args.fedspan_step_policy,
                 active_abs_tol=args.fedspan_active_abs_tol,
                 active_rel_tol=args.fedspan_active_rel_tol,
                 mixture_norm_tol=args.fedspan_mixture_norm_tol,

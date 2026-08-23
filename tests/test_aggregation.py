@@ -162,6 +162,92 @@ def test_maxmin_certificate_beats_uniform(federation):
 
 # --------------------------------------------------- norm-consistent FedSpan
 
+def _single_effective_direction(norm, module_scales):
+    blocks = [np.zeros((D_OUT, RANK)) for _ in MODULES]
+    blocks[0][0, 0] = norm / module_scales[MODULES[0]]
+    return blocks
+
+
+@pytest.mark.parametrize(
+    ("norms", "expected"),
+    [([1.0, 3.0, 100.0], 3.0),
+     ([1.0, 3.0, 5.0, 100.0], 4.0)],
+)
+def test_fedspan_median_active_resolves_odd_and_even_active_sets(
+        rng, norms, expected):
+    scales = {MODULES[0]: 0.5, MODULES[1]: 2.0}
+    deltas = [_single_effective_direction(norm, scales) for norm in norms]
+    broadcast, clients, scales = frozen_a_federation(rng, deltas, scales)
+
+    result = fedspan_delta_weights(
+        clients, broadcast, module_scales=scales,
+        step_policy="median-active", step_norm=None)
+
+    assert result["step_policy"] == "median-active"
+    assert result["declared_step_norm"] is None
+    assert result["resolved_step_norm"] == pytest.approx(expected, abs=2e-6)
+    assert result["requested_step_norm"] == pytest.approx(expected, abs=2e-6)
+
+
+def test_fedspan_median_active_excludes_nonfinite_and_tiny_clients(rng):
+    scales = {MODULES[0]: 0.5, MODULES[1]: 2.0}
+    deltas = [_single_effective_direction(norm, scales)
+              for norm in (1.0, 3.0, 100.0)]
+    tiny = _single_effective_direction(1e-15, scales)
+    nonfinite = _single_effective_direction(10.0, scales)
+    nonfinite[0][0, 0] = np.nan
+    broadcast, clients, scales = frozen_a_federation(
+        rng, deltas + [tiny, nonfinite], scales)
+
+    result = fedspan_delta_weights(
+        clients, broadcast, module_scales=scales,
+        step_policy="median-active", step_norm=None,
+        active_abs_tol=1e-12, active_rel_tol=1e-8)
+
+    assert result["active_mask"] == [True, True, True, False, False]
+    assert result["inactive_reasons"][-2:] == [
+        "zero_or_tiny_delta", "nonfinite_delta"]
+    assert result["resolved_step_norm"] == pytest.approx(3.0, abs=2e-6)
+
+
+def test_fedspan_median_active_no_active_has_no_resolved_norm(rng):
+    zero = np.zeros((D_OUT, RANK))
+    broadcast, clients, scales = frozen_a_federation(
+        rng, [[zero, zero], [zero, zero]])
+
+    result = fedspan_delta_weights(
+        clients, broadcast, module_scales=scales,
+        step_policy="median-active", step_norm=None)
+
+    assert result["status"] == "no_active"
+    assert result["step_policy"] == "median-active"
+    assert result["declared_step_norm"] is None
+    assert result["resolved_step_norm"] is None
+    assert result["requested_step_norm"] is None
+
+
+@pytest.mark.parametrize(
+    ("step_policy", "step_norm", "message"),
+    [
+        ("unknown", None, "step_policy"),
+        ("median-active", 0.2, "rejects step_norm"),
+        ("fixed", None, "positive finite step_norm"),
+        ("fixed", 0.0, "positive finite step_norm"),
+        ("fixed", -1.0, "positive finite step_norm"),
+        ("fixed", float("nan"), "positive finite step_norm"),
+        ("fixed", float("inf"), "positive finite step_norm"),
+    ],
+)
+def test_fedspan_step_policy_legality(
+        rng, step_policy, step_norm, message):
+    deltas = [[rng.normal(size=(D_OUT, RANK)) for _ in MODULES]
+              for _ in range(2)]
+    broadcast, clients, scales = frozen_a_federation(rng, deltas)
+    with pytest.raises(ValueError, match=message):
+        fedspan_delta_weights(
+            clients, broadcast, module_scales=scales,
+            step_policy=step_policy, step_norm=step_norm)
+
 def test_fedspan_exact_true_step_with_unequal_norms_and_module_scales(rng):
     deltas = [
         [rng.normal(size=(D_OUT, RANK)) * 0.02,
@@ -469,6 +555,51 @@ def test_fedspan_randomized_dense_oracle_scale_and_permutation_invariance():
             key = f"{m}.lora_B.weight"
             assert torch.allclose(
                 applied[key], scaled_applied[key], atol=7e-5, rtol=7e-5)
+
+
+def test_fedspan_median_active_randomized_permutation_invariance():
+    """Median-resolved solve/application is independent of client ordering."""
+    for seed in range(20):
+        local_rng = np.random.default_rng(5000 + seed)
+        client_deltas = []
+        for _ in range(5):
+            magnitude = 10.0 ** local_rng.uniform(-3.0, 3.0)
+            client_deltas.append([
+                magnitude * local_rng.normal(size=(D_OUT, RANK))
+                for _ in MODULES
+            ])
+        scales = {m: 10.0 ** local_rng.uniform(-1.0, 1.0)
+                  for m in MODULES}
+        broadcast, clients, scales = frozen_a_federation(
+            local_rng, client_deltas, scales)
+
+        result = fedspan_delta_weights(
+            clients, broadcast, module_scales=scales,
+            step_policy="median-active", active_rel_tol=0.0)
+        applied, diag = apply_fedspan_update(
+            broadcast, clients, result, module_scales=scales)
+        expected_median = float(np.median(result["client_norms"]))
+        assert result["resolved_step_norm"] == pytest.approx(
+            expected_median, rel=1e-12)
+        assert diag["applied_step_norm"] == pytest.approx(
+            expected_median, rel=3e-5, abs=3e-6)
+
+        permutation = local_rng.permutation(len(clients)).tolist()
+        permuted = [clients[index] for index in permutation]
+        perm_result = fedspan_delta_weights(
+            permuted, broadcast, module_scales=scales,
+            step_policy="median-active", active_rel_tol=0.0)
+        perm_applied, perm_diag = apply_fedspan_update(
+            broadcast, permuted, perm_result, module_scales=scales)
+
+        assert perm_result["resolved_step_norm"] == pytest.approx(
+            result["resolved_step_norm"], rel=1e-12)
+        assert perm_diag["applied_step_norm"] == pytest.approx(
+            diag["applied_step_norm"], rel=3e-5, abs=3e-6)
+        for m in MODULES:
+            key = f"{m}.lora_B.weight"
+            assert torch.allclose(
+                applied[key], perm_applied[key], atol=7e-5, rtol=7e-5)
 
 
 # ----------------------------------------------------------------------- MGDA

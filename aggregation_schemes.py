@@ -475,6 +475,7 @@ def apply_frozen_b_delta_weights(broadcast_state, client_states, coefficients,
 
 def _zero_fedspan_result(status, client_norms, active_mask,
                          inactive_reasons, step_norm, threshold,
+                         step_policy="fixed", declared_step_norm=None,
                          solver_status=None, solver_message="",
                          fallback="zero_update", active_indices=None,
                          cosine_gram_active=None, simplex_weights=None,
@@ -495,7 +496,13 @@ def _zero_fedspan_result(status, client_norms, active_mask,
         "solver_objective_gamma": solver_objective_gamma,
         "solver_simplex_residual": solver_simplex_residual,
         "solver_constraint_violation": solver_constraint_violation,
-        "requested_step_norm": float(step_norm),
+        "step_policy": step_policy,
+        "declared_step_norm": declared_step_norm,
+        "resolved_step_norm": (None if step_norm is None
+                               else float(step_norm)),
+        # Compatibility alias retained for existing diagnostics consumers.
+        "requested_step_norm": (None if step_norm is None
+                                else float(step_norm)),
         "activity_threshold": float(threshold),
         "client_norms": client_norms,
         "active_mask": active_mask,
@@ -529,7 +536,8 @@ def _effective_vector_sha256(blocks):
 
 
 def fedspan_delta_weights(client_states, broadcast_state, module_scales,
-                          step_norm, active_abs_tol=1e-12,
+                          step_norm=None, step_policy="fixed",
+                          active_abs_tol=1e-12,
                           active_rel_tol=1e-8, mixture_norm_tol=1e-6,
                           max_abs_delta_weight=None):
     """Exact frozen-A, norm-consistent max-min aggregation coefficients.
@@ -539,16 +547,26 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
     finite, non-tiny clients. If ``w`` is its simplex solution and ``r_k``
     the effective client norm, the raw-B delta coefficient is
 
-      c_k = step_norm * w_k / (r_k * sqrt(w.T @ H @ w)).
+      c_k = resolved_step_norm * w_k / (r_k * sqrt(w.T @ H @ w)).
 
     Solver errors, invalid solutions, near cancellation, and an optional
     coefficient-limit violation fail closed to a zero server update. Contract
     violations such as trainable/non-shared A or malformed factor states raise
     ``FedSpanContractError`` and invalidate the run rather than falling back.
     """
-    step_norm = float(step_norm)
-    if not math.isfinite(step_norm) or step_norm <= 0:
-        raise ValueError("step_norm must be positive and finite")
+    if step_policy not in ("fixed", "median-active"):
+        raise ValueError(
+            "step_policy must be 'fixed' or 'median-active'")
+    if step_policy == "fixed":
+        if (step_norm is None or not math.isfinite(float(step_norm))
+                or float(step_norm) <= 0):
+            raise ValueError(
+                "fixed step policy requires a positive finite step_norm")
+        declared_step_norm = float(step_norm)
+    else:
+        if step_norm is not None:
+            raise ValueError("median-active step policy rejects step_norm")
+        declared_step_norm = None
     for name, value in (("active_abs_tol", active_abs_tol),
                         ("active_rel_tol", active_rel_tol),
                         ("mixture_norm_tol", mixture_norm_tol)):
@@ -594,8 +612,26 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
     if not active:
         return _zero_fedspan_result(
             "no_active", client_norms, active_mask, inactive_reasons,
-            step_norm, threshold, active_indices=[], module_scales=scales,
+            declared_step_norm, threshold, step_policy=step_policy,
+            declared_step_norm=declared_step_norm,
+            active_indices=[], module_scales=scales,
             delta_weight_limit=max_abs_delta_weight)
+
+    resolved_step_norm = (
+        declared_step_norm
+        if step_policy == "fixed"
+        else float(np.median([client_norms[index] for index in active])))
+    if (not math.isfinite(resolved_step_norm)
+            or resolved_step_norm <= 0):
+        return _zero_fedspan_result(
+            "invalid_step_norm", client_norms, active_mask,
+            inactive_reasons, resolved_step_norm, threshold,
+            step_policy=step_policy,
+            declared_step_norm=declared_step_norm,
+            active_indices=active, module_scales=scales,
+            solver_message="resolved step norm is nonpositive or nonfinite",
+            delta_weight_limit=max_abs_delta_weight)
+    step_norm = resolved_step_norm
 
     M = len(active)
     gram = np.zeros((M, M), dtype=np.float64)
@@ -635,6 +671,8 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
             return _zero_fedspan_result(
                 "solver_error", client_norms, active_mask, inactive_reasons,
                 step_norm, threshold, solver_status="exception",
+                step_policy=step_policy,
+                declared_step_norm=declared_step_norm,
                 solver_message=f"{type(exc).__name__}: {exc}",
                 active_indices=active, cosine_gram_active=cosine_list,
                 module_scales=scales,
@@ -643,6 +681,8 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
             return _zero_fedspan_result(
                 "solver_failure", client_norms, active_mask, inactive_reasons,
                 step_norm, threshold, solver_status=int(solved.status),
+                step_policy=step_policy,
+                declared_step_norm=declared_step_norm,
                 solver_message=str(solved.message), active_indices=active,
                 cosine_gram_active=cosine_list, module_scales=scales,
                 delta_weight_limit=max_abs_delta_weight)
@@ -655,6 +695,8 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
             return _zero_fedspan_result(
                 "solver_invalid", client_norms, active_mask, inactive_reasons,
                 step_norm, threshold, solver_status=int(solved.status),
+                step_policy=step_policy,
+                declared_step_norm=declared_step_norm,
                 solver_message="LP returned an infeasible/nonfinite simplex point",
                 active_indices=active, cosine_gram_active=cosine_list,
                 module_scales=scales,
@@ -680,6 +722,8 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
         return _zero_fedspan_result(
             "near_cancellation", client_norms, active_mask, inactive_reasons,
             step_norm, threshold, solver_status=solver_status,
+            step_policy=step_policy,
+            declared_step_norm=declared_step_norm,
             solver_message=solver_message, active_indices=active,
             cosine_gram_active=cosine_list, simplex_weights=simplex,
             gamma=gamma, mixture_norm=mixture_norm, module_scales=scales,
@@ -699,6 +743,8 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
         return _zero_fedspan_result(
             "coefficient_limit", client_norms, active_mask, inactive_reasons,
             step_norm, threshold, solver_status=solver_status,
+            step_policy=step_policy,
+            declared_step_norm=declared_step_norm,
             solver_message=solver_message, active_indices=active,
             cosine_gram_active=cosine_list, simplex_weights=simplex,
             gamma=gamma, mixture_norm=mixture_norm, module_scales=scales,
@@ -720,6 +766,8 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
         return _zero_fedspan_result(
             "reconstruction_failure", client_norms, active_mask,
             inactive_reasons, step_norm, threshold,
+            step_policy=step_policy,
+            declared_step_norm=declared_step_norm,
             solver_status=solver_status,
             solver_message=(
                 f"coefficient reconstruction produced norm {solved_norm} "
@@ -742,6 +790,9 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
         "solver_objective_gamma": solver_objective_gamma,
         "solver_simplex_residual": solver_simplex_residual,
         "solver_constraint_violation": solver_constraint_violation,
+        "step_policy": step_policy,
+        "declared_step_norm": declared_step_norm,
+        "resolved_step_norm": step_norm,
         "requested_step_norm": step_norm,
         "activity_threshold": threshold,
         "client_norms": client_norms,
@@ -805,13 +856,18 @@ def apply_fedspan_update(broadcast_state, client_states, result,
                     for name in names)
     applied_norm = math.sqrt(sum(torch.sum(value ** 2).item()
                                  for value in actual.values()))
+    resolved_step_norm = result.get(
+        "resolved_step_norm", result.get("requested_step_norm"))
     tolerance = float(verify_atol) * max(
-        1.0, float(result.get("requested_step_norm", 0.0)))
+        1.0, float(resolved_step_norm or 0.0))
     if max_error > tolerance:
         raise RuntimeError(
             f"applied FedSpan update differs from solved update: {max_error}")
     if result.get("fallback") is None:
-        requested = float(result["requested_step_norm"])
+        if resolved_step_norm is None:
+            raise FedSpanContractError(
+                "non-fallback FedSpan result lacks a resolved step norm")
+        requested = float(resolved_step_norm)
         if abs(applied_norm - requested) > tolerance:
             raise RuntimeError(
                 f"applied FedSpan norm {applied_norm} != requested {requested}")

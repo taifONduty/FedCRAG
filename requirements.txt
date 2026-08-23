@@ -11,4 +11,6 @@ peft>=0.11
 beir
 pytrec_eval-terrier
 numpy
+scipy
+pytest
 openai

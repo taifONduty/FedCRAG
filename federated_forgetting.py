@@ -1,7 +1,11 @@
 import os
 import json
 import argparse
+import hashlib
+import importlib.metadata
+import platform
 import random
+import sys
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -23,6 +27,23 @@ def get_adapter_state(model):
 def set_adapter_state(model, state):
     inner = model[0].auto_model
     set_peft_model_state_dict(inner, state)
+
+
+# Gram/LP/QP/delta-space weighting machinery lives in aggregation_schemes.py
+# (pure math, unit-tested in tests/test_aggregation.py). NOTE: the corrected
+# trace identity there fixes a cross-pairing in the campaign-era inline copy;
+# measured effect on the shipped maxmin arms: weight shift <= 0.0025, gamma*
+# shift <= 0.0023 (results/gram_bug_audit.json) — below the seed noise floor.
+from aggregation_schemes import (afl_update, apply_delta_weights,
+                                 apply_fedspan_update,
+                                 apply_frozen_b_delta_weights,
+                                 configure_frozen_lora_a,
+                                 fednova_delta_weights,
+                                 fedspan_delta_weights, maxmin_weights,
+                                 frozen_a_state_diagnostics,
+                                 mgda_weights, qffl_delta_weights,
+                                 state_dict_sha256, update_gram,
+                                 validate_frozen_a_states)
 
 
 def fedavg(states, weights=None):
@@ -53,7 +74,8 @@ def make_examples(data, q_prefix, d_prefix):
     return ex
 
 
-def new_model(model_name, model_path, lora_rank, fp16, grad_ckpt=True):
+def new_model(model_name, model_path, lora_rank, fp16,
+              lora_mode="trainable-ab", grad_ckpt=True):
     model = SentenceTransformer(model_path, trust_remote_code=True)
     if fp16:
         model.half()
@@ -62,10 +84,128 @@ def new_model(model_name, model_path, lora_rank, fp16, grad_ckpt=True):
                      r=lora_rank, lora_alpha=2 * lora_rank, lora_dropout=0.1,
                      target_modules=LORA_TARGETS)
     model.add_adapter(cfg)
+    if lora_mode == "frozen-a":
+        module_scales = configure_frozen_lora_a(
+            model[0].auto_model, adapter_name="default")
+    elif lora_mode == "trainable-ab":
+        # All modules use this script's single LoraConfig, so alpha/r is
+        # exactly common. Keep it explicit for PEFT-scale-aware Grams.
+        module_scales = float(cfg.lora_alpha) / float(cfg.r)
+    else:
+        raise ValueError(f"unknown lora_mode: {lora_mode}")
     if grad_ckpt:
         model[0].auto_model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
-    return model
+    return model, module_scales
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _data_fingerprints(data):
+    """Canonical content identifiers for exactly the loaded experiment data."""
+    fingerprints = {}
+    for slice_name, payload in sorted(data.items()):
+        digest = hashlib.sha256()
+        for section in ("corpus", "train_q", "train_qrels",
+                        "eval_q", "eval_qrels"):
+            digest.update(section.encode("utf-8") + b"\0")
+            values = payload.get(section, {})
+            for key in sorted(values, key=str):
+                digest.update(str(key).encode("utf-8") + b"\0")
+                encoded = json.dumps(
+                    values[key], sort_keys=True, ensure_ascii=False,
+                    separators=(",", ":")).encode("utf-8")
+                digest.update(encoded + b"\0")
+        fingerprints[slice_name] = digest.hexdigest()
+    return fingerprints
+
+
+def _runtime_provenance(commit, requested_model, model_path, model,
+                        module_scales, data_root, data_sha256):
+    root = os.path.dirname(os.path.abspath(__file__))
+    source_files = ("federated_forgetting.py", "aggregation_schemes.py",
+                    "fedcrag_common.py", "requirements.txt")
+    versions = {}
+    for package in ("torch", "sentence-transformers", "peft", "scipy",
+                    "numpy"):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = "missing"
+    installed = {
+        (distribution.metadata.get("Name") or "unknown").lower():
+            distribution.version
+        for distribution in importlib.metadata.distributions()
+    }
+    installed = dict(sorted(installed.items()))
+    environment_json = json.dumps(
+        installed, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    config = model[0].auto_model.config
+    config_json = json.dumps(
+        config.to_dict(), sort_keys=True, default=str,
+        separators=(",", ":")).encode("utf-8")
+    return {
+        "git_commit": commit,
+        "source_sha256": {
+            name: _sha256_file(os.path.join(root, name))
+            for name in source_files
+        },
+        "python": sys.version,
+        "platform": platform.platform(),
+        "packages": versions,
+        "installed_packages": installed,
+        "installed_packages_sha256": hashlib.sha256(
+            environment_json).hexdigest(),
+        "model": {
+            "requested_name": requested_model,
+            "resolved_path": model_path,
+            "config_name_or_path": getattr(config, "_name_or_path", None),
+            "upstream_commit_hash": getattr(config, "_commit_hash", None),
+            "config_sha256": hashlib.sha256(config_json).hexdigest(),
+        },
+        "data_root": os.path.realpath(data_root),
+        "data_sha256": data_sha256,
+        "module_scales": module_scales,
+    }
+
+
+def _frozen_run_configuration_sha256(args, data_sha256=None):
+    """Hash every result-affecting option for collision-safe frozen-A runs."""
+    fields = {
+        "slices": args.slices,
+        "metrics": args.metrics,
+        "num_rounds": args.num_rounds,
+        "local_epochs": args.local_epochs,
+        "batch_size": args.batch_size,
+        "eval_batch_size": getattr(args, "eval_batch_size", None),
+        "lr": args.lr,
+        "lora_rank": args.lora_rank,
+        "lora_mode": args.lora_mode,
+        "weighted": args.weighted,
+        "weight_by": args.weight_by,
+        "qffl_q": args.qffl_q,
+        "afl_eta": args.afl_eta,
+        "loss_sample": args.loss_sample,
+        "max_steps_per_round": args.max_steps_per_round,
+        "no_grad_ckpt": getattr(args, "no_grad_ckpt", False),
+        "fedspan_step_norm": args.fedspan_step_norm,
+        "fedspan_active_abs_tol": args.fedspan_active_abs_tol,
+        "fedspan_active_rel_tol": args.fedspan_active_rel_tol,
+        "fedspan_mixture_norm_tol": args.fedspan_mixture_norm_tol,
+        "fedspan_max_abs_delta_weight": args.fedspan_max_abs_delta_weight,
+        "dirty_provenance_override": getattr(
+            args, "allow_dirty_provenance", False),
+        "data_sha256": data_sha256,
+    }
+    encoded = json.dumps(
+        fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def client_train(model, global_state, data, q_prefix, d_prefix,
@@ -111,6 +251,47 @@ def client_train(model, global_state, data, q_prefix, d_prefix,
     return get_adapter_state(model), len(examples), num_steps
 
 
+def estimate_client_losses(model, global_state, data_by_slice, slices,
+                           q_prefix, d_prefix, sample, batch_size, rng_seed):
+    """Per-client training loss at the BROADCAST point w^t (the evaluation
+    point q-FedAvg and AFL prescribe: F_k(w^t), before local training).
+
+    MNRL-consistent estimator: for a deterministic sample of up to ``sample``
+    training pairs per client, loss = in-batch-negatives cross-entropy over
+    cosine scores at the MNRL default scale of 20. No gradients; batched with
+    the eval batch size. The sample is fixed per (seed, round) so all schemes
+    see identical losses.
+    """
+    set_adapter_state(model, global_state)
+    out = []
+    for s in slices:
+        examples = make_examples(data_by_slice[s], q_prefix, d_prefix)
+        if not examples:
+            out.append(0.0)
+            continue
+        rng = np.random.RandomState(rng_seed)
+        idx = rng.permutation(len(examples))[:sample]
+        losses = []
+        with torch.no_grad():
+            for lo in range(0, len(idx), batch_size):
+                chunk = [examples[i] for i in idx[lo:lo + batch_size]]
+                q = model.encode([e.texts[0] for e in chunk],
+                                 batch_size=batch_size, convert_to_tensor=True,
+                                 normalize_embeddings=True,
+                                 show_progress_bar=False)
+                d = model.encode([e.texts[1] for e in chunk],
+                                 batch_size=batch_size, convert_to_tensor=True,
+                                 normalize_embeddings=True,
+                                 show_progress_bar=False)
+                scores = 20.0 * (q @ d.T)
+                target = torch.arange(len(chunk), device=scores.device)
+                ce = torch.nn.functional.cross_entropy(scores, target,
+                                                       reduction="sum")
+                losses.append(float(ce))
+        out.append(sum(losses) / max(len(idx), 1))
+    return out
+
+
 def eval_global(model, global_state, data, slices, q_prefix, d_prefix,
                 metrics, batch_size):
     set_adapter_state(model, global_state)
@@ -147,6 +328,12 @@ def dump_json(out, jpath):
     os.replace(tmp, jpath)
 
 
+def dump_torch(out, path):
+    tmp = path + ".tmp"
+    torch.save(out, tmp)
+    os.replace(tmp, path)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--slices", nargs="+", default=["nfcorpus", "fiqa", "scifact", "arguana"])
@@ -161,13 +348,62 @@ def main():
                          "affects speed, not results)")
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--lora_rank", type=int, default=16)
+    ap.add_argument("--lora_mode", choices=["trainable-ab", "frozen-a"],
+                    default="trainable-ab",
+                    help="'trainable-ab' preserves the historical ordinary-"
+                         "LoRA coordinate; 'frozen-a' row-orthonormalizes one "
+                         "shared A at initialization and trains B only")
     ap.add_argument("--weighted", action="store_true")
-    ap.add_argument("--weight_by", choices=["examples", "corpus"], default="examples",
+    ap.add_argument("--weight_by",
+                    choices=["examples", "corpus", "maxmin", "rawmaxmin",
+                             "normmaxmin",
+                             "qffl", "afl", "mgda", "fednova"],
+                    default="examples",
                     help="FedAvg weighting basis when --weighted: 'examples' = "
                          "local training-pair count (canonical FedAvg n_k), "
-                         "'corpus' = client corpus size (the original F4 run)")
+                         "'corpus' = client corpus size (the original F4 run), "
+                         "'maxmin'/'rawmaxmin' = historical-style cosine-game "
+                         "simplex weights applied by state averaging; "
+                         "'normmaxmin' = corrected FedSpan, legal only with "
+                         "--lora_mode frozen-a and an explicit positive "
+                         "--fedspan_step_norm; "
+                         "E2 external baselines: 'qffl' = q-FedAvg "
+                         "(arXiv:1905.10497, loss^q with h_k normalization), "
+                         "'afl' = agnostic-FL multiplicative-weights ascent "
+                         "(arXiv:1902.00146), 'mgda' = min-norm weights on the "
+                         "raw update Gram (arXiv:1810.04650), 'fednova' = "
+                         "tau-normalized averaging (arXiv:2007.07481)")
+    ap.add_argument("--qffl_q", type=float, default=1.0,
+                    help="q-FedAvg fairness exponent q (only with "
+                         "--weight_by qffl)")
+    ap.add_argument("--afl_eta", type=float, default=0.1,
+                    help="AFL mixture-weight ascent step size (only with "
+                         "--weight_by afl)")
+    ap.add_argument("--loss_sample", type=int, default=2048,
+                    help="max training pairs per client for the broadcast-"
+                         "point loss estimate (qffl/afl only; deterministic "
+                         "per round)")
+    ap.add_argument("--fedspan_step_norm", type=float, default=None,
+                    help="required true effective-B step norm s for "
+                         "--weight_by normmaxmin; no implicit scale is guessed")
+    ap.add_argument("--fedspan_active_abs_tol", type=float, default=1e-12,
+                    help="absolute effective-update norm threshold")
+    ap.add_argument("--fedspan_active_rel_tol", type=float, default=1e-8,
+                    help="relative threshold times the largest finite client "
+                         "effective-update norm")
+    ap.add_argument("--fedspan_mixture_norm_tol", type=float, default=1e-6,
+                    help="dimensionless near-cancellation threshold for "
+                         "sqrt(w^T H w); violations fail closed to no update")
+    ap.add_argument("--fedspan_max_abs_delta_weight", type=float, default=None,
+                    help="optional declared cap on |c_k|; a violation fails "
+                         "closed rather than silently clipping")
+    ap.add_argument("--allow_dirty_provenance", action="store_true",
+                    help="allow normmaxmin on an unknown/dirty Git tree for "
+                         "development only; recorded in output and invalid for "
+                         "paper-grade E0--E5 evidence")
     ap.add_argument("--save_states", action="store_true",
-                    help="save per-client + global adapter states each round "
+                    help="save broadcast + per-client + global adapter states "
+                         "and hashes each round "
                          "(needed for mechanism diagnostics, e.g. principal "
                          "angles between client updates)")
     ap.add_argument("--max_steps_per_round", type=int, default=0,
@@ -180,20 +416,68 @@ def main():
     ap.add_argument("--out", default="./results")
     args = ap.parse_args()
 
+    canonical_weight_by = ("rawmaxmin" if args.weight_by == "maxmin"
+                           else args.weight_by)
+    if args.weight_by == "maxmin":
+        print("  WARNING: --weight_by maxmin is the historical rawmaxmin "
+              "alias, not norm-consistent FedSpan")
+    if canonical_weight_by == "normmaxmin":
+        if not args.weighted:
+            ap.error("--weight_by normmaxmin requires --weighted")
+        if args.lora_mode != "frozen-a":
+            ap.error("--weight_by normmaxmin requires --lora_mode frozen-a")
+        if not args.save_states:
+            ap.error("--weight_by normmaxmin requires --save_states so exact "
+                     "broadcast/client/applied states are preserved")
+        if (args.fedspan_step_norm is None
+                or not np.isfinite(args.fedspan_step_norm)
+                or args.fedspan_step_norm <= 0):
+            ap.error("--weight_by normmaxmin requires a positive finite "
+                     "--fedspan_step_norm")
+        for option, value in (
+                ("--fedspan_active_abs_tol", args.fedspan_active_abs_tol),
+                ("--fedspan_active_rel_tol", args.fedspan_active_rel_tol),
+                ("--fedspan_mixture_norm_tol",
+                 args.fedspan_mixture_norm_tol)):
+            if not np.isfinite(value) or value < 0:
+                ap.error(f"{option} must be finite and nonnegative")
+        if (args.fedspan_max_abs_delta_weight is not None
+                and (not np.isfinite(args.fedspan_max_abs_delta_weight)
+                     or args.fedspan_max_abs_delta_weight <= 0)):
+            ap.error("--fedspan_max_abs_delta_weight must be positive and "
+                     "finite when supplied")
+    commit = get_git_commit()
+    if (canonical_weight_by == "normmaxmin"
+            and (commit == "unknown" or commit.endswith("-dirty"))
+            and not args.allow_dirty_provenance):
+        ap.error("normmaxmin refuses unknown/dirty source provenance; commit "
+                 "the exact implementation or use --allow_dirty_provenance "
+                 "for development-only runs")
+
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     os.makedirs(args.out, exist_ok=True)
 
     data = {s: load_slice_with_train(s, args.data_root) for s in args.slices}
+    data_sha256 = _data_fingerprints(data)
     model_path, q_prefix, d_prefix, fp16 = resolve_local(args.model)
 
-    model = new_model(args.model, model_path, args.lora_rank, fp16,
-                      grad_ckpt=not args.no_grad_ckpt)
+    model, module_scales = new_model(
+        args.model, model_path, args.lora_rank, fp16,
+        lora_mode=args.lora_mode, grad_ckpt=not args.no_grad_ckpt)
     global_state = get_adapter_state(model)
 
-    # tag must encode EVERY arm-distinguishing option: the May-2026 pilot lost
-    # its unweighted per-round data to a filename collision, and weighted runs
-    # with different --weight_by would collide again without the basis here.
+    # Preserve historical trainable-A+B filenames. New frozen-A runs add a
+    # canonical result-affecting configuration hash so capped/full and other
+    # scientifically distinct settings cannot overwrite one another.
     basis = f"weighted-{args.weight_by}" if args.weighted else "unweighted"
+    if canonical_weight_by == "normmaxmin":
+        step_tag = format(args.fedspan_step_norm, ".8g").replace(".", "p")
+        basis += f"-s{step_tag}"
+    frozen_config_sha256 = None
+    if args.lora_mode == "frozen-a":
+        frozen_config_sha256 = _frozen_run_configuration_sha256(
+            args, data_sha256=data_sha256)
+        basis = f"frozen-a_{basis}-cfg{frozen_config_sha256[:12]}"
     tag = f"{basis}_r{args.num_rounds}"
     model_safe = args.model.replace("/", "_")
     jpath = os.path.join(args.out,
@@ -203,9 +487,27 @@ def main():
            "metrics": args.metrics, "num_rounds": args.num_rounds,
            "weighted": args.weighted,
            "weight_by": args.weight_by if args.weighted else None,
+           "weight_by_canonical": (canonical_weight_by
+                                   if args.weighted else None),
            "split_fallback": [s for s in args.slices
                               if data[s].get("split_fallback")],
-           "commit": get_git_commit(), "use_amp": amp_enabled(),
+           "commit": commit, "use_amp": amp_enabled(),
+           "lora_mode": args.lora_mode,
+           "method_contract": {
+               "coordinate": ("effective-b" if args.lora_mode == "frozen-a"
+                              else "trainable-ab-factor-state"),
+               "shared_row_orthonormal_a": args.lora_mode == "frozen-a",
+               "fedspan_step_norm": args.fedspan_step_norm,
+               "dirty_provenance_override": args.allow_dirty_provenance,
+               "initial_adapter_state_sha256": state_dict_sha256(global_state),
+               "frozen_a_diagnostics": (
+                   frozen_a_state_diagnostics(global_state, module_scales)
+                   if args.lora_mode == "frozen-a" else None),
+               "run_configuration_sha256": frozen_config_sha256,
+           },
+           "provenance": _runtime_provenance(
+               commit, args.model, model_path, model, module_scales,
+               args.data_root, data_sha256),
            "args": vars(args), "clients": {}, "R_matrix": {}, "BWT": None}
     R = out["R_matrix"]
 
@@ -215,11 +517,29 @@ def main():
     print_scores("frozen", R["frozen"], args.slices, args.metrics)
     dump_json(out, jpath)
 
+    ADAPTIVE = ("maxmin", "rawmaxmin", "normmaxmin", "qffl", "afl",
+                "mgda", "fednova")
+    afl_lam = [1.0 / len(args.slices)] * len(args.slices)
+
     for rnd in range(args.num_rounds):
         print(f"  --- round {rnd+1}/{args.num_rounds} ---")
+        label = f"round_{rnd+1}"
+        round_broadcast = {key: value.clone()
+                           for key, value in global_state.items()}
+        # qffl/afl evaluate F_k at the broadcast point, BEFORE local training
+        losses = None
+        if args.weighted and args.weight_by in ("qffl", "afl"):
+            losses = estimate_client_losses(
+                model, round_broadcast, data, args.slices, q_prefix, d_prefix,
+                args.loss_sample, args.eval_batch_size,
+                rng_seed=args.seed * 1000 + rnd)
+            out.setdefault("client_losses", {})[label] = \
+                dict(zip(args.slices, [round(x, 5) for x in losses]))
+            print(f"  broadcast-point losses: "
+                  f"{[round(x, 3) for x in losses]}")
         states, n_examples, client_stats = [], [], {}
         for s in args.slices:
-            st, n_ex, n_steps = client_train(model, global_state, data[s],
+            st, n_ex, n_steps = client_train(model, round_broadcast, data[s],
                                              q_prefix, d_prefix,
                                              args.local_epochs,
                                              args.batch_size, args.lr, name=s,
@@ -227,21 +547,116 @@ def main():
             states.append(st)
             n_examples.append(n_ex)
             client_stats[s] = {"num_examples": n_ex, "num_steps": n_steps}
-        if args.weighted:
-            weights = ([len(data[s]["corpus"]) for s in args.slices]
-                       if args.weight_by == "corpus" else n_examples)
-        else:
+        if args.lora_mode == "frozen-a":
+            validate_frozen_a_states(
+                states, round_broadcast, module_scales=module_scales)
+        # --- aggregation dispatch ---------------------------------------
+        # Trainable-A+B simplex schemes retain historical FedAvg. Every
+        # frozen-A arm applies raw-B deltas so the broadcast A is copied
+        # bit-for-bit; normmaxmin supplies non-simplex true-step coefficients.
+        delta_v = None
+        precomputed_state = None
+        if not args.weighted:
             weights = None
-        global_state = fedavg(states, weights=weights)
+        elif args.weight_by in ("maxmin", "rawmaxmin"):
+            weights = maxmin_weights(
+                states, round_broadcast, module_scales=module_scales)
+        elif args.weight_by == "normmaxmin":
+            fedspan = fedspan_delta_weights(
+                states, round_broadcast, module_scales=module_scales,
+                step_norm=args.fedspan_step_norm,
+                active_abs_tol=args.fedspan_active_abs_tol,
+                active_rel_tol=args.fedspan_active_rel_tol,
+                mixture_norm_tol=args.fedspan_mixture_norm_tol,
+                max_abs_delta_weight=args.fedspan_max_abs_delta_weight)
+            precomputed_state, applied = apply_fedspan_update(
+                round_broadcast, states, fedspan,
+                module_scales=module_scales)
+            fedspan_record = dict(fedspan)
+            fedspan_record["application"] = applied
+            out.setdefault("fedspan_diagnostics", {})[label] = fedspan_record
+            delta_v = fedspan["delta_weights"]
+            weights = None
+            print("  normmaxmin status="
+                  f"{fedspan['status']} gamma={fedspan['gamma']} "
+                  f"mixture_norm={fedspan['mixture_norm']} "
+                  f"applied_norm={applied['applied_step_norm']}")
+        elif args.weight_by == "mgda":
+            weights = mgda_weights(
+                states, round_broadcast, module_scales=module_scales)
+        elif args.weight_by == "afl":
+            afl_lam = afl_update(afl_lam, losses, args.afl_eta)
+            weights = afl_lam
+        elif args.weight_by == "qffl":
+            sq_norms = np.diag(update_gram(
+                states, round_broadcast,
+                module_scales=module_scales)).tolist()
+            delta_v = qffl_delta_weights(losses, sq_norms, q=args.qffl_q,
+                                         L=1.0 / args.lr)
+        elif args.weight_by == "fednova":
+            delta_v = fednova_delta_weights(
+                n_examples, [client_stats[s]["num_steps"]
+                             for s in args.slices])
+        elif args.weight_by == "corpus":
+            weights = [len(data[s]["corpus"]) for s in args.slices]
+        else:
+            weights = n_examples
+        if args.weighted and args.weight_by in ADAPTIVE:
+            wn = (delta_v if delta_v is not None else
+                  (weights if weights is not None
+                   else [1.0 / len(states)] * len(states)))
+            out.setdefault("round_weights", {})[label] = \
+                [round(w, 5) for w in wn]
+            if delta_v is not None:
+                out["weight_space"] = "delta"
+            print(f"  {args.weight_by} weights: {[round(w, 3) for w in wn]}")
+        if precomputed_state is not None:
+            global_state = precomputed_state
+            out["weight_space"] = "raw-b-delta/true-effective-step-norm"
+        elif delta_v is not None:
+            if args.lora_mode == "frozen-a":
+                global_state = apply_frozen_b_delta_weights(
+                    round_broadcast, states, delta_v,
+                    module_scales=module_scales)
+                out["weight_space"] = "raw-b-delta/shared-frozen-a"
+            else:
+                global_state = apply_delta_weights(
+                    round_broadcast, states, delta_v)
+        elif args.lora_mode == "frozen-a":
+            frozen_weights = ([1.0] * len(states)
+                              if weights is None else list(weights))
+            frozen_total = float(sum(frozen_weights))
+            if (not np.isfinite(frozen_total) or frozen_total <= 0
+                    or not np.all(np.isfinite(frozen_weights))
+                    or np.min(frozen_weights) < 0):
+                raise ValueError(
+                    "frozen-A simplex aggregation received invalid weights")
+            frozen_weights = [float(value) / frozen_total
+                              for value in frozen_weights]
+            global_state = apply_frozen_b_delta_weights(
+                round_broadcast, states, frozen_weights,
+                module_scales=module_scales)
+            out["weight_space"] = "raw-b-delta/shared-frozen-a"
+        else:
+            global_state = fedavg(states, weights=weights)
         label = f"round_{rnd+1}"
         out["clients"][label] = client_stats
         if args.save_states:
             spath = os.path.join(
                 args.out,
                 f"states_{model_safe}_seed{args.seed}_{tag}_round{rnd+1}.pt")
-            torch.save({"clients": dict(zip(args.slices, states)),
-                        "global": global_state}, spath)
+            dump_torch({"clients": dict(zip(args.slices, states)),
+                        "broadcast": round_broadcast,
+                        "global": global_state,
+                        "broadcast_state_sha256": state_dict_sha256(
+                            round_broadcast),
+                        "global_state_sha256": state_dict_sha256(global_state)},
+                       spath)
             print(f"  saved adapter states -> {spath}")
+        # Persist aggregation/provenance diagnostics before the expensive
+        # evaluation so a later evaluation failure cannot erase the method
+        # correctness record for this completed server update.
+        dump_json(out, jpath)
         R[label] = eval_global(model, global_state, data, args.slices,
                                q_prefix, d_prefix, args.metrics,
                                args.eval_batch_size)

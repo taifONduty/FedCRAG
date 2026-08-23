@@ -4,10 +4,11 @@ A research codebase for studying **catastrophic forgetting in dense retrievers u
 temporally evolving / federated client knowledge**, and for building a continual
 adapter-based federated retriever that prevents it without sharing raw documents.
 
-> Status: **phenomenon-validation stage.** The pilot result (below) confirms forgetting
-> exists; the cluster experiments that turn it into paper-grade evidence, the temporal /
-> federated-temporal environment, and the FedCRAG method itself are not built yet. See
-> [`task.tsv`](./task.tsv) for the full execution plan and current status of every step.
+> Status: **candidate implemented, not empirically validated.** Historical runs used
+> ordinary trainable-A+B LoRA. The driver now contains a separate frozen-A,
+> norm-consistent `normmaxmin` FedSpan path with fail-closed diagnostics, but E0 and the
+> predeclared experiment campaign have not been run. Do not treat historical max-min
+> results as validation of this implementation.
 
 ---
 
@@ -50,7 +51,8 @@ checkpoint after training through stage `i`. From it:
 | `benchmark_retrievers.py` | **Zero-shot** comparison of retrievers across slices (no training). Produces the "retriever comparison" table. Supports local models and API models. |
 | `pilot_forgetting.py` | **Centralized sequential** training → R-matrix → Forgetting + BWT. The FlowRAG-comparable existence proof. |
 | `controls.py` | Reference ceilings: **frozen** (floor), **independent** (per-slice ceiling), **joint oracle** (multi-task ceiling). The gap to sequential = headroom a method must recover. |
-| `federated_forgetting.py` | **Federated simulation**: N clients, local LoRA training, FedAvg aggregation over rounds. `--weighted` toggles corpus-size-weighted averaging. The novel-axis experiment. |
+| `federated_forgetting.py` | **Federated simulation**: historical trainable-A+B controls, shared frozen-A comparators, and the corrected `normmaxmin` FedSpan path. |
+| `aggregation_schemes.py` | Pure server-side aggregation, including PEFT-scale-aware Grams, frozen-A validation, exact FedSpan coefficients/application, fail-closed edge cases, and state hashing. |
 | `README.md` / `task.tsv` | This file / the task tracker. |
 
 `run_all_paper.sh` orchestrates the four paper runs (pilot, controls, federated
@@ -77,6 +79,20 @@ Notes:
 - On Colab, first `pip uninstall -y torchao` (an old preinstalled version breaks PEFT's
   LoRA dispatcher), then restart the session.
 - Set `WANDB_MODE=disabled` to stop `sentence-transformers` prompting for a W&B login.
+
+### Local verification
+
+Run the CPU-only suite before any GPU experiment:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests -q -p no:cacheprovider
+```
+
+The FedSpan coverage includes real PEFT state keys, row-orthonormal/frozen A,
+unequal module scales and client norms, exact dense/effective true-step reconstruction,
+finite active sets, malformed/nonfinite/zero/singleton/cancellation/solver/cap cases,
+randomized scale and permutation properties, atomic persistence, collision-safe run IDs,
+and a mocked end-to-end `normmaxmin` driver round.
 
 Quick GPU + adapter sanity check before any long run (catches backbone/library issues in
 seconds rather than after an overnight job):
@@ -143,12 +159,43 @@ Flags specific to this script:
   FedAvg `n_k` = local training-pair count) or `--weight_by corpus` (corpus size — the
   weighting the original F4 run used; nonstandard, becomes wrong under query sharding
   where several clients share one corpus). State which one was used in the paper.
-- `--save_states` saves per-client + global adapter states each round
-  (`states_<model>_seed<seed>_<weighted|unweighted>_r<rounds>_round<N>.pt`, a few MB each
+- `--lora_mode trainable-ab` preserves the historical ordinary-LoRA coordinate.
+  `--lora_mode frozen-a` row-orthonormalizes one shared A while LoRA B is still zero,
+  freezes A, and applies every server update only to B deltas so A remains bitwise fixed.
+- `--weight_by maxmin` is retained as a filename-compatible alias for historical
+  `rawmaxmin`: it solves the cosine game but applies simplex weights to raw states/deltas.
+  It is an attribution control, not corrected FedSpan.
+- Corrected FedSpan requires all of:
+
+  ```bash
+  python federated_forgetting.py \
+      --model bge-m3 --slices nfcorpus fiqa scifact arguana \
+      --num_rounds 5 --seed 42 --weighted \
+      --lora_mode frozen-a --weight_by normmaxmin \
+      --fedspan_step_norm <PREDECLARED_EFFECTIVE_B_STEP_NORM> \
+      --save_states
+  ```
+
+  No default step norm is guessed, and `--save_states` is mandatory. The command refuses
+  unknown or dirty Git provenance unless `--allow_dirty_provenance` is supplied for a
+  development-only run. That override
+  is recorded and must not count as paper-grade E0--E5 evidence.
+- `normmaxmin` forms the game from concatenated `alpha/r`-scaled raw-B deltas, excludes
+  nonfinite and zero/tiny clients, handles empty and singleton active sets, and fails
+  closed to a zero update on solver failure, near cancellation, reconstruction failure,
+  or a declared coefficient-cap violation. It records the full-precision simplex and
+  raw-delta coefficients, active set, Gram, solver residuals, actual direction/norm, and
+  broadcast/client/applied-state hashes in `fedspan_diagnostics`.
+- `--save_states` saves the exact broadcast, per-client, and applied-global adapter
+  states plus their hashes each round
+  (`states_<model>_seed<seed>_<arm>_r<rounds>_round<N>.pt`, a few MB each
   at LoRA r=16) — required
   for any mechanism diagnostics (principal angles between client updates,
   `‖avg(B)avg(A) − avg(BA)‖`). Turn it on for every scaled run you may analyze later.
-- Output goes to `federated_<model>_seed<seed>_<weighted|unweighted>_r<rounds>.json`
+- Output goes to `federated_<model>_seed<seed>_<arm>_r<rounds>.json`; frozen-A and
+  `normmaxmin` filenames include the coordinate, declared step norm, and a 12-character
+  hash of every result-affecting frozen-A option so incompatible arms cannot overwrite
+  each other. The complete hash is recorded in the result JSON.
   (the round count in the name keeps runs with different `--num_rounds` from
   overwriting each other), is rewritten
   atomically **after every round** (a crash loses at most the current round), and the log

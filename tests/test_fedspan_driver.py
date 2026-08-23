@@ -198,6 +198,10 @@ def test_driver_normmaxmin_dispatch_persists_exact_round_record(
     saved = torch.load(state_paths[0], map_location="cpu", weights_only=True)
     assert torch.equal(saved["broadcast"][akey], broadcast[akey])
     assert torch.equal(saved["global"][akey], broadcast[akey])
+    from validate_e0 import validate_run_directory
+    validation = validate_run_directory(tmp_path)
+    assert validation["rounds_validated"] == 1
+    assert validation["commit"] == "abc123def456"
 
 
 @pytest.mark.parametrize(

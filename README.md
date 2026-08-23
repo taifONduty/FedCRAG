@@ -172,11 +172,14 @@ Flags specific to this script:
       --model bge-m3 --slices nfcorpus fiqa scifact arguana \
       --num_rounds 5 --seed 42 --weighted \
       --lora_mode frozen-a --weight_by normmaxmin \
-      --fedspan_step_norm <PREDECLARED_EFFECTIVE_B_STEP_NORM> \
+      --fedspan_step_policy median-active \
       --save_states
   ```
 
-  No default step norm is guessed, and `--save_states` is mandatory. The command refuses
+  The step policy is always explicit. `median-active` sets each round's true effective-B
+  norm to the median finite active-client update norm after activity gating. The
+  alternative `fixed` policy requires a positive finite `--fedspan_step_norm`;
+  `median-active` rejects that constant. `--save_states` is mandatory. The command refuses
   unknown or dirty Git provenance unless `--allow_dirty_provenance` is supplied for a
   development-only run. That override
   is recorded and must not count as paper-grade E0--E5 evidence.
@@ -193,7 +196,8 @@ Flags specific to this script:
   for any mechanism diagnostics (principal angles between client updates,
   `‖avg(B)avg(A) − avg(BA)‖`). Turn it on for every scaled run you may analyze later.
 - Output goes to `federated_<model>_seed<seed>_<arm>_r<rounds>.json`; frozen-A and
-  `normmaxmin` filenames include the coordinate, declared step norm, and a 12-character
+  `normmaxmin` filenames include the coordinate, step policy (and the declared constant
+  for fixed mode), and a 12-character
   hash of every result-affecting frozen-A option so incompatible arms cannot overwrite
   each other. The complete hash is recorded in the result JSON.
   (the round count in the name keeps runs with different `--num_rounds` from
@@ -205,6 +209,17 @@ Flags specific to this script:
 - **about equal** ⇒ reframe around "forgetting persists even under federated averaging".
 - **above** (positive transfer) ⇒ reframe around "when federation helps vs. hurts".
 Run this before committing the narrative.
+
+The frozen ten-row E0 correctness grid is exposed separately:
+
+```bash
+bash run_e0.sh manifest  # print the exact ten commands; no tests or training
+bash run_e0.sh verify    # require clean provenance and run CPU gates; no training
+bash run_e0.sh run       # execute only after cloud spend is explicitly authorized
+```
+
+`run_e0.sh` never provisions cloud resources. Its output root defaults outside the Git
+worktree so completed rows cannot dirty provenance for later rows.
 
 ### API retrievers (OpenRouter / OpenAI / Cohere / Voyage)
 Benchmark-only — no weight access, so API models **cannot** be LoRA-trained and never enter

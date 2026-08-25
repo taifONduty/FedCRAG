@@ -15,14 +15,22 @@ transition. Future campaigns must record valid per-round timings. The completed
 E0 campaign keeps its valid total row runtimes while its unrecoverable
 per-round timing breakdown is explicitly marked unavailable.
 
-## Evidence boundary
+## Evidence boundary and claim strength
 
-- Commit `7325bf5` remains the immutable execution identity for all eleven E0
-  rows.
+- Commit `7325bf5` remains the recorded execution identity for all eleven E0
+  rows. The closeout will resolve that recorded 12-character identifier to the
+  unique full Git object
+  `7325bf56381c24c6a4af013688bdd417c95d7d7d`.
 - The repair is developed on a new branch and is not used to relabel the
   implementation that generated the artifacts.
 - Existing result JSON, state, manifest, log, and resource files are read-only
   inputs to post-hoc validation.
+- No independently signed pre-audit digest is currently known. Therefore the
+  strongest warranted historical claim is **post-hoc internally consistent
+  with the recorded clean execution commit**, not independently proven
+  immutable since execution. The newly preserved inventory will become the
+  canonical tamper-evident baseline and its digest will be anchored outside
+  the artifact directory.
 - A GPU rerun is not required when an artifact passes the stronger scientific
   checks.
 - If a scientific check fails, only the affected row or rows are eligible for
@@ -65,37 +73,69 @@ For each successful `normmaxmin` round, the validator will:
    execution contract; do not trust the diagnostic's `module_scales` as the
    reconstruction input. Cross-check the derived scales against both the
    method contract and round diagnostic.
+   Require the declared LoRA rank to match every persisted A/B tensor pair and
+   bind row-scale semantics to tensors: unit means `c≈1`; numeric means
+   `c≈declared`; peft-init requires consistent recorded mode/measurement while
+   disclosing that the discarded pre-orthogonalization tensor prevents a
+   stronger origin proof.
 2. Bind the recorded step policy, direction policy, absolute/relative activity
    tolerances, mixture-norm tolerance, coefficient-cap setting, and LoRA rank
-   to their frozen-manifest command values.
+   to their frozen-manifest command values. Canonically parse and bind every
+   other execution-relevant argument, reject duplicate or unknown flags,
+   verify row metadata and archived data fingerprints, and recompute the
+   recorded run-configuration hash.
 3. Recompute finite norms, activity thresholds, active indices, normalized
    client directions, and the active cosine Gram.
 4. Compare the recomputed active set and Gram with the persisted diagnostic.
 5. Recompute the declared direction objective independently:
    - `minnorm`: enumerate all nonempty simplex faces for the at-most-four-client
-     E0 problem, solve the equality-constrained quadratic on each face, retain
-     feasible candidates, and select the smallest `w^T C w` value;
+     E0 problem, solve a rank-aware augmented KKT system on each face, retain
+     feasible candidates with small KKT residual, and select the smallest
+     `q*=w^T C w` value, including singular cancellation faces;
    - `maxmin-lp`: solve the explicit validation LP directly from the recomputed
      Gram, without calling the production aggregation module.
 6. Check the recorded simplex weights against the independently optimal value
    and verify simplex feasibility and objective tolerances.
-7. Recompute mixture norm, minimum achieved cosine, min-norm reference value,
-   direction shortfall, resolved step norm, and raw-delta coefficients.
+7. Keep the quantities distinct: minnorm optimizes `q*=w^T C w` and records
+   `min_norm_value=sqrt(max(q*,0))`; maxmin optimizes
+   `t*=min(Cw)` and records it as `solver_objective_gamma`; the applied
+   normalized direction achieves `min(Cw)/sqrt(w^T C w)`; and shortfall is
+   `sqrt(max(q*,0))-achieved`. Recompute each independently, together with the
+   resolved step norm and raw-delta coefficients.
 8. Require inactive coefficients to be exactly zero and active coefficients to
    satisfy
 
    `v_i = resolved_step_norm * w_i / (client_norm_i * mixture_norm)`.
 
-9. Recompute solved/applied effective-step hashes and retain the existing
-   aggregate/state checks.
+9. Use tensor-derived scales for scientific geometry and certify the recorded
+   scales numerically. Because a float32 persisted A can round the pre-cast
+   scale that produced legacy byte hashes, replay legacy solved/applied hashes
+   with only the now-certified recorded scales, then compare the recorded-scale
+   and derived-scale effective vectors numerically. Keep certificates separate:
+   replay production diagnostics on the recorded-scale Gram; run the
+   independent oracle on the tensor-derived Gram. Propagate their measured Gram
+   perturbation into scientific objective/direction bounds, and fail closed as
+   boundary-indeterminate when that uncertainty overlaps the cancellation
+   threshold. Replay the production coefficient formula only with certified
+   recorded-scale norms/mixture; assess the actual persisted step separately in
+   tensor-derived scientific geometry rather than demanding derived-scale
+   coefficients that production never computed.
+10. Independently reproduce success versus every deterministic fallback branch
+    (activity, step legality, cancellation, coefficient cap, and
+    reconstruction conditions). If the audit oracle succeeds, refuse a
+    recorded runtime solver error/failure/invalid fallback; a fabricated zero
+    fallback is not accepted merely because its hashes agree.
 
-Simplex feasibility, Gram/scalar agreement, and independent objective agreement
-use an absolute tolerance of `1e-8 * max(1, |reference|)`. Applied-state and
-coefficient reconstruction retain the existing `5e-6 * max(1, step_norm)`
-float32 materialization allowance.
+Float32 stored-A orthogonality uses the established
+`1e-6 * max(1, c^2)` allowance. Float64 Gram, simplex, objective, and
+coefficient-formula checks use explicit tight absolute-plus-relative
+tolerances. The existing `5e-6 * max(1, step_norm)` allowance applies only to
+materialized effective vectors/state application, not to coefficient values.
 
-The check must reject the demonstrated repaired-hash mutation that negates all
-FedSpan delta coefficients and materializes the opposite global step.
+The check must reject repaired-hash mutations that negate all FedSpan delta
+coefficients, substitute feasible-but-suboptimal minnorm or maxmin weights, or
+fabricate a zero fallback. It must accept an alternative weight vector on a
+genuinely non-unique optimal face.
 
 ### B. Exact round continuity
 
@@ -108,8 +148,12 @@ boundary `t -> t+1`:
   depth;
 - report the boundary and first mismatching key on failure.
 
-The check must reject the demonstrated mutation that changes a later broadcast
-and repairs its local hash while leaving the round internally consistent.
+Also bind the round-1 broadcast hash to
+`method_contract.initial_adapter_state_sha256`.
+
+The check must reject a coherent translation mutation that changes the same
+later-round B tensor in broadcast, every client, and global state, repairs all
+local hashes, and leaves deltas/aggregation internally consistent.
 
 ### C. Timing schema and runner behavior
 
@@ -121,22 +165,33 @@ For future runs:
 
 - launch the training interpreter unbuffered;
 - keep the timestamping interpreter unbuffered and flush each emitted line;
-- require exactly one positive duration for every completed round;
-- require ordered round markers without duplicates;
-- require `0.5 * elapsed_seconds <= sum(round_elapsed_seconds) <=
-  elapsed_seconds + 5`; the lower allowance covers model/data initialization
-  and the frozen evaluation before round 1, while the upper allowance covers
-  timestamp rounding;
+- emit machine-readable start and completion markers for every round;
+- carry the launcher row ID into markers through an explicit telemetry-only
+  environment value;
+- require exactly one ordered start/end pair and one positive duration for
+  every completed round, without duplicates, crossed pairs, or denominator
+  drift;
+- timestamp every boundary with wall-clock and monotonic nanoseconds, compute
+  all durations only from the monotonic clock, record every inter-round gap,
+  and require the exact integer partition
+  `pre_ns + sum(round_ns) + sum(between_round_ns) + post_ns = elapsed_ns`;
+  wall time is used only for human-readable UTC provenance;
+- capture and require success from training, timestamp filtering, and `tee`;
+- bind the record to the expected run ID and ordered UTC start/finish values;
+- during validation, reparse the raw timestamped log and GPU-sample file,
+  compare their duration/sample/peak values with the JSON, and verify raw-file
+  hashes;
 - fail validation when a schema-v2 timing record violates these rules.
 
-For completed E0 schema-v1 records:
+For every completed E0 schema-v1 record:
 
 - preserve the original file unchanged;
 - validate total `elapsed_seconds`, GPU sampling, and the remaining resource
   fields as before;
 - return `round_timing_valid: false`,
   `round_timing_status: legacy-buffered-unavailable`, and no publishable
-  per-round timing values when a zero/implausible breakdown is detected;
+  per-round timing values regardless of whether the buffered values happen to
+  look plausible;
 - do not fail scientific validation solely because of this known telemetry
   defect.
 
@@ -156,18 +211,26 @@ Update `README.md` so that:
 - legacy E0 per-round timings are explicitly unavailable while total row
   runtimes remain usable.
 
+Update the executable CLI help at the same time so it does not describe
+`unit` as a default when frozen-A paper-grade execution requires an explicit
+row-scale choice.
+
 ## Test-first implementation
 
 Every production change follows a witnessed red-green cycle.
 
-1. Add a repaired-hash negated-direction mutation test and confirm it passes the
-   old validator unexpectedly.
-2. Implement only the independent direction checks required to make it fail.
-3. Add a repaired-hash broken-continuity mutation test and confirm it passes the
-   old validator unexpectedly.
+1. Add repaired-hash negated-direction, feasible-suboptimal-direction for both
+   policies, alternative non-unique optimum, and fabricated-fallback tests;
+   confirm the invalid mutations pass the old validator unexpectedly.
+2. Implement only the independent direction checks required to distinguish
+   all of them correctly.
+3. Add a coherent repaired-hash broken-continuity mutation and a repaired
+   initial-state mutation; confirm they pass the old validator unexpectedly.
 4. Implement exact hash and tensor continuity checks.
-5. Add delayed-marker resource tests, legacy-schema tests, and schema-v2 strict
-   failure tests before extracting the timing module and changing the runner.
+5. Add an actual unbuffered pipeline subprocess test, explicit round start/end
+   marker tests, raw-evidence mutation tests, legacy-schema tests, and
+   schema-v2 strict failure tests before extracting the timing module and
+   changing the runner.
 6. Add README/manifest assertions before correcting documentation.
 7. Run focused tests after every repair and the full suite after all repairs.
 8. Re-run both mutations against the final validator as adversarial regression
@@ -194,8 +257,16 @@ After local verification:
 
    `/Users/turjo/Desktop/FedCRAG/post_e0_audit/2026-08-25/`
 
-6. Verify local checksums against the remote originals.
-7. Stop the VM after the export and verification complete.
+6. Snapshot a sorted relative-path inventory of regular files, refuse links or
+   special files, hash remotely before and after copying, and verify local
+   names, sizes, and hashes against it. Preserve the validator commit as a Git
+   bundle. Keep separate source-equality and complete-package checksum
+   manifests, and anchor the complete-package digest outside the artifact
+   tree.
+7. Install an unconditional shutdown trap immediately after any VM start. Stop
+   and verify the VM even when validation, export, or checksum comparison
+   fails. Do not promote a staged preservation directory to canonical status
+   until `TERMINATED` is observed.
 
 No failed scientific check will be bypassed. A failure pauses publication
 promotion and triggers diagnosis before any rerun decision.
@@ -205,9 +276,14 @@ promotion and triggers diagnosis before any rerun decision.
 - The original 200-test baseline remains green.
 - New direction and continuity mutation tests fail before their fixes and pass
   after their fixes.
-- The final validator refuses both adversarial mutations.
-- A clean schema-v2 timing fixture passes; zero, duplicated, missing, or
-  irreconcilable schema-v2 timings fail.
+- The final validator refuses every invalid repaired-hash direction,
+  fabricated-fallback, initial-state, and continuity mutation while accepting
+  alternate genuinely optimal weights.
+- Singular cancellation and non-unique optimum cases are classified correctly;
+  feasible-but-suboptimal decisions and fabricated fallbacks are refused.
+- A clean schema-v2 timing fixture and the real launcher/filter pipeline pass;
+  zero, duplicated, missing, crossed, raw-evidence-mismatched, pipeline-failed,
+  or irreconcilable schema-v2 timings fail.
 - Legacy E0 timing records remain scientifically validatable but explicitly
   return unavailable per-round timing status.
 - README commands match the actual CLI and eleven-row launcher.

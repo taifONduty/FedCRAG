@@ -1622,11 +1622,21 @@ def manifest_row(tmp_path, lora_mode="frozen-a", arm="normmaxmin",
 def write_resource_record(tmp_path, num_rounds=1):
     record = {
         "schema": "fedcrag-e0-resources/1",
+        "run_id": tmp_path.name,
+        "started_utc": "2026-08-26T00:00:00Z",
+        "finished_utc": "2026-08-26T00:00:12Z",
         "elapsed_seconds": 12.0,
         "round_elapsed_seconds": [1.0] * num_rounds,
+        "determinism_probe": "separate interpreter, same environment",
         "deterministic_algorithms": False,
+        "cudnn_deterministic": False,
+        "cudnn_benchmark": False,
+        "cublas_workspace_config": None,
+        "python_hash_seed": None,
+        "torch_version": torch.__version__,
         "gpu_available": False,
         "peak_gpu_memory_mib": None,
+        "gpu_memory_samples": 0,
     }
     with (tmp_path / "e0_resources.json").open("w") as handle:
         json.dump(record, handle)
@@ -1643,6 +1653,14 @@ def test_a_matching_manifest_row_validates(monkeypatch, tmp_path):
     assert report["launched"]["seed"] == 42
     assert report["launched"]["slices"] == list(driver_harness.SLICES)
     assert report["dataset_content_verified"] is True
+    assert report["resources"] == {
+        "elapsed_seconds": 12.0,
+        "peak_gpu_memory_mib": None,
+        "deterministic_algorithms": False,
+        "round_timing_valid": False,
+        "round_timing_status": "legacy-buffered-unavailable",
+        "round_elapsed_seconds": None,
+    }
 
 
 def test_manifest_relative_repo_interpreter_validates(monkeypatch, tmp_path):
@@ -2122,6 +2140,124 @@ def test_truncated_round_timings_are_refused(monkeypatch, tmp_path):
     with pytest.raises(E0ValidationError, match="one finite elapsed time"):
         validate_run_directory(
             tmp_path, manifest_row=manifest_row(tmp_path, num_rounds=2))
+
+
+def test_resource_schema_v2_is_replayed_from_raw_evidence(
+        monkeypatch, tmp_path):
+    run_dir = tmp_path / "e0-test-row"
+    build_run(monkeypatch, run_dir, "frozen-a", "normmaxmin",
+              num_rounds=2)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log = log_dir / "e0-test-row.log"
+    log.write_text(
+        "1000\t200\tE0_ROUND_START e0-test-row 1/2\n"
+        "900\t350\tE0_ROUND_END e0-test-row 1/2\n"
+        "1100\t500\tE0_ROUND_START e0-test-row 2/2\n"
+        "800\t900\tE0_ROUND_END e0-test-row 2/2\n")
+    samples = log_dir / "e0-test-row.gpu"
+    samples.write_text("100\n250\n")
+    record = {
+        "schema": "fedcrag-e0-resources/2",
+        "run_id": "e0-test-row",
+        "started_wall_ns": 1_700_000_000_000_000_000,
+        "finished_wall_ns": 1_600_000_000_000_000_000,
+        "started_utc": "2023-11-14T22:13:20.000000000Z",
+        "finished_utc": "2020-09-13T12:26:40.000000000Z",
+        "started_mono_ns": 100,
+        "finished_mono_ns": 1000,
+        "elapsed_seconds": 9e-7,
+        "pre_ns": 100,
+        "round_ns": [150, 400],
+        "between_round_ns": [150],
+        "post_ns": 100,
+        "round_elapsed_seconds": [1.5e-7, 4e-7],
+        "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
+        "samples_sha256": hashlib.sha256(samples.read_bytes()).hexdigest(),
+        "gpu_available": True,
+        "peak_gpu_memory_mib": 250,
+        "gpu_memory_samples": 2,
+        "determinism_probe": "separate interpreter, same environment",
+        "deterministic_algorithms": False,
+        "cudnn_deterministic": False,
+        "cudnn_benchmark": False,
+        "cublas_workspace_config": None,
+        "python_hash_seed": None,
+        "torch_version": torch.__version__,
+    }
+    (run_dir / "e0_resources.json").write_text(json.dumps(record))
+
+    report = validate_run_directory(
+        run_dir, manifest_row=manifest_row(run_dir, num_rounds=2))
+
+    assert report["resources"]["round_timing_valid"] is True
+    assert report["resources"]["round_timing_status"] == \
+        "measured-monotonic"
+    assert report["resources"]["round_elapsed_seconds"] == \
+        [1.5e-7, 4e-7]
+
+
+@pytest.mark.parametrize(("target", "mutation"), [
+    ("json", "timing"),
+    ("json", "gpu"),
+    ("log", "raw"),
+    ("samples", "raw"),
+])
+def test_resource_schema_v2_refuses_mutated_claims_or_evidence(
+        monkeypatch, tmp_path, target, mutation):
+    run_dir = tmp_path / "e0-test-row"
+    build_run(monkeypatch, run_dir, "frozen-a", "normmaxmin")
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log = log_dir / "e0-test-row.log"
+    log.write_text(
+        "1000\t200\tE0_ROUND_START e0-test-row 1/1\n"
+        "900\t900\tE0_ROUND_END e0-test-row 1/1\n")
+    samples = log_dir / "e0-test-row.gpu"
+    samples.write_text("250\n")
+    record = {
+        "schema": "fedcrag-e0-resources/2",
+        "run_id": "e0-test-row",
+        "started_wall_ns": 1000,
+        "finished_wall_ns": 900,
+        "started_utc": "1970-01-01T00:00:00.000001000Z",
+        "finished_utc": "1970-01-01T00:00:00.000000900Z",
+        "started_mono_ns": 100,
+        "finished_mono_ns": 1000,
+        "elapsed_seconds": 9e-7,
+        "pre_ns": 100,
+        "round_ns": [700],
+        "between_round_ns": [],
+        "post_ns": 100,
+        "round_elapsed_seconds": [7e-7],
+        "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
+        "samples_sha256": hashlib.sha256(samples.read_bytes()).hexdigest(),
+        "gpu_available": True,
+        "peak_gpu_memory_mib": 250,
+        "gpu_memory_samples": 1,
+        "deterministic_algorithms": False,
+        "cudnn_deterministic": False,
+        "cudnn_benchmark": False,
+        "cublas_workspace_config": None,
+        "python_hash_seed": None,
+        "torch_version": torch.__version__,
+    }
+    resource_path = run_dir / "e0_resources.json"
+    resource_path.write_text(json.dumps(record))
+    if target == "json":
+        if mutation == "timing":
+            record["round_ns"] = [699]
+        else:
+            record["peak_gpu_memory_mib"] = 999
+        resource_path.write_text(json.dumps(record))
+    elif target == "log":
+        log.write_text(log.read_text() + "mutation\n")
+    else:
+        samples.write_text("999\n")
+
+    with pytest.raises(E0ValidationError):
+        validate_run_directory(
+            run_dir, manifest_row=manifest_row(run_dir))
 
 
 # ------------------------------------- the attribution axes themselves

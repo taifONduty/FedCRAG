@@ -220,3 +220,24 @@ def test_e0_launcher_is_syntax_clean_and_never_provisions_cloud():
     assert "gcloud compute" not in source
     assert "E0_OUT" in source
 
+
+def test_e0_launcher_timing_contract_uses_the_auditable_module():
+    source = SCRIPT.read_text()
+    assert "export PYTHONUNBUFFERED=1" in source
+    assert '"$PYTHON" -u e0_resources.py timestamp' in source
+    assert 'e0_resources.py clock' in source
+    assert 'e0_resources.py write' in source
+    assert "fedcrag-e0-resources/1" not in source
+    assert "PIPESTATUS[@]" in source
+
+
+def test_e0_launcher_timing_selftest_exercises_every_pipeline_stage():
+    environment = dict(os.environ, PYTHON=sys.executable)
+    completed = subprocess.run(
+        ["bash", str(SCRIPT), "timing-selftest"], cwd=ROOT,
+        capture_output=True, text=True, timeout=20, env=environment)
+
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert "timing self-test passed" in completed.stdout
+    for stage in ("producer", "filter", "tee"):
+        assert f"refused {stage} failure" in completed.stdout

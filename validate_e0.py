@@ -24,6 +24,10 @@ from e0_direction_oracle import (
     maximin_simplex_oracle,
     min_norm_simplex_oracle,
 )
+from e0_resources import (
+    ResourceValidationError,
+    validate_resource_record,
+)
 
 _LORA_KEY = re.compile(r"(.*)\.lora_(A|B)\.weight$")
 
@@ -59,7 +63,6 @@ _STEP_NORM_RTOL = 1e-5
 _APPLIED_NORM_RTOL = 1e-9
 
 _MANIFEST_SCHEMA = "fedcrag-e0-manifest/1"
-_RESOURCE_SCHEMA = "fedcrag-e0-resources/1"
 _RESOURCE_FILENAME = "e0_resources.json"
 _SOURCE_FILES = (
     "federated_forgetting.py",
@@ -1913,40 +1916,17 @@ def _validate_resource_record(run_directory, result):
              "and determinism claims are unauditable")
     with path.open() as handle:
         record = json.load(handle)
-    _require(record.get("schema") == _RESOURCE_SCHEMA,
-             f"{_RESOURCE_FILENAME} schema is {record.get('schema')!r}, "
-             f"expected {_RESOURCE_SCHEMA!r}")
-    elapsed = record.get("elapsed_seconds")
-    _require(_finite(elapsed) and float(elapsed) > 0,
-             f"{_RESOURCE_FILENAME} has an invalid elapsed_seconds "
-             f"{elapsed!r}")
-    rounds = record.get("round_elapsed_seconds")
-    _require(isinstance(rounds, list)
-             and len(rounds) == int(result["num_rounds"])
-             and all(_finite(value) and float(value) >= 0
-                     for value in rounds),
-             f"{_RESOURCE_FILENAME} does not carry one finite elapsed time "
-             f"for each of the {result['num_rounds']} rounds")
-    _require(isinstance(record.get("deterministic_algorithms"), bool),
-             f"{_RESOURCE_FILENAME} does not record whether deterministic "
-             "algorithms were enabled")
-    _require(isinstance(record.get("gpu_available"), bool),
-             f"{_RESOURCE_FILENAME} does not record GPU availability")
-    peak = record.get("peak_gpu_memory_mib")
-    if record["gpu_available"]:
-        _require(_finite(peak) and float(peak) > 0,
-                 f"{_RESOURCE_FILENAME} reports a GPU but no positive peak "
-                 f"memory: {peak!r}")
-    else:
-        _require(peak is None,
-                 f"{_RESOURCE_FILENAME} reports no GPU but a peak memory "
-                 f"{peak!r}")
-    return {
-        "elapsed_seconds": float(elapsed),
-        "peak_gpu_memory_mib": (float(peak) if record["gpu_available"]
-                                else None),
-        "deterministic_algorithms": record["deterministic_algorithms"],
-    }
+    run_id = Path(run_directory).name
+    log_directory = Path(run_directory).parent / "logs"
+    log_path = log_directory / f"{run_id}.log"
+    samples_path = log_directory / f"{run_id}.gpu"
+    try:
+        return validate_resource_record(
+            record, run_id, int(result["num_rounds"]),
+            log_path, samples_path)
+    except (ResourceValidationError, OSError, UnicodeError) as exc:
+        raise E0ValidationError(
+            f"{_RESOURCE_FILENAME} is invalid: {exc}") from exc
 
 
 # ------------------------------------------------------------- entry point

@@ -17,6 +17,8 @@
 # workloads identical.
 set -euo pipefail
 
+export PYTHONUNBUFFERED=1
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 cd "$SCRIPT_DIR"
 
@@ -218,79 +220,52 @@ PY
 }
 
 write_resource_record() {
-  local run_id=$1 run_out=$2 log=$3 samples=$4 started=$5 finished=$6
-  "$PYTHON" - "$run_id" "$run_out" "$log" "$samples" "$started" "$finished" \
-    <<'PY'
-import json
-import os
-import re
-import sys
-import time
-
-import torch
-
-run_id, run_out, log_path, samples_path, started, finished = sys.argv[1:7]
-started, finished = float(started), float(finished)
-
-# Round boundaries come from the driver's own progress markers in the
-# timestamped log, so each interval spans local training plus the evaluation
-# that follows it.
-marker = re.compile(r"\s*--- round (\d+)/(\d+) ---")
-marks, last = [], finished
-with open(log_path, errors="replace") as handle:
-    for line in handle:
-        stamp, _, text = line.partition("\t")
-        try:
-            moment = float(stamp)
-        except ValueError:
-            continue
-        last = moment
-        if marker.match(text):
-            marks.append(moment)
-rounds = [
-    round(max(0.0, (marks[index + 1] if index + 1 < len(marks) else last)
-              - moment), 3)
-    for index, moment in enumerate(marks)
-]
-
-peak, samples = None, 0
-if os.path.exists(samples_path):
-    values = []
-    with open(samples_path, errors="replace") as handle:
-        for line in handle:
-            line = line.strip()
-            if line.isdigit():
-                values.append(int(line))
-    samples = len(values)
-    if values:
-        peak = max(values)
-
-record = {
-    "schema": "fedcrag-e0-resources/1",
-    "run_id": run_id,
-    "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
-    "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(finished)),
-    "elapsed_seconds": round(finished - started, 3),
-    "round_elapsed_seconds": rounds,
-    "gpu_available": peak is not None,
-    "peak_gpu_memory_mib": peak,
-    "gpu_memory_samples": samples,
-    # Probed in a separate interpreter with the same environment. The driver
-    # never changes these settings, so this records the defaults the run had.
-    "determinism_probe": "separate interpreter, same environment",
-    "deterministic_algorithms": bool(
-        torch.are_deterministic_algorithms_enabled()),
-    "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
-    "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
-    "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
-    "python_hash_seed": os.environ.get("PYTHONHASHSEED"),
-    "torch_version": torch.__version__,
+  local run_id=$1 run_out=$2 log=$3 samples=$4
+  local started_wall_ns=$5 finished_wall_ns=$6
+  local started_mono_ns=$7 finished_mono_ns=$8
+  "$PYTHON" e0_resources.py write \
+    --run-id "$run_id" --run-dir "$run_out" --log "$log" \
+    --samples "$samples" \
+    --started-wall-ns "$started_wall_ns" \
+    --finished-wall-ns "$finished_wall_ns" \
+    --started-mono-ns "$started_mono_ns" \
+    --finished-mono-ns "$finished_mono_ns" --num-rounds "$ROUNDS"
 }
-with open(os.path.join(run_out, "e0_resources.json"), "w") as handle:
-    json.dump(record, handle, indent=2, sort_keys=True)
-print(f"  elapsed={record['elapsed_seconds']}s "
-      f"rounds={rounds} peak_gpu_mib={peak}")
-PY
+
+timestamp_filter() {
+  if [[ ${E0_SELFTEST_FAIL_STAGE:-} == "filter" ]]; then
+    while IFS= read -r _; do :; done
+    return 92
+  fi
+  "$PYTHON" -u e0_resources.py timestamp
+}
+
+timestamp_tee() {
+  local log=$1
+  if [[ ${E0_SELFTEST_FAIL_STAGE:-} == "tee" ]]; then
+    while IFS= read -r _; do :; done
+    return 93
+  fi
+  tee "$log"
+}
+
+# The production and self-test paths share this exact three-stage pipeline.
+# PIPESTATUS is copied by the very next command, before any status can be lost.
+run_timestamped_pipeline() {
+  local log=$1
+  shift
+  "$@" 2>&1 | timestamp_filter | timestamp_tee "$log"
+  E0_LAST_PIPELINE_STATUSES=("${PIPESTATUS[@]}")
+  local index stage_names=(producer filter tee)
+  for index in 0 1 2; do
+    if [[ ${E0_LAST_PIPELINE_STATUSES[$index]} -ne 0 ]]; then
+      printf 'E0 telemetry pipeline %s stage failed (statuses: %s %s %s)\n' \
+        "${stage_names[$index]}" "${E0_LAST_PIPELINE_STATUSES[0]}" \
+        "${E0_LAST_PIPELINE_STATUSES[1]}" \
+        "${E0_LAST_PIPELINE_STATUSES[2]}" >&2
+      return "${E0_LAST_PIPELINE_STATUSES[$index]}"
+    fi
+  done
 }
 
 append_status() {
@@ -314,12 +289,14 @@ execute_row() {
   local run_out="$E0_OUT/$run_id"
   local log="$E0_OUT/logs/$run_id.log"
   local samples="$E0_OUT/logs/$run_id.gpu"
-  local started finished sampler_pid="" status=0
+  local started_wall_ns finished_wall_ns started_mono_ns finished_mono_ns
+  local elapsed_seconds sampler_pid="" status=0
 
   mkdir -p "$run_out"
   build_command "$run_id" "$coordinate" "$arm" "$max_steps" "$row_scale"
   printf 'START %s\n' "$run_id"
-  started=$(date -u +%s)
+  read -r started_wall_ns started_mono_ns \
+    < <("$PYTHON" e0_resources.py clock)
   : > "$samples"
   if command -v nvidia-smi >/dev/null 2>&1; then
     (
@@ -332,41 +309,149 @@ execute_row() {
     sampler_pid=$!
   fi
 
+  export FEDCRAG_E0_RUN_ID="$run_id"
   set +e
-  "${ROW_CMD[@]}" 2>&1 \
-    | "$PYTHON" -u -c 'import sys, time
-for line in sys.stdin:
-    sys.stdout.write("%.3f\t%s" % (time.time(), line))' \
-    | tee "$log"
-  status=${PIPESTATUS[0]}
+  run_timestamped_pipeline "$log" "${ROW_CMD[@]}"
+  status=$?
   set -e
 
   if [[ -n "$sampler_pid" ]]; then
     kill "$sampler_pid" 2>/dev/null || true
     wait "$sampler_pid" 2>/dev/null || true
   fi
-  finished=$(date -u +%s)
+  read -r finished_wall_ns finished_mono_ns \
+    < <("$PYTHON" e0_resources.py clock)
+  elapsed_seconds=$((
+    (finished_mono_ns - started_mono_ns) / 1000000000
+  ))
 
   if [[ $status -ne 0 ]]; then
-    append_status "$run_id" "FAILED" "$((finished - started))"
+    append_status "$run_id" "FAILED" "$elapsed_seconds"
     printf 'FAILED %s (exit %s)\n' "$run_id" "$status" >&2
     exit "$status"
   fi
 
   if ! write_resource_record "$run_id" "$run_out" "$log" "$samples" \
-      "$started" "$finished"; then
-    append_status "$run_id" "UNAUDITABLE" "$((finished - started))"
+      "$started_wall_ns" "$finished_wall_ns" \
+      "$started_mono_ns" "$finished_mono_ns"; then
+    append_status "$run_id" "UNAUDITABLE" "$elapsed_seconds"
     printf 'UNAUDITABLE %s: no resource record was written\n' "$run_id" >&2
     exit 1
   fi
   if ! validate_row "$run_id"; then
-    append_status "$run_id" "INVALID" "$((finished - started))"
+    append_status "$run_id" "INVALID" "$elapsed_seconds"
     printf 'INVALID %s: contract validation failed; inspect and remove %s '\
 'before resuming\n' "$run_id" "$run_out" >&2
     exit 1
   fi
-  append_status "$run_id" "VALIDATED" "$((finished - started))"
+  append_status "$run_id" "VALIDATED" "$elapsed_seconds"
   printf 'VALIDATED %s\n' "$run_id"
+}
+
+timing_selftest_producer() {
+  local run_id=$FEDCRAG_E0_RUN_ID
+  printf 'E0_ROUND_START %s 1/2\n' "$run_id"
+  sleep 0.03
+  printf 'E0_ROUND_END %s 1/2\n' "$run_id"
+  sleep 0.03
+  printf 'E0_ROUND_START %s 2/2\n' "$run_id"
+  sleep 0.03
+  printf 'E0_ROUND_END %s 2/2\n' "$run_id"
+  if [[ ${E0_SELFTEST_FAIL_STAGE:-} == "producer" ]]; then
+    return 91
+  fi
+}
+
+timing_selftest() {
+  local scratch run_id run_out log samples
+  local started_wall_ns finished_wall_ns started_mono_ns finished_mono_ns
+  local status stage expected_index index
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/fedcrag-e0-timing.XXXXXX")
+  run_id="e0-timing-selftest"
+  run_out="$scratch/$run_id"
+  log="$scratch/$run_id.log"
+  samples="$scratch/$run_id.gpu"
+  mkdir -p "$run_out"
+  : > "$samples"
+  export FEDCRAG_E0_RUN_ID="$run_id"
+
+  read -r started_wall_ns started_mono_ns \
+    < <("$PYTHON" e0_resources.py clock)
+  set +e
+  run_timestamped_pipeline "$log" timing_selftest_producer
+  status=$?
+  set -e
+  read -r finished_wall_ns finished_mono_ns \
+    < <("$PYTHON" e0_resources.py clock)
+  if [[ $status -ne 0 ]]; then
+    printf 'timing self-test success pipeline failed\n' >&2
+    rm -rf "$scratch"
+    return 1
+  fi
+  if ! "$PYTHON" e0_resources.py write \
+      --run-id "$run_id" --run-dir "$run_out" --log "$log" \
+      --samples "$samples" --started-wall-ns "$started_wall_ns" \
+      --finished-wall-ns "$finished_wall_ns" \
+      --started-mono-ns "$started_mono_ns" \
+      --finished-mono-ns "$finished_mono_ns" --num-rounds 2 >/dev/null; then
+    rm -rf "$scratch"
+    return 1
+  fi
+  if ! "$PYTHON" - "$run_out/e0_resources.json" <<'PY'
+import json
+import sys
+
+record = json.load(open(sys.argv[1]))
+assert all(value > 0 for value in record["round_ns"])
+assert all(value > 0 for value in record["between_round_ns"])
+assert record["pre_ns"] >= 0 and record["post_ns"] >= 0
+assert (record["pre_ns"] + sum(record["round_ns"])
+        + sum(record["between_round_ns"]) + record["post_ns"]
+        == record["finished_mono_ns"] - record["started_mono_ns"])
+PY
+  then
+    rm -rf "$scratch"
+    return 1
+  fi
+
+  for stage in producer filter tee; do
+    E0_SELFTEST_FAIL_STAGE=$stage
+    export E0_SELFTEST_FAIL_STAGE
+    : > "$scratch/fail-$stage.log"
+    set +e
+    run_timestamped_pipeline \
+      "$scratch/fail-$stage.log" timing_selftest_producer >/dev/null 2>&1
+    status=$?
+    set -e
+    unset E0_SELFTEST_FAIL_STAGE
+    if [[ $status -eq 0 ]]; then
+      printf 'timing self-test accepted %s failure\n' "$stage" >&2
+      rm -rf "$scratch"
+      return 1
+    fi
+    case "$stage" in
+      producer) expected_index=0 ;;
+      filter) expected_index=1 ;;
+      tee) expected_index=2 ;;
+    esac
+    for index in 0 1 2; do
+      if [[ $index -eq $expected_index ]]; then
+        if [[ ${E0_LAST_PIPELINE_STATUSES[$index]} -eq 0 ]]; then
+          printf 'timing self-test did not observe %s failure\n' "$stage" >&2
+          rm -rf "$scratch"
+          return 1
+        fi
+      elif [[ ${E0_LAST_PIPELINE_STATUSES[$index]} -ne 0 ]]; then
+        printf 'timing self-test %s failure contaminated another stage\n' \
+          "$stage" >&2
+        rm -rf "$scratch"
+        return 1
+      fi
+    done
+    printf 'timing self-test refused %s failure\n' "$stage"
+  done
+  rm -rf "$scratch"
+  printf 'timing self-test passed\n'
 }
 
 write_completion_marker() {
@@ -506,8 +591,11 @@ case "${1:-}" in
   resume)
     campaign 1
     ;;
+  timing-selftest)
+    timing_selftest
+    ;;
   *)
-    printf 'usage: %s {manifest|verify|run|resume}\n' "$0" >&2
+    printf 'usage: %s {manifest|verify|run|resume|timing-selftest}\n' "$0" >&2
     exit 2
     ;;
 esac

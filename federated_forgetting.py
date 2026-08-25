@@ -16,6 +16,7 @@ from peft import (LoraConfig, TaskType,
 from fedcrag_common import (load_slice_with_train, doc_text, resolve_local,
                             evaluate_metrics, check_lora_targets, LORA_TARGETS,
                             amp_enabled, get_git_commit)
+from e0_resources import ResourceValidationError, validate_run_id
 
 
 def get_adapter_state(model):
@@ -479,6 +480,14 @@ def main():
     ap.add_argument("--out", default="./results")
     args = ap.parse_args()
 
+    telemetry_run_id = None
+    if "FEDCRAG_E0_RUN_ID" in os.environ:
+        try:
+            telemetry_run_id = validate_run_id(
+                os.environ["FEDCRAG_E0_RUN_ID"])
+        except ResourceValidationError as exc:
+            ap.error(str(exc))
+
     canonical_weight_by = ("rawmaxmin" if args.weight_by == "maxmin"
                            else args.weight_by)
     if args.weight_by == "maxmin":
@@ -633,7 +642,11 @@ def main():
     afl_lam = [1.0 / len(args.slices)] * len(args.slices)
 
     for rnd in range(args.num_rounds):
-        print(f"  --- round {rnd+1}/{args.num_rounds} ---")
+        if telemetry_run_id is not None:
+            print(
+                f"E0_ROUND_START {telemetry_run_id} "
+                f"{rnd+1}/{args.num_rounds}", flush=True)
+        print(f"  --- round {rnd+1}/{args.num_rounds} ---", flush=True)
         label = f"round_{rnd+1}"
         round_broadcast = {key: value.clone()
                            for key, value in global_state.items()}
@@ -834,6 +847,10 @@ def main():
         print_scores(label, R[label], args.slices, args.metrics)
         dump_json(out, jpath)
         torch.cuda.empty_cache()
+        if telemetry_run_id is not None:
+            print(
+                f"E0_ROUND_END {telemetry_run_id} "
+                f"{rnd+1}/{args.num_rounds}", flush=True)
 
     bwt = {}
     anchor = "round_1"

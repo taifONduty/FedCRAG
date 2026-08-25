@@ -1,6 +1,7 @@
 """CPU-only integration tests for FedSpan driver provenance and persistence."""
 import json
 import math
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,49 @@ from federated_forgetting import (  # noqa: E402
 )
 import driver_harness  # noqa: E402
 from reference_solvers import maximin_reference, min_norm_reference  # noqa: E402
+
+
+def test_e0_markers_bind_every_complete_round_to_the_telemetry_run_id(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("FEDCRAG_E0_RUN_ID", "e0-test-row")
+
+    driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "uniform", num_rounds=2)
+
+    output = capsys.readouterr().out
+    expected = [
+        "E0_ROUND_START e0-test-row 1/2",
+        "E0_ROUND_END e0-test-row 1/2",
+        "E0_ROUND_START e0-test-row 2/2",
+        "E0_ROUND_END e0-test-row 2/2",
+    ]
+    positions = [output.index(marker) for marker in expected]
+    assert positions == sorted(positions)
+    assert all(output.count(marker) == 1 for marker in expected)
+
+
+@pytest.mark.parametrize("run_id", ["", "UPPER", "has space", "../row",
+                                     "e0_row", "-leading", "trailing-"])
+def test_e0_marker_rejects_a_malformed_launcher_identity_before_data_work(
+        monkeypatch, capsys, tmp_path, run_id):
+    touched_data = False
+
+    def unexpected_data_work(*args, **kwargs):
+        nonlocal touched_data
+        touched_data = True
+        raise AssertionError("malformed telemetry must fail before data work")
+
+    monkeypatch.setenv("FEDCRAG_E0_RUN_ID", run_id)
+    monkeypatch.setattr(driver, "load_slice_with_train", unexpected_data_work)
+    monkeypatch.setattr(driver, "get_git_commit", lambda: "abc123def456")
+    monkeypatch.setattr(sys, "argv", driver_harness.build_argv(
+        tmp_path, "frozen-a", "uniform"))
+
+    with pytest.raises(SystemExit, match="2"):
+        driver.main()
+
+    assert "FEDCRAG_E0_RUN_ID" in capsys.readouterr().err
+    assert touched_data is False
 
 
 def frozen_args(**overrides):

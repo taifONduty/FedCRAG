@@ -11,6 +11,7 @@ import json
 import math
 import re
 import statistics
+import subprocess
 import sys
 from pathlib import Path
 
@@ -59,6 +60,12 @@ _APPLIED_NORM_RTOL = 1e-9
 _MANIFEST_SCHEMA = "fedcrag-e0-manifest/1"
 _RESOURCE_SCHEMA = "fedcrag-e0-resources/1"
 _RESOURCE_FILENAME = "e0_resources.json"
+_SOURCE_FILES = (
+    "federated_forgetting.py",
+    "aggregation_schemes.py",
+    "fedcrag_common.py",
+    "requirements.txt",
+)
 
 
 class E0ValidationError(RuntimeError):
@@ -787,6 +794,13 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
             "direction_uncertainty": 0.0,
         }
 
+    _require(status != "invalid_step_norm",
+             f"{round_label}: production-impossible invalid_step_norm "
+             "fallback/status record: "
+             "a legal fixed launch has a positive finite step and a legal "
+             "median-active launch with active finite client norms has a "
+             "positive finite median")
+
     if arguments["fedspan_step_policy"] == "fixed":
         resolved = arguments["fedspan_step_norm"]
         resolved_derived = resolved
@@ -890,30 +904,59 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
         f"{round_label}: recorded min_norm_value differs from the square "
         "root of the independent min-norm objective")
     policy = diagnostic.get("direction_policy")
+    solver = diagnostic.get("min_norm_solver") or {}
+    recorded_tol = solver.get("tol")
+    _require_scalar(
+        recorded_tol, 1e-14,
+        f"{round_label}: minnorm solver tolerance differs from frozen E0")
+    iterations = solver.get("iterations")
+    _require(isinstance(iterations, int) and not isinstance(iterations, bool)
+             and 1 <= iterations <= 20000,
+             f"{round_label}: minnorm solver iterations must be an integer "
+             "in [1, 20000]")
+    _require(isinstance(diagnostic.get("solver_status"), int)
+             and not isinstance(diagnostic.get("solver_status"), bool)
+             and diagnostic.get("solver_status") == 0,
+             f"{round_label}: outer direction solver status is not the "
+             "successful frozen E0 status 0")
     if policy == "minnorm":
         policy_error = max(0.0, q_derived - q_star)
         _require(
             policy_error <= objective_allowance,
             f"{round_label}: minnorm direction objective suboptimality "
             f"{policy_error:.6g} exceeds {objective_allowance:.6g}")
-        solver = diagnostic.get("min_norm_solver") or {}
-        _require_scalar(
-            solver.get("tol"), 1e-14,
-            f"{round_label}: minnorm solver tolerance differs from frozen E0")
         gap = q_recorded - float(np.min(recorded_payoffs))
         _require_scalar(
             solver.get("gap"), gap,
             f"{round_label}: minnorm Frank-Wolfe certificate gap differs")
-        _require(solver.get("converged") is (gap <= 1e-14),
+        converged = gap <= float(recorded_tol)
+        _require(solver.get("converged") is converged,
                  f"{round_label}: min-norm reference did not converge as "
                  "required; convergence status disagrees with the replayed "
                  "certificate gap")
+        expected_message = (
+            "singleton active set; no direction solve required"
+            if len(active) == 1 else
+            f"away-step Frank-Wolfe "
+            f"{'converged' if converged else 'STALLED'} at duality gap "
+            f"{float(solver['gap']):.3e} after {iterations} iterations")
+        _require(diagnostic.get("solver_message") == expected_message,
+                 f"{round_label}: outer direction solver message differs "
+                 "from the independently replayed minnorm solve metadata")
     elif policy == "maxmin-lp":
         policy_error = max(0.0, t_star - gamma_derived)
         _require(
             policy_error <= objective_allowance,
             f"{round_label}: maxmin-lp direction objective suboptimality "
             f"{policy_error:.6g} exceeds {objective_allowance:.6g}")
+        expected_message = (
+            "singleton active set; no direction solve required"
+            if len(active) == 1 else
+            "Optimization terminated successfully. "
+            "(HiGHS Status 7: Optimal)")
+        _require(diagnostic.get("solver_message") == expected_message,
+                 f"{round_label}: outer direction solver message differs "
+                 "from the frozen maxmin-lp success metadata")
     else:
         raise E0ValidationError(
             f"{round_label}: unknown direction policy {policy!r}")
@@ -1117,13 +1160,16 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
         f"{materialization_direction_uncertainty:.6g} is non-informative; "
         "the persisted step cannot support a scientific direction "
         "certificate")
+    scientific_allowance = direction_uncertainty + 2.0 * _SCALAR_RTOL
     _require(
         abs(materialized_scientific_achieved - scientific_achieved)
-        <= (direction_uncertainty
-            + materialization_direction_uncertainty + _SCALAR_RTOL),
+        <= scientific_allowance,
         f"{round_label}: materialized scientific direction differs from "
-        "the certified direction beyond conditioning and materialization "
-        "uncertainty")
+        "the independent scientific certificate; float32 materialization "
+        "error is measured but cannot excuse direction degradation "
+        f"({materialized_scientific_achieved:.12g} versus "
+        f"{scientific_achieved:.12g}, allowance "
+        f"{scientific_allowance:.12g})")
     if policy == "minnorm":
         derived_optimum = math.sqrt(max(q_star, 0.0))
         _require(
@@ -1136,10 +1182,14 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
                  <= direction_uncertainty + _SCALAR_RTOL,
                  f"{round_label}: normalized direction shortfall exceeds "
                  "the certified scale perturbation")
+        if derived_optimum > direction_uncertainty + _SCALAR_RTOL:
+            _require(
+                materialized_scientific_achieved > 0.0,
+                f"{round_label}: materialized direction sign crossing "
+                "contradicts a positive independent min-norm certificate")
         _require(
             abs(materialized_scientific_achieved - derived_optimum)
-            <= (direction_uncertainty
-                + materialization_direction_uncertainty + _SCALAR_RTOL),
+            <= scientific_allowance,
             f"{round_label}: materialized scientific direction does not "
             "meet the independent min-norm certificate")
     return {
@@ -1384,6 +1434,66 @@ def _manifest_argument_parser():
     return parser
 
 
+def _validate_driver_argument_legality(arguments, label):
+    """Mirror every cross-field launch constraint that defines E0 legality."""
+    canonical_weight_by = (
+        "rawmaxmin" if arguments.get("weight_by") == "maxmin"
+        else arguments.get("weight_by"))
+    if canonical_weight_by == "normmaxmin":
+        _require(arguments.get("weighted") is True,
+                 f"{label}: --weight_by normmaxmin requires --weighted")
+        _require(arguments.get("lora_mode") == "frozen-a",
+                 f"{label} launched lora_mode="
+                 f"{arguments.get('lora_mode')!r}, but --weight_by "
+                 "normmaxmin requires "
+                 "--lora_mode frozen-a")
+        _require(arguments.get("save_states") is True,
+                 f"{label}: --weight_by normmaxmin requires --save_states")
+        step_policy = arguments.get("fedspan_step_policy")
+        _require(step_policy in ("fixed", "median-active"),
+                 f"{label}: --weight_by normmaxmin requires a legal "
+                 "--fedspan_step_policy")
+        _require(arguments.get("fedspan_direction_policy")
+                 in _DIRECTION_POLICIES,
+                 f"{label}: --weight_by normmaxmin requires a legal "
+                 "--fedspan_direction_policy")
+        step_norm = arguments.get("fedspan_step_norm")
+        if step_policy == "fixed":
+            _require(_finite(step_norm) and float(step_norm) > 0.0,
+                     f"{label}: --fedspan_step_policy fixed requires a "
+                     "positive finite "
+                     "--fedspan_step_norm")
+        else:
+            _require(step_norm is None,
+                     f"{label}: median-active policy rejects "
+                     "--fedspan_step_norm")
+        for field in ("fedspan_active_abs_tol", "fedspan_active_rel_tol",
+                      "fedspan_mixture_norm_tol"):
+            value = arguments.get(field)
+            _require(_finite(value) and float(value) >= 0.0,
+                     f"{label}: --{field} must be finite and nonnegative")
+        cap = arguments.get("fedspan_max_abs_delta_weight")
+        _require(cap is None or (_finite(cap) and float(cap) > 0.0),
+                 f"{label}: --fedspan_max_abs_delta_weight must be positive "
+                 "and finite when supplied")
+    else:
+        _require(arguments.get("fedspan_step_policy") is None
+                 and arguments.get("fedspan_step_norm") is None,
+                 f"{label}: FedSpan step options are legal only with "
+                 "--weight_by normmaxmin")
+        _require(arguments.get("fedspan_direction_policy") is None,
+                 f"{label}: --fedspan_direction_policy is legal only with "
+                 "--weight_by normmaxmin")
+    row_scale = arguments.get("frozen_a_row_scale")
+    lora_mode = arguments.get("lora_mode")
+    _require(row_scale is None or lora_mode == "frozen-a",
+             f"{label}: --frozen_a_row_scale is legal only with "
+             "--lora_mode frozen-a")
+    _require(lora_mode != "frozen-a" or row_scale is not None,
+             f"{label}: --frozen_a_row_scale is required with "
+             "--lora_mode frozen-a")
+
+
 def _parse_manifest_argv(argv):
     parser = _manifest_argument_parser()
     known = {option for action in parser._actions
@@ -1419,21 +1529,7 @@ def _parse_manifest_argv(argv):
     _require(not unknown,
              f"manifest command has unknown arguments {unknown!r}")
     launched = vars(namespace)
-    data_root = Path(launched["data_root"]).expanduser()
-    if not data_root.is_absolute():
-        data_root = (Path.cwd() / data_root).resolve()
-    else:
-        data_root = data_root.resolve()
-    repository_root = data_root.parent
-    expected_interpreter = (
-        repository_root / ".venv" / "bin" / "python").resolve()
-    recorded_interpreter = Path(interpreter).expanduser()
-    if not recorded_interpreter.is_absolute():
-        recorded_interpreter = repository_root / recorded_interpreter
-    _require(
-        recorded_interpreter.resolve() == expected_interpreter,
-        "manifest command interpreter differs from the exact frozen E0 "
-        f"data_root/repository interpreter {expected_interpreter}")
+    _validate_driver_argument_legality(launched, "manifest command")
     return launched
 
 
@@ -1584,14 +1680,88 @@ def _validate_configuration_hash(result, arguments, data_sha256):
         "contract and dataset fingerprints")
 
 
-def _validate_manifest_row(result, row, run_id):
-    launched = _parse_manifest_argv(row["argv"])
+def _git_capture(source_root, *arguments, text=False):
+    completed = subprocess.run(
+        ["git", *arguments], cwd=source_root, capture_output=True, text=text,
+        check=False)
+    detail = completed.stderr.strip() if text else (
+        completed.stderr.decode("utf-8", errors="replace").strip())
+    _require(completed.returncode == 0,
+             f"execution source Git verification failed for "
+             f"{' '.join(arguments)}: {detail}")
+    return completed.stdout
+
+
+def _validate_execution_source(result, row, execution_source_root):
+    _require(execution_source_root is not None,
+             "manifest-backed validation requires an explicit "
+             "execution source root")
+    source_root = Path(execution_source_root).expanduser().resolve()
+    _require(source_root.is_dir(),
+             f"execution source root {source_root} is not a directory")
+    git_root = Path(_git_capture(
+        source_root, "rev-parse", "--show-toplevel", text=True).strip()
+    ).resolve()
+    _require(git_root == source_root,
+             f"execution source root {source_root} is not the exact Git "
+             f"repository root {git_root}")
+    commit = result["commit"]
+    full_commit = _git_capture(
+        source_root, "rev-parse", "--verify", f"{commit}^{{commit}}",
+        text=True).strip()
+    _require(bool(full_commit),
+             f"execution source does not contain recorded commit {commit}")
+    provenance = result.get("provenance") or {}
+    _require(provenance.get("git_commit") == commit,
+             "result provenance git_commit differs from the recorded run "
+             "commit")
+    recorded_hashes = provenance.get("source_sha256")
+    _require(isinstance(recorded_hashes, dict)
+             and sorted(recorded_hashes) == sorted(_SOURCE_FILES),
+             "result provenance source_sha256 does not cover the canonical "
+             "frozen E0 source files")
+    source_hashes = {
+        name: hashlib.sha256(_git_capture(
+            source_root, "show", f"{full_commit}:{name}")).hexdigest()
+        for name in _SOURCE_FILES
+    }
+    _require(recorded_hashes == source_hashes,
+             "result provenance source_sha256 differs from canonical files "
+             "read from the recorded Git object")
+
+    tokens = row.get("argv") or []
+    _require(len(tokens) >= 2,
+             "manifest command lacks interpreter/script provenance tokens")
+    expected_script = (source_root / "federated_forgetting.py").resolve()
+    script = Path(tokens[1]).expanduser()
+    if not script.is_absolute():
+        script = source_root / script
+    _require(script.resolve() == expected_script,
+             "manifest command script does not resolve to the frozen E0 "
+             f"source object at {expected_script}")
+    expected_interpreter = (
+        source_root / ".venv" / "bin" / "python").resolve()
+    interpreter = Path(tokens[0]).expanduser()
+    if not interpreter.is_absolute():
+        _require(interpreter == Path(".venv/bin/python"),
+                 "manifest command relative interpreter must be exactly "
+                 ".venv/bin/python")
+        interpreter = source_root / interpreter
+    _require(interpreter.resolve() == expected_interpreter,
+             "manifest command interpreter differs from the exact frozen E0 "
+             f"execution source interpreter {expected_interpreter}")
+    return source_root
+
+
+def _validate_manifest_row(result, row, run_id, execution_source_root):
     _require(row["run_id"] == run_id,
              f"manifest row is for '{row['run_id']}', not '{run_id}'")
     _require(
         result["commit"] == row["commit"],
         f"run commit {result['commit']} differs from the manifest commit "
         f"{row['commit']}")
+    _validate_execution_source(result, row, execution_source_root)
+    launched = _parse_manifest_argv(row["argv"])
 
     arguments = result.get("args")
     _require(isinstance(arguments, dict),
@@ -1721,12 +1891,18 @@ def _validate_resource_record(run_directory, result):
 # ------------------------------------------------------------- entry point
 
 
-def validate_run_directory(run_directory, manifest_row=None):
+def validate_run_directory(run_directory, manifest_row=None,
+                           execution_source_root=None):
     run_directory = Path(run_directory)
     result_path = _single(
         run_directory.glob("federated_*.json"), "federated result JSON")
     with result_path.open() as handle:
         result = json.load(handle)
+
+    arguments = result.get("args")
+    _require(isinstance(arguments, dict),
+             "result records no argument namespace")
+    _validate_driver_argument_legality(arguments, "result arguments")
 
     commit = result.get("commit")
     _require(
@@ -1756,7 +1932,8 @@ def validate_run_directory(run_directory, manifest_row=None):
     resources = None
     if manifest_row is not None:
         launched, data_fingerprints = _validate_manifest_row(
-            result, manifest_row, run_directory.name)
+            result, manifest_row, run_directory.name,
+            execution_source_root)
         resources = _validate_resource_record(run_directory, result)
     elif result["lora_mode"] == "frozen-a":
         provenance = result.get("provenance") or {}
@@ -1877,6 +2054,10 @@ def main():
     parser.add_argument("--run_id",
                         help="manifest run id (default: directory name)")
     parser.add_argument(
+        "--execution_source_root",
+        help="exact frozen Git repository that contains the recorded E0 "
+             "commit (required with --manifest)")
+    parser.add_argument(
         "--allow_missing_manifest", action="store_true",
         help="validate contracts only; the report records that the run was "
              "not checked against the manifest that launched it")
@@ -1885,13 +2066,17 @@ def main():
     run_id = args.run_id or Path(args.run_directory).name
     manifest_row = None
     if args.manifest:
+        if not args.execution_source_root:
+            parser.error("--execution_source_root is required with --manifest")
         manifest_row = _load_manifest_row(args.manifest, run_id)
     elif not args.allow_missing_manifest:
         parser.error(
             "--manifest is required; pass --allow_missing_manifest to "
             "validate a run whose launch manifest is unavailable")
 
-    report = validate_run_directory(args.run_directory, manifest_row)
+    report = validate_run_directory(
+        args.run_directory, manifest_row,
+        execution_source_root=args.execution_source_root)
     if not report["manifest_verified"]:
         print("WARNING: run was not checked against a launch manifest",
               file=sys.stderr)

@@ -10,9 +10,9 @@ import copy
 import hashlib
 import math
 import json
+import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -21,6 +21,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import driver_harness  # noqa: E402
+import validate_e0 as validator  # noqa: E402
 from aggregation_schemes import (  # noqa: E402
     ModuleScales,
     apply_fedspan_update,
@@ -29,7 +30,7 @@ from aggregation_schemes import (  # noqa: E402
 )
 from validate_e0 import (  # noqa: E402
     E0ValidationError,
-    validate_run_directory,
+    validate_run_directory as _validate_run_directory,
 )
 
 E0_CELLS = [
@@ -39,6 +40,27 @@ E0_CELLS = [
     ("frozen-a", "rawmaxmin"),
     ("frozen-a", "normmaxmin"),
 ]
+
+
+SOURCE_FILES = (
+    "federated_forgetting.py",
+    "aggregation_schemes.py",
+    "fedcrag_common.py",
+    "requirements.txt",
+)
+
+
+def validate_run_directory(run_directory, manifest_row=None,
+                           execution_source_root=None):
+    """Give manifest tests their independent frozen execution-source anchor."""
+    if manifest_row is not None and execution_source_root is None:
+        execution_source_root = prepare_execution_source(Path(run_directory))
+    if execution_source_root is None:
+        return _validate_run_directory(
+            run_directory, manifest_row=manifest_row)
+    return _validate_run_directory(
+        run_directory, manifest_row=manifest_row,
+        execution_source_root=execution_source_root)
 
 
 def build_run(monkeypatch, tmp_path, lora_mode="frozen-a", arm="normmaxmin",
@@ -283,8 +305,8 @@ def negate_only_materialized_step(tmp_path, result_path, round_number=1):
     return result
 
 
-def rotate_only_materialized_step_45_degrees(
-        tmp_path, result_path, round_number=1):
+def rotate_only_materialized_step(
+        tmp_path, result_path, angle_degrees=45.0, round_number=1):
     """Rotate only the persisted step while preserving its small-step norm."""
     payload = load_states(tmp_path, round_number)
     with Path(result_path).open() as handle:
@@ -313,8 +335,9 @@ def rotate_only_materialized_step_45_degrees(
     perpendicular = -(client_unit - torch.dot(
         client_unit, solved_unit) * solved_unit)
     perpendicular /= torch.linalg.vector_norm(perpendicular)
+    angle = math.radians(angle_degrees)
     rotated_vector = solved_norm * (
-        solved_unit + perpendicular) / math.sqrt(2.0)
+        math.cos(angle) * solved_unit + math.sin(angle) * perpendicular)
     rotated_block = rotated_vector.reshape_as(solved_block)
     payload["global"][driver_harness.B_KEY] = (
         broadcast_b + rotated_block / scale).float()
@@ -365,12 +388,6 @@ def replace_with_genuine_invalid_step_fallback(
             active_rel_tol=1e-8, mixture_norm_tol=1e-6,
             max_abs_delta_weight=None)
     assert diagnostic["status"] == "invalid_step_norm"
-    # Public CLI validation prevents a nonpositive fixed step from launching,
-    # but it is the independent, unpatched validator classification of this
-    # defensive record. Adapt only the method declaration after the genuine
-    # production fallback diagnostic has been emitted.
-    diagnostic["step_policy"] = "fixed"
-    diagnostic["declared_step_norm"] = 0.0
     global_state, application = apply_fedspan_update(
         payload["broadcast"], states, diagnostic, scales)
     diagnostic = {**diagnostic, "application": application}
@@ -379,15 +396,6 @@ def replace_with_genuine_invalid_step_fallback(
     torch.save(payload, state_path(tmp_path))
 
     result["fedspan_diagnostics"]["round_1"] = diagnostic
-    result["args"]["fedspan_step_policy"] = "fixed"
-    result["args"]["fedspan_step_norm"] = 0.0
-    result["method_contract"]["fedspan_step_policy"] = "fixed"
-    result["method_contract"]["fedspan_step_norm"] = 0.0
-    result["method_contract"]["run_configuration_sha256"] = (
-        driver_harness.driver._frozen_run_configuration_sha256(
-            SimpleNamespace(**result["args"]),
-            data_sha256=result["provenance"]["data_sha256"],
-            row_scale=result["method_contract"]["frozen_a_row_scale"]))
     rewrite(result_path, result)
     return result
 
@@ -616,7 +624,7 @@ def test_rotated_materialized_direction_with_noninformative_bound_is_refused(
         monkeypatch, tmp_path, "frozen-a", "normmaxmin",
         extra=("--fedspan_step_policy", "fixed",
                "--fedspan_step_norm", "6e-6"))
-    result, vector_error = rotate_only_materialized_step_45_degrees(
+    result, vector_error = rotate_only_materialized_step(
         tmp_path, result_path)
     diagnostic = result["fedspan_diagnostics"]["round_1"]
     assert vector_error < 5e-6
@@ -626,6 +634,29 @@ def test_rotated_materialized_direction_with_noninformative_bound_is_refused(
     with pytest.raises(
             E0ValidationError,
             match="materialized.*certificate|non-informative"):
+        validate_run_directory(tmp_path)
+
+
+def test_small_rotation_crossing_positive_certificate_is_refused(
+        monkeypatch, tmp_path):
+    a = 0.1
+    b = math.sqrt(1.0 - a * a)
+    directions = ([a, b], [a, -b], [0.0, 0.0])
+    _, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        clients=clients_from_unit_directions(directions),
+        extra=("--fedspan_step_policy", "fixed",
+               "--fedspan_step_norm", "2e-5"))
+    result, vector_error = rotate_only_materialized_step(
+        tmp_path, result_path, angle_degrees=10.0)
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    assert vector_error < 5e-6
+    assert diagnostic["achieved_min_direction_cosine"] > 0.09
+    assert diagnostic["application"]["applied_min_active_cosine"] < 0.0
+
+    with pytest.raises(
+            E0ValidationError,
+            match="materialized.*certificate|sign crossing"):
         validate_run_directory(tmp_path)
 
 
@@ -841,6 +872,31 @@ def test_genuine_coefficient_limit_fallback_is_certified_before_campaign_gate(
         validate_run_directory(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("solver_status", 1, "solver status"),
+        ("solver_message", "forged convergence", "solver message"),
+        ("proposed_max_abs_delta_weight", 0.0,
+         "proposed maximum coefficient"),
+        ("step_reconstruction_error", 0.0,
+         "coefficient-limit.*reconstruction error"),
+    ],
+)
+def test_coefficient_limit_fallback_solver_metadata_is_bound(
+        monkeypatch, tmp_path, field, replacement, message):
+    result, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        extra=("--fedspan_max_abs_delta_weight", "0.01"))
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    assert diagnostic["status"] == "coefficient_limit"
+    diagnostic[field] = replacement
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match=message):
+        validate_run_directory(tmp_path)
+
+
 def multi_module_peft_fixture():
     second_module = "encoder.layer0.value"
     second_a = f"{second_module}.lora_A.weight"
@@ -908,7 +964,6 @@ def genuine_no_active_clients():
     }
 
 
-@pytest.mark.parametrize("fallback_kind", ["no_active", "invalid_step_norm"])
 @pytest.mark.parametrize(
     ("path", "replacement", "message"),
     [
@@ -923,18 +978,12 @@ def genuine_no_active_clients():
     ],
 )
 def test_genuine_pre_geometry_fallback_fields_are_bound(
-        monkeypatch, tmp_path, fallback_kind, path, replacement, message):
-    if fallback_kind == "no_active":
-        result, result_path = driver_harness.run_driver(
-            monkeypatch, tmp_path, "frozen-a", "normmaxmin",
-            clients=genuine_no_active_clients())
-    else:
-        _, result_path = build_run(
-            monkeypatch, tmp_path, "frozen-a", "normmaxmin")
-        result = replace_with_genuine_invalid_step_fallback(
-            monkeypatch, tmp_path, result_path)
+        monkeypatch, tmp_path, path, replacement, message):
+    result, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        clients=genuine_no_active_clients())
     diagnostic = result["fedspan_diagnostics"]["round_1"]
-    assert diagnostic["status"] == fallback_kind
+    assert diagnostic["status"] == "no_active"
     target = diagnostic
     for key in path[:-1]:
         target = target[key]
@@ -955,7 +1004,9 @@ def test_genuine_invalid_step_fixture_is_independently_classified(
         "invalid_step_norm")
     assert float(np.median([1.0, 2.0, 3.0])) == 2.0
 
-    with pytest.raises(E0ValidationError, match="never applied a nonzero"):
+    with pytest.raises(
+            E0ValidationError,
+            match="production-impossible.*invalid_step_norm"):
         validate_run_directory(tmp_path)
 
 
@@ -1021,6 +1072,55 @@ def test_unconverged_min_norm_reference_is_refused(monkeypatch, tmp_path):
     rewrite(result_path, result)
 
     with pytest.raises(E0ValidationError, match="did not converge"):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize("iterations", ["32", 0, 20001, True])
+def test_min_norm_solver_iterations_are_bound(
+        monkeypatch, tmp_path, iterations):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    with result_path.open() as handle:
+        result = json.load(handle)
+    result["fedspan_diagnostics"]["round_1"]["min_norm_solver"][
+        "iterations"] = iterations
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="iterations"):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("solver_status", 1, "solver status"),
+        ("solver_message", "forged convergence", "solver message"),
+    ],
+)
+def test_outer_direction_solver_metadata_is_bound(
+        monkeypatch, tmp_path, field, replacement, message):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    with result_path.open() as handle:
+        result = json.load(handle)
+    result["fedspan_diagnostics"]["round_1"][field] = replacement
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match=message):
+        validate_run_directory(tmp_path)
+
+
+def test_outer_maxmin_solver_message_is_bound(monkeypatch, tmp_path):
+    _, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        direction_policy="maxmin-lp")
+    with result_path.open() as handle:
+        result = json.load(handle)
+    result["fedspan_diagnostics"]["round_1"]["solver_message"] = (
+        "forged LP success")
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="solver message"):
         validate_run_directory(tmp_path)
 
 
@@ -1195,16 +1295,63 @@ def test_unit_labeled_nonunit_frozen_a_is_refused(monkeypatch, tmp_path):
         validate_run_directory(tmp_path)
 
 
+def prepare_execution_source(tmp_path):
+    """Create a real frozen Git source object and bind the synthetic result."""
+    root = Path(tmp_path) / "execution-source"
+    if not (root / ".git").is_dir():
+        root.mkdir()
+        for index, name in enumerate(SOURCE_FILES):
+            (root / name).write_text(f"frozen source {index}: {name}\n")
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "fixture@example.invalid"],
+            cwd=root, check=True)
+        subprocess.run(
+            ["git", "config", "user.name", "E0 Fixture"],
+            cwd=root, check=True)
+        subprocess.run(["git", "add", *SOURCE_FILES], cwd=root, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "frozen fixture"],
+            cwd=root, check=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True,
+        text=True, capture_output=True).stdout.strip()
+    source_hashes = {
+        name: hashlib.sha256(subprocess.run(
+            ["git", "show", f"{commit}:{name}"], cwd=root, check=True,
+            capture_output=True).stdout).hexdigest()
+        for name in SOURCE_FILES
+    }
+    result_path = _single_for_test(Path(tmp_path).glob("federated_*.json"))
+    with result_path.open() as handle:
+        result = json.load(handle)
+    result["commit"] = commit
+    result["provenance"]["git_commit"] = commit
+    result["provenance"]["source_sha256"] = source_hashes
+    rewrite(result_path, result)
+    return root
+
+
+def _single_for_test(paths):
+    values = list(paths)
+    assert len(values) == 1
+    return values[0]
+
+
 def manifest_row(tmp_path, lora_mode="frozen-a", arm="normmaxmin",
                  num_rounds=1):
+    source_root = prepare_execution_source(tmp_path)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source_root, check=True,
+        text=True, capture_output=True).stdout.strip()
     return {
         "run_id": tmp_path.name,
-        "commit": driver_harness.CLEAN_COMMIT,
+        "commit": commit,
         "coordinate": lora_mode,
         "arm": arm,
         "regime": "full",
         "max_steps": 0,
-        "argv": [str(Path(tmp_path) / ".venv" / "bin" / "python")]
+        "argv": [str(source_root / ".venv" / "bin" / "python")]
                 + driver_harness.build_argv(
                     tmp_path, lora_mode, arm, num_rounds=num_rounds)
                 + ["--seed", "42", "--max_steps_per_round", "0"],
@@ -1246,6 +1393,78 @@ def test_manifest_relative_repo_interpreter_validates(monkeypatch, tmp_path):
     report = validate_run_directory(tmp_path, manifest_row=row)
 
     assert report["manifest_verified"] is True
+
+
+def test_manifest_requires_explicit_execution_source_anchor(
+        monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+
+    with pytest.raises(E0ValidationError, match="execution.source.root"):
+        _validate_run_directory(tmp_path, manifest_row=row)
+
+
+def test_manifest_cli_requires_execution_source_anchor(
+        monkeypatch, tmp_path, capsys):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "schema": "fedcrag-e0-manifest/1",
+        "commit": "0123456789ab",
+        "rows": [],
+    }))
+    monkeypatch.setattr(sys, "argv", [
+        "validate_e0.py", str(tmp_path), "--manifest", str(manifest),
+    ])
+
+    with pytest.raises(SystemExit) as error:
+        validator.main()
+    assert error.value.code == 2
+    assert "--execution_source_root is required" in capsys.readouterr().err
+
+
+def test_manifest_same_suffix_unrelated_interpreter_is_refused(
+        monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    row["argv"][0] = "/tmp/unrelated/.venv/bin/python"
+
+    with pytest.raises(E0ValidationError, match="interpreter"):
+        validate_run_directory(tmp_path, manifest_row=row)
+
+
+def test_manifest_source_hash_is_verified_from_recorded_git_object(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    source_root = tmp_path / "execution-source"
+    with result_path.open() as handle:
+        result = json.load(handle)
+    result["provenance"]["source_sha256"]["aggregation_schemes.py"] = (
+        "0" * 64)
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="source_sha256"):
+        _validate_run_directory(
+            tmp_path, manifest_row=row,
+            execution_source_root=source_root)
+
+
+def test_manifest_source_anchor_must_contain_recorded_commit(
+        monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    unrelated = tmp_path / "unrelated-source"
+    unrelated.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=unrelated, check=True)
+
+    with pytest.raises(E0ValidationError, match="recorded commit|Git"):
+        _validate_run_directory(
+            tmp_path, manifest_row=row, execution_source_root=unrelated)
 
 
 @pytest.mark.parametrize(
@@ -1390,6 +1609,29 @@ def test_manifest_uses_driver_cli_choices(
     with pytest.raises(
             E0ValidationError,
             match=f"cannot be parsed.*{flag.removeprefix('--')}.*invalid"):
+        validate_run_directory(tmp_path, manifest_row=drifted)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda argv: argv.extend(["--fedspan_step_norm", "0"]),
+         "positive finite.*fedspan_step_norm"),
+        (lambda argv: argv.extend(["--fedspan_step_norm", "1e-4"]),
+         "median-active.*rejects.*fedspan_step_norm"),
+    ],
+)
+def test_manifest_enforces_driver_cross_field_legality(
+        monkeypatch, tmp_path, mutate, message):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    drifted = manifest_row(tmp_path)
+    if "positive finite" in message:
+        index = drifted["argv"].index("--fedspan_step_policy") + 1
+        drifted["argv"][index] = "fixed"
+    mutate(drifted["argv"])
+
+    with pytest.raises(E0ValidationError, match=message):
         validate_run_directory(tmp_path, manifest_row=drifted)
 
 

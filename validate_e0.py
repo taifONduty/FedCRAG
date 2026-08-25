@@ -655,6 +655,70 @@ def _recorded_active_weights(diagnostic, client_count, active, round_label):
     return active_weights
 
 
+def _validate_pre_geometry_zero_fallback(
+        diagnostic, slices, status, expected_resolved, round_label):
+    """Bind every field emitted before Gram construction can begin."""
+    for field in ("resolved_step_norm", "requested_step_norm"):
+        actual = diagnostic.get(field)
+        if expected_resolved is None:
+            _require(actual is None,
+                     f"{round_label}: {status} fallback has unexpected "
+                     f"{field}")
+        elif _finite(expected_resolved):
+            _require_scalar(
+                actual, expected_resolved,
+                f"{round_label}: {status} fallback {field} differs")
+        else:
+            _require(not _finite(actual),
+                     f"{round_label}: {status} fallback {field} should be "
+                     "nonfinite")
+    _require(diagnostic.get("solver_status") is None,
+             f"{round_label}: {status} fallback has an unexpected solver "
+             "status")
+    expected_message = ("" if status == "no_active"
+                        else "resolved step norm is nonpositive or nonfinite")
+    _require(diagnostic.get("solver_message") == expected_message,
+             f"{round_label}: {status} fallback solver message differs")
+    _require(diagnostic.get("cosine_gram_active") is None,
+             f"{round_label}: {status} fallback records a cosine Gram")
+    zeros = [0.0] * len(slices)
+    _require(diagnostic.get("simplex_weights") == zeros,
+             f"{round_label}: {status} fallback has simplex weights")
+    _require(diagnostic.get("delta_weights") == zeros,
+             f"{round_label}: {status} fallback has applied coefficients")
+    _require(diagnostic.get("proposed_delta_weights") is None,
+             f"{round_label}: {status} fallback proposes coefficients")
+    for field in ("gamma", "mixture_norm", "solver_objective_gamma",
+                  "solver_simplex_residual", "solver_constraint_violation",
+                  "min_norm_value", "min_norm_solver",
+                  "achieved_min_direction_cosine",
+                  "certified_min_direction_cosine",
+                  "direction_solver_shortfall",
+                  "proposed_max_abs_delta_weight",
+                  "step_reconstruction_error",
+                  "solved_effective_step_sha256"):
+        _require(diagnostic.get(field) is None,
+                 f"{round_label}: {status} fallback has unexpected {field}")
+    _require(diagnostic.get("max_abs_delta_weight") == 0.0,
+             f"{round_label}: {status} fallback maximum applied coefficient "
+             "is not zero")
+    application = diagnostic.get("application") or {}
+    _require(application.get("applied_delta_weights") == zeros,
+             f"{round_label}: {status} fallback application coefficient "
+             "list is not exactly zero")
+    _require(application.get("applied_step_norm") == 0.0,
+             f"{round_label}: {status} fallback materialized a nonzero step")
+    _require(application.get("max_effective_block_error") == 0.0,
+             f"{round_label}: {status} fallback application has block error")
+    _require(application.get("applied_direction_cosines")
+             == [None] * len(slices),
+             f"{round_label}: {status} fallback application records "
+             "direction cosines")
+    _require(application.get("applied_min_active_cosine") is None,
+             f"{round_label}: {status} fallback application records a "
+             "minimum direction cosine")
+
+
 def _validate_fedspan_direction_decision(result, payload, diagnostic,
                                          round_label):
     """Independently reconstruct geometry, optimum, and coefficients."""
@@ -677,6 +741,15 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
     _require(diagnostic.get("declared_step_norm")
              == arguments["fedspan_step_norm"],
              f"{round_label}: declared step norm diagnostic differs from args")
+    _require(
+        diagnostic.get("direction_policy_specified") is True,
+        f"{round_label}: the FedSpan direction policy was not specified "
+        "explicitly, so the recorded direction is an implicit default")
+    _require(
+        diagnostic.get("delta_weight_limit")
+        == arguments["fedspan_max_abs_delta_weight"],
+        f"{round_label}: coefficient limit diagnostic differs from the "
+        "execution contract")
     modules, recorded_scales, derived_scales, _ = (
         _derive_frozen_a_geometry_scales(
             result, payload, diagnostic, round_label))
@@ -704,27 +777,8 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
         expected_resolved = (arguments["fedspan_step_norm"]
                              if arguments["fedspan_step_policy"] == "fixed"
                              else None)
-        _require(diagnostic.get("resolved_step_norm") == expected_resolved
-                 and diagnostic.get("requested_step_norm")
-                 == expected_resolved,
-                 f"{round_label}: no_active fallback has an invalid resolved "
-                 "step diagnostic")
-        _require(diagnostic.get("cosine_gram_active") is None,
-                 f"{round_label}: no_active fallback records a cosine Gram")
-        _require(diagnostic.get("simplex_weights")
-                 == [0.0] * len(slices),
-                 f"{round_label}: no_active fallback has simplex weights")
-        _require(diagnostic.get("proposed_delta_weights") is None,
-                 f"{round_label}: no_active fallback proposes coefficients")
-        for field in ("gamma", "mixture_norm", "solver_objective_gamma",
-                      "solver_simplex_residual",
-                      "solver_constraint_violation", "min_norm_value",
-                      "min_norm_solver", "achieved_min_direction_cosine",
-                      "direction_solver_shortfall",
-                      "solved_effective_step_sha256"):
-            _require(diagnostic.get(field) is None,
-                     f"{round_label}: no_active fallback has unexpected "
-                     f"{field}")
+        _validate_pre_geometry_zero_fallback(
+            diagnostic, slices, status, expected_resolved, round_label)
         return {
             "status": status,
             "delta_gram": 0.0,
@@ -747,6 +801,8 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
         _require(status == "invalid_step_norm" and fallback == "zero_update",
                  f"{round_label}: fallback/status does not match the "
                  "invalid_step_norm branch")
+        _validate_pre_geometry_zero_fallback(
+            diagnostic, slices, status, resolved, round_label)
         return {
             "status": status,
             "delta_gram": 0.0,
@@ -783,10 +839,9 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
     _require(recorded_diagnostic_gram.shape == recorded_gram.shape
              and np.all(np.isfinite(recorded_diagnostic_gram)),
              f"{round_label}: invalid recorded cosine Gram")
-    gram_error = float(np.max(np.abs(
-        recorded_diagnostic_gram - recorded_gram)))
-    gram_reference = float(np.max(np.abs(recorded_gram)))
-    _require(gram_error <= _SCALAR_ATOL + _SCALAR_RTOL * gram_reference,
+    gram_errors = np.abs(recorded_diagnostic_gram - recorded_gram)
+    gram_limits = _SCALAR_ATOL + _SCALAR_RTOL * np.abs(recorded_gram)
+    _require(np.all(gram_errors <= gram_limits),
              f"{round_label}: recorded cosine Gram differs from saved "
              "client tensors")
     delta_gram = float(np.max(np.abs(recorded_gram - derived_gram)))
@@ -992,7 +1047,14 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
     _require_scalar(
         application.get("max_effective_block_error"), max_block_error,
         f"{round_label}: application block reconstruction error differs")
+    materialized_limit = _MATERIALIZED_VECTOR_RTOL * max(
+        1.0, float(resolved))
     recorded_actual_norm = _block_norm(actual_recorded)
+    _require(
+        recorded_actual_norm > materialized_limit,
+        f"{round_label}: materialized step is too small for direction "
+        f"certification ({recorded_actual_norm:.6g} <= "
+        f"{materialized_limit:.6g})")
     recorded_application_cosines = [None] * len(slices)
     for index in active:
         dot = sum(float(torch.sum(
@@ -1019,13 +1081,19 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
         f"{round_label}: application minimum direction cosine differs")
     actual_vector = _flatten_blocks(actual_derived)
     solved_vector = _flatten_blocks(solved_derived)
-    materialized_limit = _MATERIALIZED_VECTOR_RTOL * max(
-        1.0, float(resolved))
-    _require(float(torch.linalg.vector_norm(
-        actual_vector - solved_vector).item()) <= materialized_limit,
+    materialization_error = float(torch.linalg.vector_norm(
+        actual_vector - solved_vector).item())
+    _require(materialization_error <= materialized_limit,
         f"{round_label}: materialized effective vector differs from the "
         "certified coefficient reconstruction")
     actual_norm = float(torch.linalg.vector_norm(actual_vector).item())
+    solved_norm_derived = float(torch.linalg.vector_norm(solved_vector).item())
+    direction_conditioning_norm = min(actual_norm, solved_norm_derived)
+    _require(
+        direction_conditioning_norm > materialized_limit,
+        f"{round_label}: materialized step is too small for direction "
+        f"certification ({direction_conditioning_norm:.6g} <= "
+        f"{materialized_limit:.6g})")
     _require(abs(actual_norm - float(resolved)) <= materialized_limit,
              f"{round_label}: materialized applied norm differs from the "
              "resolved step")
@@ -1041,6 +1109,15 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
                              / max(mixture_derived,
                                    float(arguments[
                                        "fedspan_mixture_norm_tol"])))
+    materialization_direction_uncertainty = (
+        2.0 * materialization_error / direction_conditioning_norm)
+    _require(
+        abs(materialized_scientific_achieved - scientific_achieved)
+        <= (direction_uncertainty
+            + materialization_direction_uncertainty + _SCALAR_RTOL),
+        f"{round_label}: materialized scientific direction differs from "
+        "the certified direction beyond conditioning and materialization "
+        "uncertainty")
     if policy == "minnorm":
         derived_optimum = math.sqrt(max(q_star, 0.0))
         _require(
@@ -1060,6 +1137,8 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
         "coefficient_error": coefficient_error,
         "recorded_vs_derived_vector_delta": vector_delta,
         "direction_uncertainty": direction_uncertainty,
+        "materialization_direction_uncertainty": (
+            materialization_direction_uncertainty),
         "scientific_achieved_cosine": scientific_achieved,
         "materialized_scientific_achieved_cosine": (
             materialized_scientific_achieved),
@@ -1263,14 +1342,21 @@ def _manifest_argument_parser():
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_mode", choices=["trainable-ab", "frozen-a"],
                         default="trainable-ab")
-    parser.add_argument("--frozen_a_row_scale")
+    parser.add_argument("--frozen_a_row_scale",
+                        choices=["unit", "peft-init"])
     parser.add_argument("--weighted", action="store_true")
-    parser.add_argument("--weight_by", default="examples")
+    parser.add_argument(
+        "--weight_by",
+        choices=["examples", "corpus", "maxmin", "rawmaxmin",
+                 "normmaxmin", "qffl", "afl", "mgda", "fednova"],
+        default="examples")
     parser.add_argument("--qffl_q", type=float, default=1.0)
     parser.add_argument("--afl_eta", type=float, default=0.1)
     parser.add_argument("--loss_sample", type=int, default=2048)
-    parser.add_argument("--fedspan_step_policy")
-    parser.add_argument("--fedspan_direction_policy")
+    parser.add_argument("--fedspan_step_policy",
+                        choices=["fixed", "median-active"])
+    parser.add_argument("--fedspan_direction_policy",
+                        choices=["minnorm", "maxmin-lp"])
     parser.add_argument("--fedspan_step_norm", type=float, default=None)
     parser.add_argument("--fedspan_active_abs_tol", type=float, default=1e-12)
     parser.add_argument("--fedspan_active_rel_tol", type=float, default=1e-8)
@@ -1291,10 +1377,20 @@ def _parse_manifest_argv(argv):
     known = {option for action in parser._actions
              for option in action.option_strings}
     tokens = list(argv)
-    first_flag = next(
-        (index for index, token in enumerate(tokens)
-         if isinstance(token, str) and token.startswith("--")), len(tokens))
-    command = tokens[first_flag:]
+    _require(len(tokens) >= 3,
+             "manifest command must contain an interpreter, script, and "
+             "driver arguments")
+    interpreter = tokens[0]
+    _require(isinstance(interpreter, str)
+             and Path(interpreter).parts[-3:] == (".venv", "bin", "python"),
+             "manifest command interpreter is not the canonical "
+             ".venv/bin/python E0 interpreter")
+    _require(tokens[1] == "federated_forgetting.py",
+             "manifest command script is not federated_forgetting.py")
+    command = tokens[2:]
+    _require(isinstance(command[0], str) and command[0].startswith("--"),
+             "manifest command has noncanonical tokens between its script "
+             "and driver flags")
     seen = set()
     for token in command:
         if not isinstance(token, str) or not token.startswith("--"):

@@ -1112,6 +1112,12 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
     materialization_direction_uncertainty = (
         2.0 * materialization_error / direction_conditioning_norm)
     _require(
+        materialization_direction_uncertainty < 1.0,
+        f"{round_label}: materialized direction uncertainty "
+        f"{materialization_direction_uncertainty:.6g} is non-informative; "
+        "the persisted step cannot support a scientific direction "
+        "certificate")
+    _require(
         abs(materialized_scientific_achieved - scientific_achieved)
         <= (direction_uncertainty
             + materialization_direction_uncertainty + _SCALAR_RTOL),
@@ -1130,6 +1136,12 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
                  <= direction_uncertainty + _SCALAR_RTOL,
                  f"{round_label}: normalized direction shortfall exceeds "
                  "the certified scale perturbation")
+        _require(
+            abs(materialized_scientific_achieved - derived_optimum)
+            <= (direction_uncertainty
+                + materialization_direction_uncertainty + _SCALAR_RTOL),
+            f"{round_label}: materialized scientific direction does not "
+            "meet the independent min-norm certificate")
     return {
         "status": status,
         "delta_gram": delta_gram,
@@ -1381,10 +1393,8 @@ def _parse_manifest_argv(argv):
              "manifest command must contain an interpreter, script, and "
              "driver arguments")
     interpreter = tokens[0]
-    _require(isinstance(interpreter, str)
-             and Path(interpreter).parts[-3:] == (".venv", "bin", "python"),
-             "manifest command interpreter is not the canonical "
-             ".venv/bin/python E0 interpreter")
+    _require(isinstance(interpreter, str),
+             "manifest command interpreter token is not text")
     _require(tokens[1] == "federated_forgetting.py",
              "manifest command script is not federated_forgetting.py")
     command = tokens[2:]
@@ -1408,7 +1418,23 @@ def _parse_manifest_argv(argv):
             f"manifest command cannot be parsed: {error}") from error
     _require(not unknown,
              f"manifest command has unknown arguments {unknown!r}")
-    return vars(namespace)
+    launched = vars(namespace)
+    data_root = Path(launched["data_root"]).expanduser()
+    if not data_root.is_absolute():
+        data_root = (Path.cwd() / data_root).resolve()
+    else:
+        data_root = data_root.resolve()
+    repository_root = data_root.parent
+    expected_interpreter = (
+        repository_root / ".venv" / "bin" / "python").resolve()
+    recorded_interpreter = Path(interpreter).expanduser()
+    if not recorded_interpreter.is_absolute():
+        recorded_interpreter = repository_root / recorded_interpreter
+    _require(
+        recorded_interpreter.resolve() == expected_interpreter,
+        "manifest command interpreter differs from the exact frozen E0 "
+        f"data_root/repository interpreter {expected_interpreter}")
+    return launched
 
 
 _EXECUTION_FIELDS = (

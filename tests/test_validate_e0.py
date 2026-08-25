@@ -12,6 +12,7 @@ import math
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -282,6 +283,68 @@ def negate_only_materialized_step(tmp_path, result_path, round_number=1):
     return result
 
 
+def rotate_only_materialized_step_45_degrees(
+        tmp_path, result_path, round_number=1):
+    """Rotate only the persisted step while preserving its small-step norm."""
+    payload = load_states(tmp_path, round_number)
+    with Path(result_path).open() as handle:
+        result = json.load(handle)
+    diagnostic = result["fedspan_diagnostics"][f"round_{round_number}"]
+    application = diagnostic["application"]
+    scale = float(diagnostic["module_scales"][driver_harness.MODULE])
+    broadcast_b = payload["broadcast"][driver_harness.B_KEY].double()
+    solved_block = scale * (
+        payload["global"][driver_harness.B_KEY].double() - broadcast_b)
+    solved_vector = solved_block.reshape(-1)
+    solved_norm = float(torch.linalg.vector_norm(solved_vector).item())
+    solved_unit = solved_vector / solved_norm
+
+    active = diagnostic["active_indices"]
+    client_blocks = []
+    client_norms = []
+    for name in result["slices"]:
+        block = scale * (
+            payload["clients"][name][driver_harness.B_KEY].double()
+            - broadcast_b)
+        client_blocks.append(block)
+        client_norms.append(float(torch.linalg.vector_norm(block).item()))
+    client_unit = (
+        client_blocks[active[0]].reshape(-1) / client_norms[active[0]])
+    perpendicular = -(client_unit - torch.dot(
+        client_unit, solved_unit) * solved_unit)
+    perpendicular /= torch.linalg.vector_norm(perpendicular)
+    rotated_vector = solved_norm * (
+        solved_unit + perpendicular) / math.sqrt(2.0)
+    rotated_block = rotated_vector.reshape_as(solved_block)
+    payload["global"][driver_harness.B_KEY] = (
+        broadcast_b + rotated_block / scale).float()
+    payload["global_state_sha256"] = state_dict_sha256(payload["global"])
+    torch.save(payload, state_path(tmp_path, round_number))
+
+    applied_block = scale * (
+        payload["global"][driver_harness.B_KEY].double() - broadcast_b)
+    applied_norm = float(torch.linalg.vector_norm(applied_block).item())
+    direction_cosines = [None] * len(result["slices"])
+    for index in active:
+        direction_cosines[index] = float(
+            torch.sum(client_blocks[index] * applied_block).item()
+            / (client_norms[index] * applied_norm))
+    application.update({
+        "applied_step_norm": applied_norm,
+        "max_effective_block_error": float(torch.max(torch.abs(
+            applied_block - solved_block)).item()),
+        "applied_direction_cosines": direction_cosines,
+        "applied_min_active_cosine": min(
+            value for value in direction_cosines if value is not None),
+        "applied_effective_step_sha256": direct_effective_step_sha256(
+            {driver_harness.MODULE: applied_block}),
+        "applied_state_sha256": payload["global_state_sha256"],
+    })
+    rewrite(result_path, result)
+    return result, float(torch.linalg.vector_norm(
+        applied_block - solved_block).item())
+
+
 def replace_with_genuine_invalid_step_fallback(
         monkeypatch, tmp_path, result_path):
     """Install a real production invalid-step result in a persisted round."""
@@ -293,14 +356,21 @@ def replace_with_genuine_invalid_step_fallback(
     # The driver's CLI excludes this defensive production branch. Force only
     # its deterministic median dependency to zero so the diagnostic itself is
     # still emitted by the real fedspan_delta_weights implementation.
-    monkeypatch.setattr(np, "median", lambda values: 0.0)
-    diagnostic = fedspan_delta_weights(
-        states, payload["broadcast"], scales,
-        step_norm=None, step_policy="median-active",
-        direction_policy="minnorm", active_abs_tol=1e-12,
-        active_rel_tol=1e-8, mixture_norm_tol=1e-6,
-        max_abs_delta_weight=None)
+    with monkeypatch.context() as local:
+        local.setattr(np, "median", lambda values: 0.0)
+        diagnostic = fedspan_delta_weights(
+            states, payload["broadcast"], scales,
+            step_norm=None, step_policy="median-active",
+            direction_policy="minnorm", active_abs_tol=1e-12,
+            active_rel_tol=1e-8, mixture_norm_tol=1e-6,
+            max_abs_delta_weight=None)
     assert diagnostic["status"] == "invalid_step_norm"
+    # Public CLI validation prevents a nonpositive fixed step from launching,
+    # but it is the independent, unpatched validator classification of this
+    # defensive record. Adapt only the method declaration after the genuine
+    # production fallback diagnostic has been emitted.
+    diagnostic["step_policy"] = "fixed"
+    diagnostic["declared_step_norm"] = 0.0
     global_state, application = apply_fedspan_update(
         payload["broadcast"], states, diagnostic, scales)
     diagnostic = {**diagnostic, "application": application}
@@ -309,6 +379,15 @@ def replace_with_genuine_invalid_step_fallback(
     torch.save(payload, state_path(tmp_path))
 
     result["fedspan_diagnostics"]["round_1"] = diagnostic
+    result["args"]["fedspan_step_policy"] = "fixed"
+    result["args"]["fedspan_step_norm"] = 0.0
+    result["method_contract"]["fedspan_step_policy"] = "fixed"
+    result["method_contract"]["fedspan_step_norm"] = 0.0
+    result["method_contract"]["run_configuration_sha256"] = (
+        driver_harness.driver._frozen_run_configuration_sha256(
+            SimpleNamespace(**result["args"]),
+            data_sha256=result["provenance"]["data_sha256"],
+            row_scale=result["method_contract"]["frozen_a_row_scale"]))
     rewrite(result_path, result)
     return result
 
@@ -528,6 +607,25 @@ def test_small_negated_materialized_step_is_refused(
     with pytest.raises(
             E0ValidationError,
             match="materialized.*direction|too small.*direction"):
+        validate_run_directory(tmp_path)
+
+
+def test_rotated_materialized_direction_with_noninformative_bound_is_refused(
+        monkeypatch, tmp_path):
+    _, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        extra=("--fedspan_step_policy", "fixed",
+               "--fedspan_step_norm", "6e-6"))
+    result, vector_error = rotate_only_materialized_step_45_degrees(
+        tmp_path, result_path)
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    assert vector_error < 5e-6
+    assert diagnostic["achieved_min_direction_cosine"] > 0.68
+    assert diagnostic["application"]["applied_min_active_cosine"] < 0.0
+
+    with pytest.raises(
+            E0ValidationError,
+            match="materialized.*certificate|non-informative"):
         validate_run_directory(tmp_path)
 
 
@@ -847,6 +945,20 @@ def test_genuine_pre_geometry_fallback_fields_are_bound(
         validate_run_directory(tmp_path)
 
 
+def test_genuine_invalid_step_fixture_is_independently_classified(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    result = replace_with_genuine_invalid_step_fallback(
+        monkeypatch, tmp_path, result_path)
+    assert result["fedspan_diagnostics"]["round_1"]["status"] == (
+        "invalid_step_norm")
+    assert float(np.median([1.0, 2.0, 3.0])) == 2.0
+
+    with pytest.raises(E0ValidationError, match="never applied a nonzero"):
+        validate_run_directory(tmp_path)
+
+
 @pytest.mark.parametrize(
     "status",
     ["no_active", "invalid_step_norm", "solver_error", "solver_failure",
@@ -1092,7 +1204,7 @@ def manifest_row(tmp_path, lora_mode="frozen-a", arm="normmaxmin",
         "arm": arm,
         "regime": "full",
         "max_steps": 0,
-        "argv": ["/test/FedCRAG/.venv/bin/python"]
+        "argv": [str(Path(tmp_path) / ".venv" / "bin" / "python")]
                 + driver_harness.build_argv(
                     tmp_path, lora_mode, arm, num_rounds=num_rounds)
                 + ["--seed", "42", "--max_steps_per_round", "0"],
@@ -1123,6 +1235,17 @@ def test_a_matching_manifest_row_validates(monkeypatch, tmp_path):
     assert report["launched"]["seed"] == 42
     assert report["launched"]["slices"] == list(driver_harness.SLICES)
     assert report["dataset_content_verified"] is True
+
+
+def test_manifest_relative_repo_interpreter_validates(monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    row["argv"][0] = ".venv/bin/python"
+
+    report = validate_run_directory(tmp_path, manifest_row=row)
+
+    assert report["manifest_verified"] is True
 
 
 @pytest.mark.parametrize(
@@ -1234,6 +1357,7 @@ def test_manifest_unknown_flag_is_refused(monkeypatch, tmp_path):
     ("index", "replacement", "message"),
     [
         (0, "/usr/bin/python", "interpreter"),
+        (0, "/tmp/unrelated/.venv/bin/python", "interpreter"),
         (1, "different_driver.py", "script"),
     ],
 )

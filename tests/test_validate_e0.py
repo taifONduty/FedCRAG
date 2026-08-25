@@ -7,18 +7,20 @@ case: the older hash gates cannot see it, so only the independent aggregate
 recomputation can.
 """
 import copy
+import hashlib
 import math
 import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import driver_harness  # noqa: E402
-from aggregation_schemes import state_dict_sha256  # noqa: E402
+from aggregation_schemes import ModuleScales, state_dict_sha256  # noqa: E402
 from validate_e0 import (  # noqa: E402
     E0ValidationError,
     validate_run_directory,
@@ -60,6 +62,166 @@ def resave_states(tmp_path, payload, round_number=1, repair_hashes=False):
 def rewrite(result_path, result):
     with Path(result_path).open("w") as handle:
         json.dump(result, handle)
+
+
+def direct_effective_step_sha256(blocks):
+    """Hash effective blocks directly; never reuse validator internals."""
+    digest = hashlib.sha256()
+    for name in sorted(blocks):
+        tensor = blocks[name].detach().cpu().double().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def repair_fedspan_solution(tmp_path, result_path, active_weights,
+                            round_number=1, coefficient_sign=1.0):
+    """Replace a round decision and independently repair all affected data."""
+    payload = load_states(tmp_path, round_number)
+    with Path(result_path).open() as handle:
+        result = json.load(handle)
+    label = f"round_{round_number}"
+    diagnostic = result["fedspan_diagnostics"][label]
+    application = diagnostic["application"]
+    active = list(diagnostic["active_indices"])
+    weights = np.asarray(active_weights, dtype=np.float64)
+    assert len(weights) == len(active)
+    assert np.min(weights) >= 0.0
+    assert np.sum(weights) == pytest.approx(1.0)
+
+    scale = float(diagnostic["module_scales"][driver_harness.MODULE])
+    broadcast_b = payload["broadcast"][driver_harness.B_KEY].double()
+    blocks = []
+    norms = []
+    for name in result["slices"]:
+        block = scale * (
+            payload["clients"][name][driver_harness.B_KEY].double()
+            - broadcast_b)
+        blocks.append(block)
+        norms.append(float(torch.linalg.vector_norm(block).item()))
+    unit = torch.stack([
+        blocks[index].reshape(-1) / norms[index] for index in active
+    ]).numpy()
+    cosine = unit @ unit.T
+    mixture_sq = float(weights @ cosine @ weights)
+    mixture_norm = math.sqrt(max(mixture_sq, 0.0))
+    payoffs = cosine @ weights
+    gamma = float(np.min(payoffs))
+    step_norm = float(diagnostic["resolved_step_norm"])
+    coefficients = [0.0] * len(result["slices"])
+    for local_index, client_index in enumerate(active):
+        coefficients[client_index] = float(
+            coefficient_sign * step_norm * weights[local_index]
+            / (norms[client_index] * mixture_norm))
+
+    global_b = broadcast_b.clone()
+    for coefficient, name in zip(coefficients, result["slices"]):
+        global_b += coefficient * (
+            payload["clients"][name][driver_harness.B_KEY].double()
+            - broadcast_b)
+    payload["global"][driver_harness.B_KEY] = global_b.float()
+    payload["global_state_sha256"] = state_dict_sha256(payload["global"])
+    torch.save(payload, state_path(tmp_path, round_number))
+
+    solved_block = sum(
+        coefficients[index] * blocks[index] for index in active)
+    applied_block = scale * (
+        payload["global"][driver_harness.B_KEY].double() - broadcast_b)
+    solved_hash = direct_effective_step_sha256(
+        {driver_harness.MODULE: solved_block})
+    applied_hash = direct_effective_step_sha256(
+        {driver_harness.MODULE: applied_block})
+    solved_norm = float(torch.linalg.vector_norm(solved_block).item())
+    applied_norm = float(torch.linalg.vector_norm(applied_block).item())
+    direction_cosines = [None] * len(result["slices"])
+    if applied_norm > 0.0:
+        for index in active:
+            direction_cosines[index] = float(
+                torch.sum(blocks[index] * applied_block).item()
+                / (norms[index] * applied_norm))
+
+    simplex = [0.0] * len(result["slices"])
+    for local_index, client_index in enumerate(active):
+        simplex[client_index] = float(weights[local_index])
+    diagnostic.update({
+        "simplex_weights": simplex,
+        "delta_weights": coefficients,
+        "proposed_delta_weights": coefficients.copy(),
+        "gamma": gamma,
+        "mixture_norm": mixture_norm,
+        "solver_objective_gamma": gamma,
+        "solver_simplex_residual": abs(float(np.sum(weights)) - 1.0),
+        "solver_constraint_violation": max(
+            0.0, float(np.max(gamma - payoffs))),
+        "achieved_min_direction_cosine": (
+            None if mixture_norm <= 0.0
+            else float(coefficient_sign * gamma / mixture_norm)),
+        "certified_min_direction_cosine": (
+            None if mixture_norm <= 0.0
+            else float(coefficient_sign * gamma / mixture_norm)),
+        "direction_solver_shortfall": float(
+            diagnostic["min_norm_value"]
+            - coefficient_sign * gamma / mixture_norm),
+        "max_abs_delta_weight": max(abs(value) for value in coefficients),
+        "proposed_max_abs_delta_weight": max(
+            abs(value) for value in coefficients),
+        "step_reconstruction_error": solved_norm - step_norm,
+        "solved_effective_step_sha256": solved_hash,
+    })
+    application.update({
+        "applied_step_norm": applied_norm,
+        "max_effective_block_error": float(
+            torch.max(torch.abs(applied_block - solved_block)).item()),
+        "applied_delta_weights": coefficients.copy(),
+        "applied_direction_cosines": direction_cosines,
+        "applied_min_active_cosine": min(
+            value for value in direction_cosines if value is not None),
+        "applied_effective_step_sha256": applied_hash,
+        "applied_state_sha256": payload["global_state_sha256"],
+    })
+    rewrite(result_path, result)
+    return result, payload
+
+
+def fabricate_zero_fallback(tmp_path, result_path, status, round_number=1):
+    """Rewrite one genuine success as a self-consistent zero fallback."""
+    payload = load_states(tmp_path, round_number)
+    with Path(result_path).open() as handle:
+        result = json.load(handle)
+    label = f"round_{round_number}"
+    diagnostic = result["fedspan_diagnostics"][label]
+    application = diagnostic["application"]
+    payload["global"] = {
+        key: value.clone() for key, value in payload["broadcast"].items()
+    }
+    payload["global_state_sha256"] = state_dict_sha256(payload["global"])
+    torch.save(payload, state_path(tmp_path, round_number))
+    zero_block = torch.zeros_like(
+        payload["broadcast"][driver_harness.B_KEY], dtype=torch.float64)
+    zero_hash = direct_effective_step_sha256(
+        {driver_harness.MODULE: zero_block})
+    zeros = [0.0] * len(result["slices"])
+    diagnostic.update({
+        "status": status,
+        "fallback": "zero_update",
+        "delta_weights": zeros,
+        "proposed_delta_weights": zeros,
+        "max_abs_delta_weight": 0.0,
+        "proposed_max_abs_delta_weight": 0.0,
+        "solved_effective_step_sha256": None,
+    })
+    application.update({
+        "applied_step_norm": 0.0,
+        "max_effective_block_error": 0.0,
+        "applied_delta_weights": zeros,
+        "applied_direction_cosines": [None] * len(result["slices"]),
+        "applied_min_active_cosine": None,
+        "applied_effective_step_sha256": zero_hash,
+        "applied_state_sha256": payload["global_state_sha256"],
+    })
+    rewrite(result_path, result)
 
 
 # --------------------------------------------------------- the clean baseline
@@ -250,6 +412,310 @@ def test_unclean_provenance_is_refused(monkeypatch, tmp_path, commit):
 # ------------------------------------------------------ D1 direction policy
 
 
+def test_repaired_hash_opposite_direction_is_refused(monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    with result_path.open() as handle:
+        before = json.load(handle)
+    weights = before["fedspan_diagnostics"]["round_1"]["simplex_weights"]
+    repair_fedspan_solution(
+        tmp_path, result_path, weights, coefficient_sign=-1.0)
+
+    with pytest.raises(E0ValidationError, match="direction|coefficient"):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize("direction_policy", ["minnorm", "maxmin-lp"])
+def test_repaired_hash_suboptimal_direction_is_refused(
+        monkeypatch, tmp_path, direction_policy):
+    _, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        direction_policy=direction_policy)
+    repair_fedspan_solution(tmp_path, result_path, [1.0, 0.0, 0.0])
+
+    with pytest.raises(E0ValidationError, match="objective suboptimality"):
+        validate_run_directory(tmp_path)
+
+
+def test_repaired_near_balanced_antipodal_success_is_refused(
+        monkeypatch, tmp_path):
+    directions = ([1.0, 0.0], [-1.0, 0.0], [0.0, 0.0])
+    _, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        clients=clients_from_unit_directions(directions))
+    result, _ = repair_fedspan_solution(
+        tmp_path, result_path, [0.500006, 0.499994])
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    diagnostic["status"] = "optimal"
+    diagnostic["fallback"] = None
+    rewrite(result_path, result)
+    assert diagnostic["achieved_min_direction_cosine"] == pytest.approx(-1.0)
+
+    with pytest.raises(
+            E0ValidationError,
+            match="objective suboptimality|normalized direction|certificate|"
+                  "boundary-indeterminate"):
+        validate_run_directory(tmp_path)
+
+
+def test_near_antipodal_objective_passes_but_certificate_refuses(
+        monkeypatch, tmp_path):
+    """A q-optimal repaired record still needs its directional certificate."""
+    directions = [
+        [0.6684167496930513, 0.4182758748494597, 0.6150319839233531],
+        [-0.9083004866545865, 0.2549551570183043, 0.3316445293575836],
+        [-0.4358725723652378, -0.061135324061740555,
+         -0.8979296034832444],
+    ]
+    _, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        direction_policy="minnorm",
+        clients=clients_from_unit_directions(directions))
+    weights = [
+        0.4446213294146499,
+        0.13892965492126302,
+        0.41644901566408704,
+    ]
+    result, _ = repair_fedspan_solution(tmp_path, result_path, weights)
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    active = diagnostic["active_indices"]
+    cosine = np.asarray(
+        diagnostic["cosine_gram_active"], dtype=np.float64)
+    active_weights = np.asarray(
+        [diagnostic["simplex_weights"][index] for index in active])
+    recorded_q = float(active_weights @ cosine @ active_weights)
+    optimal_q = float(diagnostic["min_norm_value"]) ** 2
+
+    assert abs(recorded_q - optimal_q) <= 1e-10
+    assert min(cosine[np.triu_indices_from(cosine, k=1)]) < -0.85
+    with pytest.raises(E0ValidationError, match="certificate"):
+        validate_run_directory(tmp_path)
+
+
+def test_exact_antipodal_fallback_is_boundary_indeterminate(
+        monkeypatch, tmp_path):
+    directions = ([1.0, 0.0], [-1.0, 0.0], [0.0, 0.0])
+    result, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        clients=clients_from_unit_directions(directions))
+    assert result["fedspan_diagnostics"]["round_1"]["status"] == (
+        "near_cancellation")
+
+    with pytest.raises(E0ValidationError, match="boundary-indeterminate"):
+        validate_run_directory(tmp_path)
+
+
+def aligned_clients():
+    base = driver_harness.broadcast_state()
+    states = {}
+    for multiplier, name in enumerate(driver_harness.SLICES, start=1):
+        value = base[driver_harness.B_KEY].clone()
+        value[0, 0] = float(multiplier)
+        states[name] = {
+            driver_harness.A_KEY: base[driver_harness.A_KEY].clone(),
+            driver_harness.B_KEY: value,
+        }
+    return states
+
+
+def clients_from_unit_directions(directions):
+    base = driver_harness.broadcast_state()
+    states = {}
+    for name, direction in zip(driver_harness.SLICES, directions):
+        value = base[driver_harness.B_KEY].clone()
+        value[0, :len(direction)] = torch.tensor(direction)
+        states[name] = {
+            driver_harness.A_KEY: base[driver_harness.A_KEY].clone(),
+            driver_harness.B_KEY: value,
+        }
+    return states
+
+
+@pytest.mark.parametrize("direction_policy", ["minnorm", "maxmin-lp"])
+def test_nonunique_optimal_face_accepts_alternate_weights(
+        monkeypatch, tmp_path, direction_policy):
+    _, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        direction_policy=direction_policy, clients=aligned_clients())
+    repair_fedspan_solution(tmp_path, result_path, [0.2, 0.3, 0.5])
+
+    report = validate_run_directory(tmp_path)
+
+    assert report["fedspan_applied_rounds"] == 1
+
+
+def test_direction_quantities_remain_numerically_distinct(
+        monkeypatch, tmp_path):
+    directions = [
+        [0.7011839609197387, -0.39470784729742453,
+         0.5883180802160277, 0.08017858019238598],
+        [0.885407186197653, -0.381415825422982,
+         -0.1801954606651313, 0.19520675885363425],
+        [-0.727595824060434, 0.27288791414731695,
+         0.5081307013877858, 0.3714023336347008],
+    ]
+    result, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        direction_policy="maxmin-lp",
+        clients=clients_from_unit_directions(directions))
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    q_star = float(diagnostic["min_norm_value"]) ** 2
+    quantities = [
+        q_star,
+        float(diagnostic["min_norm_value"]),
+        float(diagnostic["solver_objective_gamma"]),
+        float(diagnostic["achieved_min_direction_cosine"]),
+    ]
+    assert min(abs(left - right)
+               for index, left in enumerate(quantities)
+               for right in quantities[index + 1:]) > 0.03
+
+    validate_run_directory(tmp_path)
+
+
+def test_negative_min_norm_value_is_not_hidden_by_squaring(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    with result_path.open() as handle:
+        result = json.load(handle)
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    diagnostic["min_norm_value"] = -float(diagnostic["min_norm_value"])
+    diagnostic["direction_solver_shortfall"] = (
+        diagnostic["min_norm_value"]
+        - diagnostic["achieved_min_direction_cosine"])
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="min_norm_value"):
+        validate_run_directory(tmp_path)
+
+
+def test_genuine_singleton_direction_status_is_certified(
+        monkeypatch, tmp_path):
+    base = driver_harness.broadcast_state()
+    clients = {
+        name: {key: value.clone() for key, value in base.items()}
+        for name in driver_harness.SLICES
+    }
+    clients["c0"][driver_harness.B_KEY][0, 0] = 1.0
+    result, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin", clients=clients)
+    assert result["fedspan_diagnostics"]["round_1"]["status"] == "singleton"
+
+    validate_run_directory(tmp_path)
+
+
+def test_genuine_coefficient_limit_fallback_is_certified_before_campaign_gate(
+        monkeypatch, tmp_path):
+    result, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        extra=("--fedspan_max_abs_delta_weight", "0.01"))
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    assert diagnostic["status"] == "coefficient_limit"
+
+    with pytest.raises(E0ValidationError, match="never applied a nonzero"):
+        validate_run_directory(tmp_path)
+
+
+def multi_module_peft_fixture():
+    second_module = "encoder.layer0.value"
+    second_a = f"{second_module}.lora_A.weight"
+    second_b = f"{second_module}.lora_B.weight"
+    stored_scales = {
+        driver_harness.MODULE: float(torch.tensor(0.57735026).item()),
+        second_module: float(torch.tensor(0.6123457).item()),
+    }
+    recorded_scales = {
+        name: value * (1.0 + 2e-9)
+        for name, value in stored_scales.items()
+    }
+    broadcast = {
+        driver_harness.A_KEY: stored_scales[driver_harness.MODULE]
+        * torch.eye(16),
+        driver_harness.B_KEY: torch.zeros(3, 16),
+        second_a: stored_scales[second_module] * torch.eye(16),
+        second_b: torch.zeros(2, 16),
+    }
+    clients = {}
+    for index, name in enumerate(driver_harness.SLICES):
+        state = {key: value.clone() for key, value in broadcast.items()}
+        state[driver_harness.B_KEY][:, :2] = torch.tensor(
+            driver_harness.CLIENT_B_BLOCKS[name])
+        state[second_b][0, :3] = torch.tensor([
+            [0.3, -0.1, 0.2],
+            [-0.2, 0.4, 0.1],
+            [0.1, 0.2, -0.3],
+        ][index])
+        clients[name] = state
+    scales = ModuleScales({
+        name: 2.0 * value for name, value in recorded_scales.items()
+    })
+    for name, value in recorded_scales.items():
+        scales.records[name] = {
+            "peft_scale": 2.0,
+            "row_scale_mode": "peft-init",
+            "row_scale_c": value,
+            "measured_init_row_rms": value,
+            "geometry_scale": 2.0 * value,
+        }
+    return broadcast, clients, scales
+
+
+def test_multimodule_peft_init_scale_perturbation_passes(
+        monkeypatch, tmp_path):
+    broadcast, clients, scales = multi_module_peft_fixture()
+    driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        row_scale="peft-init", broadcast=broadcast, clients=clients,
+        scale_override=scales)
+
+    report = validate_run_directory(tmp_path)
+
+    residuals = report["fedspan_direction_residuals"]["round_1"]
+    assert residuals["delta_gram"] >= 0.0
+    assert residuals["coefficient_error"] < 1e-10
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["no_active", "invalid_step_norm", "solver_error", "solver_failure",
+     "solver_invalid", "near_cancellation", "coefficient_limit",
+     "reconstruction_failure"],
+)
+def test_repaired_fabricated_fallback_status_is_refused(
+        monkeypatch, tmp_path, status):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin", num_rounds=2)
+    fabricate_zero_fallback(tmp_path, result_path, status, round_number=1)
+
+    with pytest.raises(E0ValidationError, match="fallback|status"):
+        validate_run_directory(tmp_path)
+
+
+def test_repaired_singleton_status_for_multiple_active_clients_is_refused(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin", num_rounds=2)
+    with result_path.open() as handle:
+        result = json.load(handle)
+    result["fedspan_diagnostics"]["round_1"]["status"] = "singleton"
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="fallback|status"):
+        validate_run_directory(tmp_path)
+
+
+def test_two_round_repaired_fabricated_fallback_is_refused(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin", num_rounds=2)
+    fabricate_zero_fallback(
+        tmp_path, result_path, "solver_failure", round_number=1)
+
+    with pytest.raises(E0ValidationError, match="fallback|status"):
+        validate_run_directory(tmp_path)
+
+
 def test_implicit_direction_policy_is_refused(monkeypatch, tmp_path):
     """A paper-grade run may not rely on the compatibility default."""
     _, result_path = build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
@@ -395,6 +861,57 @@ def test_recorded_weights_that_do_not_cover_every_client_are_refused(
         validate_run_directory(tmp_path)
 
 
+def test_repaired_hash_lora_rank_shape_mismatch_is_refused(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    payload = load_states(tmp_path)
+    for state in [payload["broadcast"], payload["global"],
+                  *payload["clients"].values()]:
+        state[driver_harness.A_KEY] = state[driver_harness.A_KEY][:-1, :]
+        state[driver_harness.B_KEY] = state[driver_harness.B_KEY][:, :-1]
+    resave_states(tmp_path, payload, repair_hashes=True)
+
+    with result_path.open() as handle:
+        result = json.load(handle)
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    application = diagnostic["application"]
+    application["broadcast_state_sha256"] = payload["broadcast_state_sha256"]
+    application["client_state_sha256"] = [
+        state_dict_sha256(payload["clients"][name])
+        for name in result["slices"]
+    ]
+    application["applied_state_sha256"] = payload["global_state_sha256"]
+    scale = diagnostic["module_scales"][driver_harness.MODULE]
+    broadcast_b = payload["broadcast"][driver_harness.B_KEY].double()
+    solved = sum(
+        float(coefficient) * scale * (
+            payload["clients"][name][driver_harness.B_KEY].double()
+            - broadcast_b)
+        for coefficient, name in zip(
+            diagnostic["delta_weights"], result["slices"])
+    )
+    applied = scale * (
+        payload["global"][driver_harness.B_KEY].double() - broadcast_b)
+    diagnostic["solved_effective_step_sha256"] = direct_effective_step_sha256(
+        {driver_harness.MODULE: solved})
+    application["applied_effective_step_sha256"] = direct_effective_step_sha256(
+        {driver_harness.MODULE: applied})
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="lora_rank|rank"):
+        validate_run_directory(tmp_path)
+
+
+def test_unit_labeled_nonunit_frozen_a_is_refused(monkeypatch, tmp_path):
+    _, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        row_scale="unit", row_scale_c=1.25)
+
+    with pytest.raises(E0ValidationError, match="unit|row scale"):
+        validate_run_directory(tmp_path)
+
+
 def manifest_row(tmp_path, lora_mode="frozen-a", arm="normmaxmin",
                  num_rounds=1):
     return {
@@ -402,6 +919,8 @@ def manifest_row(tmp_path, lora_mode="frozen-a", arm="normmaxmin",
         "commit": driver_harness.CLEAN_COMMIT,
         "coordinate": lora_mode,
         "arm": arm,
+        "regime": "full",
+        "max_steps": 0,
         "argv": driver_harness.build_argv(
             tmp_path, lora_mode, arm, num_rounds=num_rounds)
                 + ["--seed", "42", "--max_steps_per_round", "0"],
@@ -431,6 +950,163 @@ def test_a_matching_manifest_row_validates(monkeypatch, tmp_path):
     assert report["manifest_verified"] is True
     assert report["launched"]["seed"] == 42
     assert report["launched"]["slices"] == list(driver_harness.SLICES)
+    assert report["dataset_content_verified"] is True
+
+
+@pytest.mark.parametrize(
+    ("flag", "replacement"),
+    [
+        ("--model", "different-model"),
+        ("--metrics", "recall@10"),
+        ("--seed", "7"),
+        ("--num_rounds", "9"),
+        ("--local_epochs", "2"),
+        ("--lora_rank", "8"),
+        ("--lora_mode", "trainable-ab"),
+        ("--batch_size", "64"),
+        ("--eval_batch_size", "64"),
+        ("--lr", "3e-5"),
+        ("--max_steps_per_round", "7"),
+        ("--data_root", "missing-data-root"),
+        ("--frozen_a_row_scale", "peft-init"),
+        ("--fedspan_step_policy", "fixed"),
+        ("--fedspan_direction_policy", "maxmin-lp"),
+        ("--fedspan_active_abs_tol", "2e-12"),
+        ("--fedspan_active_rel_tol", "2e-8"),
+        ("--fedspan_mixture_norm_tol", "2e-6"),
+        ("--weight_by", "rawmaxmin"),
+        ("--out", "different-output"),
+    ],
+)
+def test_every_manifest_value_drift_is_field_specifically_refused(
+        monkeypatch, tmp_path, flag, replacement):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    drifted = manifest_row(tmp_path)
+    if flag not in drifted["argv"]:
+        insertion = 1
+        drifted["argv"][insertion:insertion] = [flag, replacement]
+    else:
+        drifted["argv"][drifted["argv"].index(flag) + 1] = replacement
+
+    field = flag.removeprefix("--")
+    with pytest.raises(E0ValidationError, match=field):
+        validate_run_directory(tmp_path, manifest_row=drifted)
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected_field"),
+    [
+        ("--weighted", "weighted"),
+        ("--save_states", "save_states"),
+        ("--no_grad_ckpt", "no_grad_ckpt"),
+        ("--allow_dirty_provenance", "allow_dirty_provenance"),
+    ],
+)
+def test_manifest_boolean_drift_is_field_specifically_refused(
+        monkeypatch, tmp_path, flag, expected_field):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    drifted = manifest_row(tmp_path)
+    if flag in drifted["argv"]:
+        drifted["argv"].remove(flag)
+    else:
+        drifted["argv"].append(flag)
+
+    with pytest.raises(E0ValidationError, match=expected_field):
+        validate_run_directory(tmp_path, manifest_row=drifted)
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--qffl_q", "2"),
+        ("--afl_eta", "0.2"),
+        ("--loss_sample", "1024"),
+        ("--fedspan_step_norm", "0.1"),
+        ("--fedspan_max_abs_delta_weight", "10"),
+    ],
+)
+def test_manifest_optional_value_drift_is_field_specifically_refused(
+        monkeypatch, tmp_path, flag, value):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    drifted = manifest_row(tmp_path)
+    drifted["argv"].extend([flag, value])
+
+    with pytest.raises(E0ValidationError, match=flag.removeprefix("--")):
+        validate_run_directory(tmp_path, manifest_row=drifted)
+
+
+def test_manifest_duplicate_flag_is_refused(monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    drifted = manifest_row(tmp_path)
+    drifted["argv"].extend(["--seed", "42"])
+
+    with pytest.raises(E0ValidationError, match="duplicate.*--seed"):
+        validate_run_directory(tmp_path, manifest_row=drifted)
+
+
+def test_manifest_unknown_flag_is_refused(monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    drifted = manifest_row(tmp_path)
+    drifted["argv"].append("--unknown_e0_flag")
+
+    with pytest.raises(E0ValidationError, match="unknown.*--unknown_e0_flag"):
+        validate_run_directory(tmp_path, manifest_row=drifted)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("coordinate", "trainable-ab"), ("arm", "rawmaxmin"),
+     ("regime", "capped-500"), ("max_steps", 500)],
+)
+def test_manifest_row_metadata_drift_is_refused(
+        monkeypatch, tmp_path, field, value):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    drifted = manifest_row(tmp_path)
+    drifted[field] = value
+
+    with pytest.raises(E0ValidationError, match=field):
+        validate_run_directory(tmp_path, manifest_row=drifted)
+
+
+def test_repaired_configuration_hash_drift_is_refused(monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    with result_path.open() as handle:
+        result = json.load(handle)
+    result["method_contract"]["run_configuration_sha256"] = "0" * 64
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="run_configuration_sha256"):
+        validate_run_directory(tmp_path, manifest_row=manifest_row(tmp_path))
+
+
+def test_archived_data_content_drift_is_refused(monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    corpus_path = tmp_path / "archived_data" / "c1" / "corpus.jsonl"
+    corpus_path.write_text(json.dumps({
+        "_id": "d0", "text": "tampered", "title": None,
+    }) + "\n")
+
+    with pytest.raises(E0ValidationError, match="dataset content|data_sha256"):
+        validate_run_directory(tmp_path, manifest_row=manifest_row(tmp_path))
+
+
+def test_missing_archived_data_is_refused(monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    root = tmp_path / "archived_data"
+    root.rename(tmp_path / "unavailable_archived_data")
+
+    with pytest.raises(E0ValidationError, match="dataset-content|data root"):
+        validate_run_directory(tmp_path, manifest_row=manifest_row(tmp_path))
 
 
 @pytest.mark.parametrize(

@@ -116,15 +116,20 @@ def test_driver_normmaxmin_dispatch_persists_exact_round_record(
     akey = f"{module}.lora_A.weight"
     bkey = f"{module}.lora_B.weight"
     broadcast = {
-        akey: torch.tensor([[1.0, 0.0, 0.0],
-                            [0.0, 1.0, 0.0]]),
-        bkey: torch.zeros(3, 2),
+        akey: torch.eye(16),
+        bkey: torch.zeros(3, 16),
     }
+    c0_b = broadcast[bkey].clone()
+    c1_b = broadcast[bkey].clone()
+    c0_b[:, :2] = torch.tensor(
+        [[1.0, 0.2], [0.1, 0.3], [0.2, 0.5]])
+    c1_b[:, :2] = torch.tensor(
+        [[0.2, 0.8], [0.4, 0.1], [0.7, 0.2]])
     clients = {
         "c0": {akey: broadcast[akey].clone(),
-               bkey: torch.tensor([[1.0, 0.2], [0.1, 0.3], [0.2, 0.5]])},
+               bkey: c0_b},
         "c1": {akey: broadcast[akey].clone(),
-               bkey: torch.tensor([[0.2, 0.8], [0.4, 0.1], [0.7, 0.2]])},
+               bkey: c1_b},
     }
 
     monkeypatch.setattr(driver, "get_git_commit", lambda: "abc123def456")
@@ -136,7 +141,8 @@ def test_driver_normmaxmin_dispatch_persists_exact_round_record(
     monkeypatch.setattr(
         driver, "resolve_local", lambda name: ("fake-model", "", "", False))
     monkeypatch.setattr(
-        driver, "new_model", lambda *args, **kwargs: (object(), {module: 2.0}))
+        driver, "new_model", lambda *args, **kwargs: (
+            object(), driver_harness.module_scales("frozen-a")))
     monkeypatch.setattr(
         driver, "get_adapter_state",
         lambda model: {key: value.clone() for key, value in broadcast.items()})

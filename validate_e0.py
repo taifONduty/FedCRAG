@@ -9,6 +9,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import re
 import statistics
 import subprocess
@@ -1056,6 +1057,11 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
         f"{round_label}: maximum applied coefficient differs")
 
     if expected_fallback is not None:
+        _require(
+            diagnostic.get("solved_effective_step_sha256") is None,
+            f"{round_label}: {expected_status} fallback has an unexpected "
+            "solved_effective_step_sha256; production records no solved step "
+            "hash for this zero-update branch")
         return {
             "status": status,
             "delta_gram": delta_gram,
@@ -1681,9 +1687,11 @@ def _validate_configuration_hash(result, arguments, data_sha256):
 
 
 def _git_capture(source_root, *arguments, text=False):
+    environment = dict(os.environ)
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     completed = subprocess.run(
         ["git", *arguments], cwd=source_root, capture_output=True, text=text,
-        check=False)
+        check=False, env=environment)
     detail = completed.stderr.strip() if text else (
         completed.stderr.decode("utf-8", errors="replace").strip())
     _require(completed.returncode == 0,
@@ -1709,8 +1717,10 @@ def _validate_execution_source(result, row, execution_source_root):
     full_commit = _git_capture(
         source_root, "rev-parse", "--verify", f"{commit}^{{commit}}",
         text=True).strip()
-    _require(bool(full_commit),
-             f"execution source does not contain recorded commit {commit}")
+    _require(re.fullmatch(r"[0-9a-f]{40,64}", full_commit) is not None
+             and full_commit.startswith(commit),
+             f"execution source resolved OID {full_commit!r} does not start "
+             f"with the recorded commit prefix {commit}")
     provenance = result.get("provenance") or {}
     _require(provenance.get("git_commit") == commit,
              "result provenance git_commit differs from the recorded run "
@@ -1739,15 +1749,16 @@ def _validate_execution_source(result, row, execution_source_root):
     _require(script.resolve() == expected_script,
              "manifest command script does not resolve to the frozen E0 "
              f"source object at {expected_script}")
-    expected_interpreter = (
-        source_root / ".venv" / "bin" / "python").resolve()
+    expected_interpreter = Path(os.path.abspath(
+        source_root / ".venv" / "bin" / "python"))
     interpreter = Path(tokens[0]).expanduser()
     if not interpreter.is_absolute():
         _require(interpreter == Path(".venv/bin/python"),
                  "manifest command relative interpreter must be exactly "
                  ".venv/bin/python")
         interpreter = source_root / interpreter
-    _require(interpreter.resolve() == expected_interpreter,
+    recorded_interpreter = Path(os.path.abspath(interpreter))
+    _require(recorded_interpreter == expected_interpreter,
              "manifest command interpreter differs from the exact frozen E0 "
              f"execution source interpreter {expected_interpreter}")
     return source_root
@@ -1835,10 +1846,11 @@ def _load_manifest_row(manifest_path, run_id):
              f"manifest schema is {manifest.get('schema')!r}, expected "
              f"{_MANIFEST_SCHEMA!r}")
     commit = manifest.get("commit")
-    _require(isinstance(commit, str) and commit != "unknown"
-             and not commit.endswith("-dirty")
-             and not commit.endswith("-unknown-worktree"),
-             f"manifest does not have clean Git provenance: {commit!r}")
+    _require(isinstance(commit, str)
+             and re.fullmatch(r"[0-9a-f]{12}", commit) is not None,
+             "manifest does not have clean Git provenance: execution commit "
+             "must be exactly 12 lowercase hex "
+             f"characters, recorded {commit!r}")
     rows = [row for row in manifest["rows"] if row["run_id"] == run_id]
     _require(len(rows) == 1,
              f"manifest has {len(rows)} rows for run id '{run_id}'")
@@ -1906,10 +1918,11 @@ def validate_run_directory(run_directory, manifest_row=None,
 
     commit = result.get("commit")
     _require(
-        isinstance(commit, str) and commit != "unknown"
-        and not commit.endswith("-dirty")
-        and not commit.endswith("-unknown-worktree"),
-        "result does not have clean Git provenance")
+        isinstance(commit, str)
+        and re.fullmatch(r"[0-9a-f]{12}", commit) is not None,
+        "result does not have clean Git provenance: execution commit must be "
+        "exactly 12 lowercase hex "
+        f"characters, recorded {commit!r}")
 
     num_rounds = int(result["num_rounds"])
     state_paths = sorted(run_directory.glob("states_*.pt"))

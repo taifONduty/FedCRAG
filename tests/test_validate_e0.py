@@ -897,6 +897,26 @@ def test_coefficient_limit_fallback_solver_metadata_is_bound(
         validate_run_directory(tmp_path)
 
 
+def test_coefficient_limit_fallback_cannot_claim_a_solved_step_hash(
+        monkeypatch, tmp_path):
+    result, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        extra=("--fedspan_max_abs_delta_weight", "0.01"))
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    assert diagnostic["status"] == "coefficient_limit"
+    zero = torch.zeros_like(
+        load_states(tmp_path)["broadcast"][driver_harness.B_KEY],
+        dtype=torch.float64)
+    diagnostic["solved_effective_step_sha256"] = (
+        direct_effective_step_sha256({driver_harness.MODULE: zero}))
+    rewrite(result_path, result)
+
+    with pytest.raises(
+            E0ValidationError,
+            match="fallback.*solved_effective_step_sha256|solved step hash"):
+        validate_run_directory(tmp_path)
+
+
 def multi_module_peft_fixture():
     second_module = "encoder.layer0.value"
     second_a = f"{second_module}.lora_A.weight"
@@ -1313,12 +1333,17 @@ def prepare_execution_source(tmp_path):
         subprocess.run(
             ["git", "commit", "-q", "-m", "frozen fixture"],
             cwd=root, check=True)
-    commit = subprocess.run(
+        (root / ".venv" / "bin").mkdir(parents=True)
+        (root / "base-python").write_text("fixture interpreter\n")
+        (root / ".venv" / "bin" / "python").symlink_to(
+            Path("..") / ".." / "base-python")
+    full_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=root, check=True,
         text=True, capture_output=True).stdout.strip()
+    commit = full_commit[:12]
     source_hashes = {
         name: hashlib.sha256(subprocess.run(
-            ["git", "show", f"{commit}:{name}"], cwd=root, check=True,
+            ["git", "show", f"{full_commit}:{name}"], cwd=root, check=True,
             capture_output=True).stdout).hexdigest()
         for name in SOURCE_FILES
     }
@@ -1343,7 +1368,7 @@ def manifest_row(tmp_path, lora_mode="frozen-a", arm="normmaxmin",
     source_root = prepare_execution_source(tmp_path)
     commit = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=source_root, check=True,
-        text=True, capture_output=True).stdout.strip()
+        text=True, capture_output=True).stdout.strip()[:12]
     return {
         "run_id": tmp_path.name,
         "commit": commit,
@@ -1465,6 +1490,125 @@ def test_manifest_source_anchor_must_contain_recorded_commit(
     with pytest.raises(E0ValidationError, match="recorded commit|Git"):
         _validate_run_directory(
             tmp_path, manifest_row=row, execution_source_root=unrelated)
+
+
+def test_manifest_commit_identity_must_be_frozen_12_hex(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    source_root = tmp_path / "execution-source"
+    with result_path.open() as handle:
+        result = json.load(handle)
+    row["commit"] = "HEAD"
+    result["commit"] = "HEAD"
+    result["provenance"]["git_commit"] = "HEAD"
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="12 lowercase hex"):
+        _validate_run_directory(
+            tmp_path, manifest_row=row,
+            execution_source_root=source_root)
+
+
+def test_manifest_hex_named_branch_cannot_alias_recorded_commit(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    prefix = row["commit"]
+    unrelated = tmp_path / "branch-alias-source"
+    unrelated.mkdir()
+    for index, name in enumerate(SOURCE_FILES):
+        (unrelated / name).write_text(f"unrelated {index}: {name}\n")
+    subprocess.run(["git", "init", "-q"], cwd=unrelated, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "fixture@example.invalid"],
+        cwd=unrelated, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "E0 Fixture"],
+        cwd=unrelated, check=True)
+    subprocess.run(["git", "add", *SOURCE_FILES], cwd=unrelated, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "unrelated fixture"],
+        cwd=unrelated, check=True)
+    subprocess.run(["git", "branch", "-m", prefix], cwd=unrelated, check=True)
+    alias_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=unrelated, check=True,
+        text=True, capture_output=True).stdout.strip()
+    assert not alias_commit.startswith(prefix)
+    with result_path.open() as handle:
+        result = json.load(handle)
+    result["provenance"]["source_sha256"] = {
+        name: hashlib.sha256(subprocess.run(
+            ["git", "show", f"{alias_commit}:{name}"], cwd=unrelated,
+            check=True, capture_output=True).stdout).hexdigest()
+        for name in SOURCE_FILES
+    }
+    row["argv"][0] = str(unrelated / ".venv" / "bin" / "python")
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="OID.*prefix|recorded commit"):
+        _validate_run_directory(
+            tmp_path, manifest_row=row,
+            execution_source_root=unrelated)
+
+
+def test_manifest_source_hash_ignores_git_replacement_objects(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    source_root = tmp_path / "execution-source"
+    original = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source_root, check=True,
+        text=True, capture_output=True).stdout.strip()
+    for index, name in enumerate(SOURCE_FILES):
+        (source_root / name).write_text(f"replacement {index}: {name}\n")
+    subprocess.run(["git", "add", *SOURCE_FILES], cwd=source_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "replacement fixture"],
+        cwd=source_root, check=True)
+    replacement = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source_root, check=True,
+        text=True, capture_output=True).stdout.strip()
+    subprocess.run(
+        ["git", "replace", original, replacement], cwd=source_root,
+        check=True)
+    with result_path.open() as handle:
+        result = json.load(handle)
+    result["provenance"]["source_sha256"] = {
+        name: hashlib.sha256(subprocess.run(
+            ["git", "show", f"{replacement}:{name}"], cwd=source_root,
+            check=True, capture_output=True).stdout).hexdigest()
+        for name in SOURCE_FILES
+    }
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="source_sha256"):
+        _validate_run_directory(
+            tmp_path, manifest_row=row,
+            execution_source_root=source_root)
+
+
+def test_manifest_interpreter_symlink_target_name_is_refused(
+        monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    source_root = tmp_path / "execution-source"
+    interpreter = source_root / ".venv" / "bin" / "python"
+    assert interpreter.is_symlink()
+    assert interpreter.resolve() == (source_root / "base-python").resolve()
+    row["argv"][0] = str(source_root / "base-python")
+
+    with pytest.raises(E0ValidationError, match="interpreter"):
+        _validate_run_directory(
+            tmp_path, manifest_row=row,
+            execution_source_root=source_root)
 
 
 @pytest.mark.parametrize(

@@ -917,6 +917,109 @@ def test_coefficient_limit_fallback_cannot_claim_a_solved_step_hash(
         validate_run_directory(tmp_path)
 
 
+def install_genuine_reconstruction_failure(
+        monkeypatch, tmp_path, direction_policy="minnorm"):
+    healthy_clients = genuine_no_active_clients()
+    healthy_clients["c0"][driver_harness.B_KEY][0, 0] = 1.0
+    healthy_clients["c1"][driver_harness.B_KEY][0, 0] = 0.75
+    healthy_clients["c2"][driver_harness.B_KEY][0, 0] = 0.6
+    _, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin", num_rounds=2,
+        direction_policy=direction_policy, clients=healthy_clients,
+        extra=("--fedspan_step_policy", "fixed",
+               "--fedspan_step_norm", "1.0"))
+    payload = load_states(tmp_path, round_number=1)
+    a = 1.5e-5
+    b = math.sqrt(1.0 - a * a)
+    clients = clients_from_unit_directions(
+        ([a, b], [a, -b], [0.0, 0.0]))
+    states = [clients[name] for name in driver_harness.SLICES]
+    scales = driver_harness.module_scales("frozen-a")
+    diagnostic = fedspan_delta_weights(
+        states, payload["broadcast"], scales, step_norm=1.0,
+        step_policy="fixed", direction_policy=direction_policy,
+        active_abs_tol=1e-12, active_rel_tol=1e-8,
+        mixture_norm_tol=1e-6, max_abs_delta_weight=None)
+    assert diagnostic["status"] == "reconstruction_failure"
+    assert diagnostic["solver_message"].startswith(
+        "coefficient reconstruction produced norm ")
+    global_state, application = apply_fedspan_update(
+        payload["broadcast"], states, diagnostic, scales)
+    diagnostic = {**diagnostic, "application": application}
+    payload["clients"] = {
+        name: state for name, state in zip(driver_harness.SLICES, states)
+    }
+    payload["global"] = global_state
+    payload["global_state_sha256"] = state_dict_sha256(global_state)
+    torch.save(payload, state_path(tmp_path, round_number=1))
+    with result_path.open() as handle:
+        result = json.load(handle)
+    result["fedspan_diagnostics"]["round_1"] = diagnostic
+    result["client_delta_norms"]["round_1"] = {
+        name: diagnostic["client_norms"][index]
+        for index, name in enumerate(driver_harness.SLICES)
+    }
+    rewrite(result_path, result)
+    return result, result_path
+
+
+def test_genuine_reconstruction_failure_message_validates(
+        monkeypatch, tmp_path):
+    install_genuine_reconstruction_failure(monkeypatch, tmp_path)
+
+    report = validate_run_directory(tmp_path)
+
+    assert report["fedspan_fallback_rounds"] == 1
+    assert report["fedspan_applied_rounds"] == 1
+
+
+def test_reconstruction_failure_with_outer_success_message_is_refused(
+        monkeypatch, tmp_path):
+    result, result_path = install_genuine_reconstruction_failure(
+        monkeypatch, tmp_path)
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    solver = diagnostic["min_norm_solver"]
+    diagnostic["solver_message"] = (
+        "away-step Frank-Wolfe "
+        f"{'converged' if solver['converged'] else 'STALLED'} at duality "
+        f"gap {solver['gap']:.3e} after {solver['iterations']} iterations")
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="reconstruction.*message"):
+        validate_run_directory(tmp_path)
+
+
+def test_fallback_persisted_global_must_be_bit_exact_broadcast(
+        monkeypatch, tmp_path):
+    result, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin", num_rounds=2,
+        extra=("--fedspan_max_abs_delta_weight", "1.0"))
+    assert result["fedspan_diagnostics"]["round_1"]["fallback"] is None
+    diagnostic = result["fedspan_diagnostics"]["round_2"]
+    assert diagnostic["status"] == "coefficient_limit"
+    payload = load_states(tmp_path, round_number=2)
+    payload["global"][driver_harness.B_KEY][0, -1] += 2e-10
+    assert not torch.equal(
+        payload["global"][driver_harness.B_KEY],
+        payload["broadcast"][driver_harness.B_KEY])
+    payload["global_state_sha256"] = state_dict_sha256(payload["global"])
+    torch.save(payload, state_path(tmp_path, round_number=2))
+    scale = float(diagnostic["module_scales"][driver_harness.MODULE])
+    applied = scale * (
+        payload["global"][driver_harness.B_KEY].double()
+        - payload["broadcast"][driver_harness.B_KEY].double())
+    application = diagnostic["application"]
+    application["applied_state_sha256"] = payload["global_state_sha256"]
+    application["applied_effective_step_sha256"] = (
+        direct_effective_step_sha256({driver_harness.MODULE: applied}))
+    rewrite(result_path, result)
+
+    with pytest.raises(
+            E0ValidationError,
+            match="fallback.*global.*broadcast|exact zero"):
+        validate_run_directory(tmp_path)
+
+
 def multi_module_peft_fixture():
     second_module = "encoder.layer0.value"
     second_a = f"{second_module}.lora_A.weight"
@@ -1141,6 +1244,45 @@ def test_outer_maxmin_solver_message_is_bound(monkeypatch, tmp_path):
     rewrite(result_path, result)
 
     with pytest.raises(E0ValidationError, match="solver message"):
+        validate_run_directory(tmp_path)
+
+
+def test_maxmin_shared_min_norm_gap_semantics_are_bound(
+        monkeypatch, tmp_path):
+    _, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        direction_policy="maxmin-lp")
+    with result_path.open() as handle:
+        result = json.load(handle)
+    solver = result["fedspan_diagnostics"]["round_1"]["min_norm_solver"]
+    solver["gap"] = 1.0
+    solver["converged"] = True
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="min.?norm.*gap|convergence"):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize("fallback_status", [
+    "coefficient_limit", "reconstruction_failure",
+])
+def test_maxmin_post_geometry_fallback_binds_shared_min_norm_metadata(
+        monkeypatch, tmp_path, fallback_status):
+    if fallback_status == "coefficient_limit":
+        result, result_path = driver_harness.run_driver(
+            monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+            direction_policy="maxmin-lp",
+            extra=("--fedspan_max_abs_delta_weight", "0.01"))
+    else:
+        result, result_path = install_genuine_reconstruction_failure(
+            monkeypatch, tmp_path, direction_policy="maxmin-lp")
+    diagnostic = result["fedspan_diagnostics"]["round_1"]
+    assert diagnostic["status"] == fallback_status
+    diagnostic["min_norm_solver"]["gap"] = 1.0
+    diagnostic["min_norm_solver"]["converged"] = True
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="min.?norm.*gap|convergence"):
         validate_run_directory(tmp_path)
 
 

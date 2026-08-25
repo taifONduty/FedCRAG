@@ -289,7 +289,11 @@ def _assert_finite_state(state, label):
 def _states_are_identical(left, right):
     if left is None or right is None or set(left) != set(right):
         return False
-    return all(torch.equal(left[key], right[key]) for key in left)
+    return all(
+        tuple(left[key].shape) == tuple(right[key].shape)
+        and left[key].dtype == right[key].dtype
+        and torch.equal(left[key], right[key])
+        for key in left)
 
 
 def _validate_finite_states(payload, round_label):
@@ -915,6 +919,16 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
              and 1 <= iterations <= 20000,
              f"{round_label}: minnorm solver iterations must be an integer "
              "in [1, 20000]")
+    recorded_gap = solver.get("gap")
+    _require(_finite(recorded_gap) and float(recorded_gap) >= 0.0,
+             f"{round_label}: shared min-norm reference gap is invalid")
+    shared_converged = float(recorded_gap) <= float(recorded_tol)
+    _require(isinstance(solver.get("converged"), bool)
+             and solver.get("converged") is shared_converged,
+             f"{round_label}: shared min-norm reference did not converge as "
+             "recorded; convergence status disagrees with its gap/tolerance")
+    _require(shared_converged,
+             f"{round_label}: shared min-norm reference did not converge")
     _require(isinstance(diagnostic.get("solver_status"), int)
              and not isinstance(diagnostic.get("solver_status"), bool)
              and diagnostic.get("solver_status") == 0,
@@ -930,34 +944,23 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
         _require_scalar(
             solver.get("gap"), gap,
             f"{round_label}: minnorm Frank-Wolfe certificate gap differs")
-        converged = gap <= float(recorded_tol)
-        _require(solver.get("converged") is converged,
-                 f"{round_label}: min-norm reference did not converge as "
-                 "required; convergence status disagrees with the replayed "
-                 "certificate gap")
-        expected_message = (
+        outer_solver_message = (
             "singleton active set; no direction solve required"
             if len(active) == 1 else
             f"away-step Frank-Wolfe "
-            f"{'converged' if converged else 'STALLED'} at duality gap "
+            f"{'converged' if shared_converged else 'STALLED'} at duality gap "
             f"{float(solver['gap']):.3e} after {iterations} iterations")
-        _require(diagnostic.get("solver_message") == expected_message,
-                 f"{round_label}: outer direction solver message differs "
-                 "from the independently replayed minnorm solve metadata")
     elif policy == "maxmin-lp":
         policy_error = max(0.0, t_star - gamma_derived)
         _require(
             policy_error <= objective_allowance,
             f"{round_label}: maxmin-lp direction objective suboptimality "
             f"{policy_error:.6g} exceeds {objective_allowance:.6g}")
-        expected_message = (
+        outer_solver_message = (
             "singleton active set; no direction solve required"
             if len(active) == 1 else
             "Optimization terminated successfully. "
             "(HiGHS Status 7: Optimal)")
-        _require(diagnostic.get("solver_message") == expected_message,
-                 f"{round_label}: outer direction solver message differs "
-                 "from the frozen maxmin-lp success metadata")
     else:
         raise E0ValidationError(
             f"{round_label}: unknown direction policy {policy!r}")
@@ -989,7 +992,8 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
     coefficient_max = max(abs(value) for value in expected_coefficients)
     solved_recorded = _weighted_blocks(
         recorded["blocks"], expected_coefficients, modules)
-    reconstruction_error = _block_norm(solved_recorded) - float(resolved)
+    solved_norm_recorded = _block_norm(solved_recorded)
+    reconstruction_error = solved_norm_recorded - float(resolved)
     cap = arguments["fedspan_max_abs_delta_weight"]
     if cap is not None and coefficient_max > float(cap):
         expected_status, expected_fallback = "coefficient_limit", "zero_update"
@@ -1003,6 +1007,19 @@ def _validate_fedspan_direction_decision(result, payload, diagnostic,
              f"{round_label}: fallback/status {fallback!r}/{status!r} differs "
              f"from independent decision {expected_fallback!r}/"
              f"{expected_status!r}")
+    expected_solver_message = outer_solver_message
+    if expected_status == "reconstruction_failure":
+        expected_solver_message = (
+            f"coefficient reconstruction produced norm "
+            f"{solved_norm_recorded} instead of "
+            f"{float(resolved)}")
+    message_label = ("reconstruction solver message"
+                     if expected_status == "reconstruction_failure"
+                     else "outer solver message")
+    _require(
+        diagnostic.get("solver_message") == expected_solver_message,
+        f"{round_label}: {expected_status} {message_label} differs from the "
+        "independently replayed branch metadata")
 
     actual_coefficients = diagnostic.get("delta_weights")
     proposed_coefficients = diagnostic.get("proposed_delta_weights")
@@ -1365,6 +1382,11 @@ def _validate_fedspan_round(result, payload, round_label):
                 f"{round_label}: invalid {field}")
     else:
         _require(
+            _states_are_identical(payload["global"], payload["broadcast"]),
+            f"{round_label}: fallback persisted global is not bit-exactly "
+            "identical to the broadcast (keys, shapes, dtypes, and tensors "
+            "must match for an exact zero update)")
+        _require(
             applied_norm == 0.0,
             f"{round_label}: fallback must apply an exact zero update")
         _require(
@@ -1386,6 +1408,11 @@ def _validate_fedspan_round(result, payload, round_label):
     _validate_median_active_step(result, diagnostic, round_label)
     recomputed_norm = _validate_recomputed_fedspan_step(
         result, payload, diagnostic, round_label)
+    if fallback is not None:
+        _require(
+            recomputed_norm == 0.0,
+            f"{round_label}: fallback effective step recomputed from persisted "
+            "states is not exact zero")
     return {"fallback": fallback, "applied_step_norm": recomputed_norm,
             "direction_residuals": direction_residuals}
 

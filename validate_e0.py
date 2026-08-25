@@ -296,6 +296,28 @@ def _states_are_identical(left, right):
         for key in left)
 
 
+def _first_state_mismatch(left, right):
+    """Return the first exact state mismatch as ``(key, reason)``."""
+    left_keys = set(left)
+    right_keys = set(right)
+    if left_keys != right_keys:
+        key = sorted(left_keys ^ right_keys)[0]
+        side = "preceding global" if key in left_keys else "next broadcast"
+        return key, f"is present only in the {side}"
+    for key in sorted(left_keys):
+        if left[key].shape != right[key].shape:
+            return key, (f"has shape {tuple(left[key].shape)} in the "
+                         f"preceding global and {tuple(right[key].shape)} "
+                         "in the next broadcast")
+        if left[key].dtype != right[key].dtype:
+            return key, (f"has dtype {left[key].dtype} in the preceding "
+                         f"global and {right[key].dtype} in the next "
+                         "broadcast")
+        if not torch.equal(left[key], right[key]):
+            return key, "has different tensor values"
+    return None
+
+
 def _validate_finite_states(payload, round_label):
     _assert_finite_state(payload["broadcast"], f"{round_label} broadcast")
     _assert_finite_state(payload["global"], f"{round_label} global")
@@ -1988,6 +2010,9 @@ def validate_run_directory(run_directory, manifest_row=None,
     applied_rounds = 0
     first_broadcast = None
     final_global = None
+    initial_boundary_checked = False
+    previous_global = None
+    previous_global_hash = None
     scale_audit = {}
     direction_audit = {}
     for round_number in range(1, num_rounds + 1):
@@ -2005,6 +2030,30 @@ def validate_run_directory(run_directory, manifest_row=None,
             state_dict_sha256(payload["global"])
             == payload["global_state_sha256"],
             f"{round_label}: persisted global hash is invalid")
+
+        if round_number == 1:
+            _require(
+                payload["broadcast_state_sha256"]
+                == contract.get("initial_adapter_state_sha256"),
+                "initial -> round_1 boundary: round-1 broadcast hash does "
+                "not equal method_contract.initial_adapter_state_sha256")
+            initial_boundary_checked = True
+        else:
+            boundary = f"round_{round_number - 1} -> {round_label}"
+            mismatch = _first_state_mismatch(
+                previous_global, payload["broadcast"])
+            mismatch_detail = (
+                f"; first mismatching key '{mismatch[0]}' {mismatch[1]}"
+                if mismatch is not None else "")
+            _require(
+                payload["broadcast_state_sha256"] == previous_global_hash,
+                f"{boundary} boundary: broadcast hash does not equal the "
+                f"preceding global hash{mismatch_detail}")
+            if mismatch is not None:
+                _require(
+                    False,
+                    f"{boundary} boundary: first mismatching key "
+                    f"'{mismatch[0]}' {mismatch[1]}")
 
         _validate_finite_states(payload, round_label)
         _validate_lora_shapes(result, payload, round_label)
@@ -2043,6 +2092,8 @@ def validate_run_directory(run_directory, manifest_row=None,
         if first_broadcast is None:
             first_broadcast = payload["broadcast"]
         final_global = payload["global"]
+        previous_global = payload["global"]
+        previous_global_hash = payload["global_state_sha256"]
         if recomputation["max_tolerance_ratio"] > worst_ratio:
             worst_ratio = recomputation["max_tolerance_ratio"]
             worst_round = round_label
@@ -2066,6 +2117,8 @@ def validate_run_directory(run_directory, manifest_row=None,
         "result_path": str(result_path),
         "commit": commit,
         "rounds_validated": num_rounds,
+        "initial_boundary_checked": initial_boundary_checked,
+        "continuity_boundaries_checked": max(num_rounds - 1, 0),
         "lora_mode": result["lora_mode"],
         "weight_by_canonical": result.get("weight_by_canonical"),
         "aggregate_recomputation_worst_tolerance_ratio": worst_ratio,

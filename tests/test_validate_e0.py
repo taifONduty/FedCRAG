@@ -213,6 +213,65 @@ def repair_fedspan_solution(tmp_path, result_path, active_weights,
     return result, payload
 
 
+def translate_round_b_state_and_repair_hashes(
+        tmp_path, result_path, round_number,
+        translation=2.0 ** -8):
+    """Translate a whole round without changing any within-round delta."""
+    payload = load_states(tmp_path, round_number)
+    with Path(result_path).open() as handle:
+        result = json.load(handle)
+    diagnostic = result["fedspan_diagnostics"][f"round_{round_number}"]
+    application = diagnostic["application"]
+
+    states = [payload["broadcast"], payload["global"],
+              *payload["clients"].values()]
+    original_b = [state[driver_harness.B_KEY].clone() for state in states]
+    for state in states:
+        state[driver_harness.B_KEY] = (
+            state[driver_harness.B_KEY] + translation)
+    for before, state in zip(original_b, states):
+        assert torch.equal(
+            state[driver_harness.B_KEY].double() - before.double(),
+            torch.full_like(before.double(), translation))
+    for before, state in zip(original_b[1:], states[1:]):
+        assert torch.equal(
+            state[driver_harness.B_KEY].double()
+            - states[0][driver_harness.B_KEY].double(),
+            before.double() - original_b[0].double())
+    resave_states(
+        tmp_path, payload, round_number=round_number, repair_hashes=True)
+
+    application["broadcast_state_sha256"] = (
+        payload["broadcast_state_sha256"])
+    application["client_state_sha256"] = [
+        state_dict_sha256(payload["clients"][name])
+        for name in result["slices"]
+    ]
+    application["applied_state_sha256"] = payload["global_state_sha256"]
+
+    scale = float(diagnostic["module_scales"][driver_harness.MODULE])
+    broadcast_b = payload["broadcast"][driver_harness.B_KEY].double()
+    client_blocks = [
+        scale * (payload["clients"][name][driver_harness.B_KEY].double()
+                 - broadcast_b)
+        for name in result["slices"]
+    ]
+    solved_block = sum(
+        float(coefficient) * block
+        for coefficient, block in zip(
+            diagnostic["delta_weights"], client_blocks)
+    )
+    applied_block = scale * (
+        payload["global"][driver_harness.B_KEY].double() - broadcast_b)
+    diagnostic["solved_effective_step_sha256"] = (
+        direct_effective_step_sha256(
+            {driver_harness.MODULE: solved_block}))
+    application["applied_effective_step_sha256"] = (
+        direct_effective_step_sha256(
+            {driver_harness.MODULE: applied_block}))
+    rewrite(result_path, result)
+
+
 def fabricate_zero_fallback(tmp_path, result_path, status, round_number=1):
     """Rewrite one genuine success as a self-consistent zero fallback."""
     payload = load_states(tmp_path, round_number)
@@ -413,8 +472,35 @@ def test_clean_run_validates_for_every_e0_cell(
     assert report["commit"] == driver_harness.CLEAN_COMMIT
     assert report["lora_mode"] == lora_mode
     assert report["manifest_verified"] is False
+    assert report["initial_boundary_checked"] is True
+    assert report["continuity_boundaries_checked"] == 1
     # Headroom against false positives must stay visible, not merely pass.
     assert report["aggregate_recomputation_worst_tolerance_ratio"] < 0.5
+
+
+# ------------------------------------------------------- state-chain gates
+
+
+def test_repaired_round_translation_breaking_continuity_is_refused(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin", num_rounds=2)
+    translate_round_b_state_and_repair_hashes(
+        tmp_path, result_path, round_number=2)
+
+    with pytest.raises(E0ValidationError, match="round_1 -> round_2"):
+        validate_run_directory(tmp_path)
+
+
+def test_repaired_round_1_initial_boundary_replacement_is_refused(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    translate_round_b_state_and_repair_hashes(
+        tmp_path, result_path, round_number=1)
+
+    with pytest.raises(E0ValidationError, match="initial -> round_1"):
+        validate_run_directory(tmp_path)
 
 
 # ----------------------------------------------------- forged server updates
@@ -929,6 +1015,7 @@ def install_genuine_reconstruction_failure(
         extra=("--fedspan_step_policy", "fixed",
                "--fedspan_step_norm", "1.0"))
     payload = load_states(tmp_path, round_number=1)
+    healthy_round_payload = copy.deepcopy(payload)
     a = 1.5e-5
     b = math.sqrt(1.0 - a * a)
     clients = clients_from_unit_directions(
@@ -952,8 +1039,13 @@ def install_genuine_reconstruction_failure(
     payload["global"] = global_state
     payload["global_state_sha256"] = state_dict_sha256(global_state)
     torch.save(payload, state_path(tmp_path, round_number=1))
+    torch.save(healthy_round_payload, state_path(tmp_path, round_number=2))
     with result_path.open() as handle:
         result = json.load(handle)
+    result["fedspan_diagnostics"]["round_2"] = copy.deepcopy(
+        result["fedspan_diagnostics"]["round_1"])
+    result["client_delta_norms"]["round_2"] = copy.deepcopy(
+        result["client_delta_norms"]["round_1"])
     result["fedspan_diagnostics"]["round_1"] = diagnostic
     result["client_delta_norms"]["round_1"] = {
         name: diagnostic["client_norms"][index]
@@ -1419,6 +1511,8 @@ def test_repaired_hash_lora_rank_shape_mismatch_is_refused(
 
     with result_path.open() as handle:
         result = json.load(handle)
+    result["method_contract"]["initial_adapter_state_sha256"] = (
+        payload["broadcast_state_sha256"])
     diagnostic = result["fedspan_diagnostics"]["round_1"]
     application = diagnostic["application"]
     application["broadcast_state_sha256"] = payload["broadcast_state_sha256"]

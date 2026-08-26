@@ -394,6 +394,48 @@ def test_e0_launcher_timing_contract_uses_the_auditable_module():
     assert acquire < precheck < execute < final_release
 
 
+def test_validate_row_supplies_exact_execution_source_root(tmp_path):
+    """The hardened validator must receive the Git root used by the launcher."""
+    calls = tmp_path / "validator-argv.txt"
+    python = tmp_path / "validator-stub"
+    python.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$@" > "$VALIDATOR_CALLS"\n'
+        'while [ "$#" -gt 0 ]; do\n'
+        '  if [ "$1" = "--execution_source_root" ]; then\n'
+        '    shift\n'
+        '    [ "$1" = "$EXPECTED_SOURCE_ROOT" ] && exit 0\n'
+        '    exit 41\n'
+        '  fi\n'
+        '  shift\n'
+        'done\n'
+        'exit 42\n')
+    python.chmod(0o755)
+    output = tmp_path / "external-output"
+    manifest = output / "manifest.json"
+    environment = dict(
+        os.environ,
+        PYTHON=str(python),
+        E0_OUT=str(output),
+        VALIDATOR_CALLS=str(calls),
+        EXPECTED_SOURCE_ROOT=str(ROOT),
+    )
+    command = (
+        'source "$1"; E0_MANIFEST="$2"; validate_row e0-hermetic-row'
+    )
+
+    completed = subprocess.run(
+        ["bash", "-c", command, "launcher-validation", str(SCRIPT),
+         str(manifest)],
+        cwd=ROOT, capture_output=True, text=True, env=environment)
+
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    argv = calls.read_text().splitlines()
+    index = argv.index("--execution_source_root")
+    assert argv[index + 1] == str(ROOT)
+    assert argv[:2] == ["validate_e0.py", str(output / "e0-hermetic-row")]
+
+
 def test_failed_row_retry_refuses_every_surviving_artifact_until_removed(
         tmp_path):
     run_id = "e0-failed-row"

@@ -384,7 +384,8 @@ acquire_row_lock() {
 
 validate_row() {
   "$PYTHON" validate_e0.py "$E0_OUT/$1" \
-    --manifest "$E0_MANIFEST" --run_id "$1"
+    --manifest "$E0_MANIFEST" --run_id "$1" \
+    --execution_source_root "$SCRIPT_DIR"
 }
 
 execute_row() {

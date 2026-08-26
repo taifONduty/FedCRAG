@@ -9,7 +9,7 @@ set -u
 set -o pipefail
 
 readonly INSTANCE=thesis-fedcrag
-readonly REMOTE_ARTIFACT_ROOT=/home/turjo/FedCRAG_E0_RESULTS
+REMOTE_ARTIFACT_ROOT=/home/turjo/FedCRAG_E0_RESULTS
 readonly EXECUTION_COMMIT=7325bf56381c24c6a4af013688bdd417c95d7d7d
 readonly EXECUTION_COMMIT_SHORT=7325bf56381c
 readonly EXPECTED_ROWS=11
@@ -19,6 +19,17 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 DEST=${POST_E0_DEST:-/Users/turjo/Desktop/FedCRAG/post_e0_audit/2026-08-25}
 RETRY_SLEEP=${POST_E0_RETRY_SLEEP:-2}
 PYTHON_BIN=${POST_E0_PYTHON:-python3}
+REMOTE_TMP_ROOT=/tmp
+EXECUTION_SOURCE_ROOT=/home/turjo/FedCRAG
+EXECUTION_PYTHON=/home/turjo/FedCRAG/.venv/bin/python
+VALIDATOR_BIN=
+if [ "${POST_E0_TEST_MODE:-}" = 1 ]; then
+    REMOTE_ARTIFACT_ROOT=${POST_E0_TEST_REMOTE_ROOT:?test remote root required}
+    REMOTE_TMP_ROOT=${POST_E0_REMOTE_TMP:?test remote tmp required}
+    EXECUTION_SOURCE_ROOT=${POST_E0_TEST_EXECUTION_SOURCE_ROOT:?test execution source root required}
+    EXECUTION_PYTHON=${POST_E0_PYTHON:-python3}
+fi
+VALIDATOR_BIN=${POST_E0_VALIDATOR:-$EXECUTION_PYTHON}
 RETRY_LIMIT=3
 ATTEMPT=
 E0_PROJECT=
@@ -37,7 +48,7 @@ new_failure_path() {
     counter=0
     while :; do
         candidate="${DEST}.failed-${stamp}-${counter}"
-        [ ! -e "$candidate" ] && { printf '%s\n' "$candidate"; return; }
+        [ ! -e "$candidate" ] && [ ! -L "$candidate" ] && { printf '%s\n' "$candidate"; return; }
         counter=$((counter + 1))
     done
 }
@@ -59,6 +70,22 @@ preserve_preflight_failure() {
     failure=$(new_failure_path)
     mkdir -p "$failure/audit" || return 0
     printf '%s\n' "$message" > "$failure/audit/preflight_failure.txt"
+}
+
+create_attempt() {
+    local stamp counter candidate
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    counter=0
+    while [ "$counter" -lt 100 ]; do
+        candidate="${DEST}.attempt-${stamp}-${counter}"
+        if [ ! -e "$candidate" ] && [ ! -L "$candidate" ] && mkdir "$candidate"; then
+            mkdir "$candidate/artifacts" "$candidate/audit" || return 1
+            ATTEMPT=$candidate
+            return 0
+        fi
+        counter=$((counter + 1))
+    done
+    return 1
 }
 
 get_status() {
@@ -117,7 +144,11 @@ require_clean_worktree() {
     if [ "${POST_E0_TEST_MODE:-}" = 1 ]; then
         return 0
     fi
-    [ -z "$(git -C "$SCRIPT_DIR" status --porcelain)" ] || \
+    local output status
+    output=$(git -C "$SCRIPT_DIR" status --porcelain)
+    status=$?
+    [ "$status" -eq 0 ] || fail "cannot determine worktree status" 2
+    [ -z "$output" ] || \
         fail "worktree is not clean" 2
 }
 
@@ -211,11 +242,12 @@ if complete.get("commit") != expected_commit or manifest.get("commit") != expect
     raise SystemExit("completion or manifest commit is not the frozen short identity")
 if not isinstance(rows, list) or len(rows) != expected_rows:
     raise SystemExit("manifest does not contain eleven rows")
-if complete.get("validated_rows") and len(complete["validated_rows"]) != expected_rows:
-    raise SystemExit("completion does not record eleven validated rows")
 run_ids = [row.get("run_id") for row in rows if isinstance(row, dict)]
 if len(run_ids) != expected_rows or len(set(run_ids)) != expected_rows or not all(run_ids):
     raise SystemExit("manifest row identities are invalid")
+validated = complete.get("validated_rows")
+if not isinstance(validated, list) or validated != run_ids:
+    raise SystemExit("completion validated rows do not exactly bind manifest rows")
 for run_id in run_ids:
     paths = glob.glob(os.path.join(root, run_id, "federated_*.json"))
     if len(paths) != 1:
@@ -232,24 +264,6 @@ resolve_execution_commit() {
     [ "$resolved" = "$EXECUTION_COMMIT" ]
 }
 
-run_test_snapshot() {
-    local source=$1 validator=$2
-    [ -n "$source" ] && [ -d "$source" ] || return 1
-    assert_regular_tree "$source" || return 1
-    inventory_tree "$source" > "$ATTEMPT/audit/remote_pre_inventory.jsonl" || return 1
-    if [ "${POST_E0_TEST_FAIL:-}" = copy ]; then return 1; fi
-    copy_regular_tree "$source" "$ATTEMPT/artifacts" || return 1
-    check_identity_and_rows "$ATTEMPT/artifacts" || return 1
-    resolve_execution_commit "$SCRIPT_DIR" || return 1
-    inventory_tree "$ATTEMPT/artifacts" > "$ATTEMPT/audit/local_inventory.jsonl" || return 1
-    cmp "$ATTEMPT/audit/remote_pre_inventory.jsonl" \
-        "$ATTEMPT/audit/local_inventory.jsonl" || return 1
-    [ -x "$validator" ] || return 1
-    "$validator" > "$ATTEMPT/audit/validation_summary.json" || return 1
-    [ "${POST_E0_TEST_FAIL:-}" != checksum ] || return 1
-    return 0
-}
-
 write_remote_worker() {
     # The production worker is this same audited script in an explicit remote
     # mode.  It is copied to /tmp and never checked out over the E0 execution
@@ -259,12 +273,13 @@ write_remote_worker() {
 }
 
 run_production_snapshot() {
-    local audit_commit bundle bundle_hash remote_base
+    local audit_commit bundle bundle_hash remote_stage worker_status fetch_status
     audit_commit=$(git -C "$SCRIPT_DIR" rev-parse HEAD) || return 1
     bundle="$ATTEMPT/audit/fedspan-post-e0-audit-${audit_commit}.bundle"
-    git -C "$SCRIPT_DIR" bundle create "$bundle" "$audit_commit" || return 1
+    [ "$(git -C "$SCRIPT_DIR" rev-parse HEAD)" = "$audit_commit" ] || return 1
+    git -C "$SCRIPT_DIR" bundle create "$bundle" HEAD || return 1
     bundle_hash=$(hash_file "$bundle") || return 1
-    remote_base="/tmp/fedspan-post-e0-audit-${audit_commit}"
+    remote_stage="$REMOTE_TMP_ROOT/fedspan-post-e0-stage-${audit_commit}"
     write_remote_worker || return 1
     {
         printf 'audit_commit=%s\n' "$audit_commit"
@@ -273,43 +288,77 @@ run_production_snapshot() {
         /bin/bash --version
     } > "$ATTEMPT/audit/environment.txt"
     gcloud compute scp "$bundle" "$ATTEMPT/audit/post_e0_closeout.sh" \
-        "$INSTANCE:/tmp/" --project "$E0_PROJECT" --zone "$E0_ZONE" || return 1
+        "$INSTANCE:$REMOTE_TMP_ROOT/" --project "$E0_PROJECT" --zone "$E0_ZONE" || return 1
     # The remote subcommand refuses unsafe entries, copies only inventoried
     # regular files to /tmp, and runs the strengthened validator from the
     # fresh audit-commit clone.  Its outputs remain in /tmp until copied back.
-    printf '%s\n' "POST_E0_REMOTE_WORKER=1 bash /tmp/post_e0_closeout.sh '$REMOTE_ARTIFACT_ROOT' '$remote_base' '$audit_commit' '$EXECUTION_COMMIT'" \
+    printf '%s\n' "POST_E0_REMOTE_WORKER=1 bash $REMOTE_TMP_ROOT/post_e0_closeout.sh '$audit_commit' '$bundle_hash' '$EXECUTION_COMMIT'" \
         > "$ATTEMPT/audit/remote_command.txt" || return 1
     gcloud compute ssh "$INSTANCE" --project "$E0_PROJECT" --zone "$E0_ZONE" \
-        --command "$(cat "$ATTEMPT/audit/remote_command.txt")" || return 1
-    gcloud compute scp --recurse "$INSTANCE:$remote_base/artifacts" \
-        "$INSTANCE:$remote_base/audit" "$ATTEMPT/" --project "$E0_PROJECT" \
-        --zone "$E0_ZONE" || return 1
-    [ -d "$ATTEMPT/artifacts" ] && [ -d "$ATTEMPT/audit" ] || return 1
+        --command "$(cat "$ATTEMPT/audit/remote_command.txt")"
+    worker_status=$?
+    # Pull audit evidence even after a scientific refusal, before preserving it.
+    mkdir "$ATTEMPT/remote_transfer" || return 1
+    gcloud compute scp --recurse "$INSTANCE:$remote_stage/audit" "$ATTEMPT/remote_transfer" \
+        --project "$E0_PROJECT" --zone "$E0_ZONE"
+    fetch_status=$?
+    [ "$fetch_status" -eq 0 ] || return 1
+    [ -d "$ATTEMPT/remote_transfer/audit" ] || return 1
+    assert_regular_tree "$ATTEMPT/remote_transfer/audit" || return 1
+    mv "$ATTEMPT/remote_transfer/audit/"* "$ATTEMPT/audit/" || return 1
+    rmdir "$ATTEMPT/remote_transfer/audit" "$ATTEMPT/remote_transfer" || return 1
+    [ "$worker_status" -eq 0 ] || return "$worker_status"
+    mkdir "$ATTEMPT/remote_transfer" || return 1
+    gcloud compute scp --recurse "$INSTANCE:$remote_stage/artifacts" "$ATTEMPT/remote_transfer" \
+        --project "$E0_PROJECT" --zone "$E0_ZONE" || return 1
+    [ -d "$ATTEMPT/remote_transfer/artifacts" ] && [ -d "$ATTEMPT/audit" ] || return 1
+    assert_regular_tree "$ATTEMPT/remote_transfer/artifacts" || return 1
+    mv "$ATTEMPT/remote_transfer/artifacts/"* "$ATTEMPT/artifacts/" || return 1
+    rmdir "$ATTEMPT/remote_transfer/artifacts" "$ATTEMPT/remote_transfer" || return 1
     inventory_tree "$ATTEMPT/artifacts" > "$ATTEMPT/audit/local_inventory.jsonl" || return 1
-    cmp "$ATTEMPT/audit/remote_pre_inventory.jsonl" \
-        "$ATTEMPT/audit/local_inventory.jsonl" || return 1
+    cmp "$ATTEMPT/audit/source_pre_inventory.jsonl" "$ATTEMPT/audit/source_post_inventory.jsonl" || return 1
+    cmp "$ATTEMPT/audit/source_pre_inventory.jsonl" "$ATTEMPT/audit/staged_inventory.jsonl" || return 1
+    cmp "$ATTEMPT/audit/source_pre_inventory.jsonl" "$ATTEMPT/audit/local_inventory.jsonl" || return 1
 }
 
 remote_worker() {
-    local source=$1 stage=$2 audit_commit=$3 execution_commit=$4 repo rows run
-    [ "$execution_commit" = "$EXECUTION_COMMIT" ] || return 1
-    rm -rf "$stage"
-    mkdir -p "$stage/artifacts" "$stage/audit" || return 1
-    assert_regular_tree "$source" || return 1
-    inventory_tree "$source" > "$stage/audit/remote_pre_inventory.jsonl" || return 1
-    copy_regular_tree "$source" "$stage/artifacts" || return 1
+    local audit_commit bundle_hash execution_commit stage repo bundle rows run
+    [ "$#" -eq 3 ] || return 2
+    audit_commit=$1
+    bundle_hash=$2
+    execution_commit=$3
+    case "$audit_commit" in *[!0-9a-f]*|???????????????????????????????????????) return 2 ;; esac
+    [ "${#audit_commit}" -eq 40 ] || return 2
+    case "$bundle_hash" in *[!0-9a-f]*|"") return 2 ;; esac
+    [ "${#bundle_hash}" -eq 64 ] || return 2
+    [ "$execution_commit" = "$EXECUTION_COMMIT" ] || return 2
+    case "$REMOTE_TMP_ROOT" in /|""|*".."*) return 2 ;; esac
+    [ -d "$REMOTE_TMP_ROOT" ] && [ ! -L "$REMOTE_TMP_ROOT" ] || return 2
+    stage="$REMOTE_TMP_ROOT/fedspan-post-e0-stage-${audit_commit}"
+    repo="$REMOTE_TMP_ROOT/fedspan-post-e0-clone-${audit_commit}"
+    bundle="$REMOTE_TMP_ROOT/fedspan-post-e0-audit-${audit_commit}.bundle"
+    [ ! -e "$stage" ] && [ ! -L "$stage" ] && [ ! -e "$repo" ] && [ ! -L "$repo" ] || return 2
+    mkdir "$stage" && mkdir "$stage/artifacts" "$stage/audit" || return 1
+    [ -f "$bundle" ] && [ ! -L "$bundle" ] || return 1
+    [ "$(hash_file "$bundle")" = "$bundle_hash" ] || return 1
+    assert_regular_tree "$REMOTE_ARTIFACT_ROOT" || return 1
+    inventory_tree "$REMOTE_ARTIFACT_ROOT" > "$stage/audit/source_pre_inventory.jsonl" || return 1
+    [ "${POST_E0_TEST_FAIL:-}" != copy ] || return 1
+    copy_regular_tree "$REMOTE_ARTIFACT_ROOT" "$stage/artifacts" || return 1
     check_identity_and_rows "$stage/artifacts" || return 1
-    inventory_tree "$stage/artifacts" > "$stage/audit/remote_post_inventory.jsonl" || return 1
-    cmp "$stage/audit/remote_pre_inventory.jsonl" "$stage/audit/remote_post_inventory.jsonl" || return 1
-    repo="/tmp/fedspan-post-e0-audit-${audit_commit}"
-    rm -rf "$repo"
-    git clone "/tmp/fedspan-post-e0-audit-${audit_commit}.bundle" "$repo" || return 1
+    inventory_tree "$REMOTE_ARTIFACT_ROOT" > "$stage/audit/source_post_inventory.jsonl" || return 1
+    inventory_tree "$stage/artifacts" > "$stage/audit/staged_inventory.jsonl" || return 1
+    cmp "$stage/audit/source_pre_inventory.jsonl" "$stage/audit/source_post_inventory.jsonl" || return 1
+    cmp "$stage/audit/source_pre_inventory.jsonl" "$stage/audit/staged_inventory.jsonl" || return 1
+    [ "${POST_E0_TEST_FAIL:-}" != checksum ] || return 1
+    git clone "$bundle" "$repo" || return 1
+    [ "$(git -C "$repo" rev-parse HEAD)" = "$audit_commit" ] || return 1
     resolve_execution_commit "$repo" || return 1
     {
         printf 'audit_clone=%s\n' "$repo"
-        printf 'execution_source_root=/home/turjo/FedCRAG\n'
-        git -C /home/turjo/FedCRAG rev-parse HEAD
-        git -C /home/turjo/FedCRAG status --porcelain
+        printf 'execution_source_root=%s\n' "$EXECUTION_SOURCE_ROOT"
+        git -C "$EXECUTION_SOURCE_ROOT" rev-parse HEAD
+        git -C "$EXECUTION_SOURCE_ROOT" status --porcelain
     } > "$stage/audit/execution_source_identity.txt" || return 1
     rows=$("$PYTHON_BIN" - "$stage/artifacts/manifest.json" <<'PY'
 import json, sys
@@ -319,13 +368,16 @@ for row in value["rows"]:
 PY
 ) || return 1
     : > "$stage/audit/validator_output.jsonl"
-    printf '%s\n' "/home/turjo/FedCRAG/.venv/bin/python $repo/validate_e0.py <row> --manifest $stage/artifacts/manifest.json --run_id <row> --execution_source_root /home/turjo/FedCRAG" \
-        > "$stage/audit/validator_command.txt" || return 1
+    : > "$stage/audit/validator_command.txt"
     while IFS= read -r run; do
         [ -n "$run" ] || continue
-        /home/turjo/FedCRAG/.venv/bin/python "$repo/validate_e0.py" "$stage/artifacts/$run" \
+        printf '%q ' "$VALIDATOR_BIN" "$repo/validate_e0.py" "$stage/artifacts/$run" \
             --manifest "$stage/artifacts/manifest.json" --run_id "$run" \
-            --execution_source_root /home/turjo/FedCRAG \
+            --execution_source_root "$EXECUTION_SOURCE_ROOT" >> "$stage/audit/validator_command.txt"
+        printf '\n' >> "$stage/audit/validator_command.txt"
+        "$VALIDATOR_BIN" "$repo/validate_e0.py" "$stage/artifacts/$run" \
+            --manifest "$stage/artifacts/manifest.json" --run_id "$run" \
+            --execution_source_root "$EXECUTION_SOURCE_ROOT" \
             >> "$stage/audit/validator_output.jsonl" || {
                 printf 'scientific validation failed for %s\n' "$run" \
                     > "$stage/audit/validation_failure.txt"
@@ -334,20 +386,40 @@ PY
     done <<EOF
 $rows
 EOF
-    /home/turjo/FedCRAG/.venv/bin/python - <<'PY' > "$stage/audit/runtime_versions.txt"
+    "$EXECUTION_PYTHON" - <<'PY' > "$stage/audit/runtime_versions.txt" || return 1
 import numpy, sys, torch
 print("python=" + sys.version.replace("\n", " "))
 print("torch=" + torch.__version__)
 print("numpy=" + numpy.__version__)
 PY
-    printf '{"validated_rows": %s, "status": "pass"}\n' "$EXPECTED_ROWS" \
-        > "$stage/audit/validation_summary.json"
+    "$PYTHON_BIN" - "$stage/audit/validator_output.jsonl" "$stage/artifacts/status.tsv" \
+        "$stage/audit/validation_summary.json" <<'PY' || return 1
+import json, os, sys
+reports_path, status_path, output = sys.argv[1:]
+reports = [json.loads(line) for line in open(reports_path, encoding="utf-8") if line.strip()]
+if len(reports) != 11:
+    raise SystemExit("validator did not produce eleven reports")
+durations = []
+if os.path.exists(status_path):
+    for line in open(status_path, encoding="utf-8"):
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) >= 3:
+            try: durations.append(float(fields[2]))
+            except ValueError: pass
+summary = {"validated_rows": len(reports), "reports": reports,
+           "direction_residuals": [r.get("direction_residuals") for r in reports],
+           "continuity_verified_rows": sum(bool(r.get("continuity")) for r in reports),
+           "aggregate_tolerances": [r.get("aggregate_tolerances") for r in reports],
+           "measured_total_row_runtimes": durations,
+           "legacy_schema_v1_per_round": "unavailable"}
+json.dump(summary, open(output, "w", encoding="utf-8"), sort_keys=True)
+PY
     printf '%s\n' "Post-hoc internally consistent preservation; not a signed historical attestation." \
         > "$stage/audit/2026-08-25_E0_STRENGTHENED_VALIDATION_CLOSEOUT.md"
 }
 
 write_reports() {
-    "$PYTHON_BIN" - "$ATTEMPT/audit/remote_pre_inventory.jsonl" \
+    "$PYTHON_BIN" - "$ATTEMPT/audit/source_pre_inventory.jsonl" \
         "$ATTEMPT/audit/local_inventory.jsonl" "$ATTEMPT/SOURCE_SHA256SUMS" <<'PY' || return 1
 import json, sys
 remote_path, local_path, output = sys.argv[1:]
@@ -424,10 +496,9 @@ main() {
     fi
     trap cleanup EXIT
     trap on_signal INT TERM
-    [ ! -e "$DEST" ] || fail "canonical destination already exists" 5
+    [ ! -e "$DEST" ] && [ ! -L "$DEST" ] || fail "canonical destination already exists" 5
     mkdir -p "$(dirname "$DEST")" || fail "cannot create preservation parent"
-    ATTEMPT="${DEST}.attempt-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-    mkdir "$ATTEMPT" && mkdir "$ATTEMPT/artifacts" "$ATTEMPT/audit" || fail "cannot create attempt"
+    create_attempt || fail "cannot create exclusive attempt"
     CLEANUP_ARMED=1
 
     before=$(get_status) || fail "initial VM status query was malformed or failed"
@@ -443,12 +514,7 @@ main() {
     fi
     printf 'after=%s\n' "$after" >> "$ATTEMPT/audit/vm_state.txt" || fail "cannot record post-start VM state"
 
-    if [ "${POST_E0_TEST_MODE:-}" = 1 ]; then
-        run_test_snapshot "${POST_E0_TEST_REMOTE_ROOT:-}" \
-            "${POST_E0_TEST_VALIDATOR:-}" || fail "test snapshot gate failed"
-    else
-        run_production_snapshot || fail "remote snapshot/validation gate failed"
-    fi
+    run_production_snapshot || fail "remote snapshot/validation gate failed"
     write_reports || fail "report gate failed"
     if ensure_terminated; then
         CLEANUP_DONE=1

@@ -27,7 +27,7 @@ def closeout_env(tmp_path):
     source.mkdir()
     (source / "COMPLETE.json").write_text(json.dumps({
         "commit": EXPECTED_COMMIT_SHORT,
-        "rows": [f"row-{index}" for index in range(11)],
+        "validated_rows": [f"row-{index}" for index in range(11)],
     }))
     (source / "manifest.json").write_text(json.dumps({
         "commit": EXPECTED_COMMIT_SHORT,
@@ -46,6 +46,8 @@ def closeout_env(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     gcloud_log = tmp_path / "gcloud.log"
+    remote_tmp = tmp_path / "remote-tmp"
+    remote_tmp.mkdir()
     status_file = tmp_path / "statuses"
     status_file.write_text("RUNNING")
     fake_gcloud = bin_dir / "gcloud"
@@ -81,6 +83,47 @@ if [ \"$1\" = compute ] && [ \"$2\" = instances ] && [ \"$3\" = stop ]; then
   [ \"${FAKE_STOP_FAIL:-0}\" = 0 ] || exit 1
   exit 0
 fi
+if [ \"$1\" = compute ] && [ \"$2\" = scp ]; then
+  first=$3
+  [ \"$first\" = --recurse ] && first=$4
+  case \"$first\" in *:*)
+    destination=
+    for item in \"$@\"; do
+      [ \"$item\" = --project ] && break
+      destination=$item
+    done
+    mkdir -p \"$destination\"
+    for item in \"$@\"; do
+      case \"$item\" in *:*) cp -R \"${item#*:}\" \"$destination/\" ;; esac
+    done
+    ;;
+  *)
+    target=
+    for item in \"$@\"; do case \"$item\" in *:*) target=$item ;; esac; done
+    destination=${target#*:}
+    mkdir -p \"$destination\"
+    for item in \"$@\"; do
+      case \"$item\" in
+        -*|compute|scp|\"$target\"|*:* ) ;;
+        *) [ -f \"$item\" ] && cp \"$item\" \"$destination/\" ;;
+      esac
+    done
+    destination=
+    ;;
+  esac
+  exit 0
+fi
+if [ \"$1\" = compute ] && [ \"$2\" = ssh ]; then
+  command=
+  shift 2
+  while [ \"$#\" -gt 0 ]; do
+    if [ \"$1\" = --command ]; then command=$2; break; fi
+    shift
+  done
+  [ -n \"$command\" ] || exit 98
+  /bin/bash -c \"$command\"
+  exit $?
+fi
 printf '%s\\n' \"unexpected fake gcloud command: $*\" >&2
 exit 99
 """)
@@ -89,7 +132,7 @@ exit 99
     validator = tmp_path / "validator"
     validator.write_text("""#!/bin/sh
 if [ \"${POST_E0_TEST_FAIL:-}\" = validation ]; then exit 41; fi
-printf '{"validated_rows": 11, "status": "pass"}\\n'
+printf '{"manifest_verified": true, "continuity": {"verified_rounds": 5}, "direction_residuals": {"max": 0.0}}\\n'
 """)
     validator.chmod(validator.stat().st_mode | stat.S_IXUSR)
 
@@ -102,11 +145,13 @@ printf '{"validated_rows": 11, "status": "pass"}\\n'
         "POST_E0_DEST": str(destination),
         "POST_E0_TEST_MODE": "1",
         "POST_E0_TEST_REMOTE_ROOT": str(source),
-        "POST_E0_TEST_VALIDATOR": str(validator),
+        "POST_E0_REMOTE_TMP": str(remote_tmp),
+        "POST_E0_TEST_EXECUTION_SOURCE_ROOT": str(ROOT),
+        "POST_E0_VALIDATOR": str(validator),
         "POST_E0_RETRY_SLEEP": "0",
     })
     return {"env": env, "destination": destination, "log": gcloud_log,
-            "source": source}
+            "source": source, "remote_tmp": remote_tmp}
 
 
 def run_driver(closeout_env, **extra_env):
@@ -158,6 +203,14 @@ def test_success_snapshots_exactly_eleven_regular_files_and_stops_vm(closeout_en
         assert (destination / relative).is_file()
     assert "instances start thesis-fedcrag" in "\n".join(cloud_calls(closeout_env))
     assert "instances stop thesis-fedcrag" in "\n".join(cloud_calls(closeout_env))
+    assert any("compute ssh thesis-fedcrag" in call for call in cloud_calls(closeout_env))
+    assert sum("compute scp" in call for call in cloud_calls(closeout_env)) >= 2
+    assert (destination / "audit" / "source_pre_inventory.jsonl").is_file()
+    assert (destination / "audit" / "source_post_inventory.jsonl").is_file()
+    assert (destination / "audit" / "staged_inventory.jsonl").is_file()
+    summary = json.loads((destination / "audit" / "validation_summary.json").read_text())
+    assert summary["validated_rows"] == 11
+    assert summary["legacy_schema_v1_per_round"] == "unavailable"
     assert not failed_attempts(closeout_env)
 
 
@@ -190,6 +243,22 @@ def test_refuses_failed_zone_query_before_start(closeout_env):
     assert not any("instances start" in call for call in cloud_calls(closeout_env))
 
 
+@pytest.mark.parametrize("validated_rows", [None, [], ["row-0"] * 11,
+                         [f"wrong-{index}" for index in range(11)]])
+def test_refuses_missing_empty_duplicate_or_wrong_completion_rows(
+        closeout_env, validated_rows):
+    complete = closeout_env["source"] / "COMPLETE.json"
+    payload = json.loads(complete.read_text())
+    if validated_rows is None:
+        payload.pop("validated_rows")
+    else:
+        payload["validated_rows"] = validated_rows
+    complete.write_text(json.dumps(payload))
+    completed = run_driver(closeout_env, FAKE_STATUSES="RUNNING,TERMINATED")
+    assert completed.returncode == 20
+    assert_not_published(closeout_env)
+
+
 @pytest.mark.parametrize("failure", ["validation", "copy", "checksum"])
 def test_failure_gates_preserve_unique_attempt_and_refuse_publication(closeout_env, failure):
     completed = run_driver(
@@ -198,6 +267,16 @@ def test_failure_gates_preserve_unique_attempt_and_refuse_publication(closeout_e
     assert completed.returncode == 20
     assert_not_published(closeout_env)
     assert any("instances stop thesis-fedcrag" in call for call in cloud_calls(closeout_env))
+
+
+def test_scientific_failure_retrieves_remote_audit_before_preservation(closeout_env):
+    completed = run_driver(closeout_env, POST_E0_TEST_FAIL="validation",
+                           FAKE_STATUSES="RUNNING,TERMINATED")
+    assert completed.returncode == 20
+    attempts = failed_attempts(closeout_env)
+    assert len(attempts) == 1
+    assert (attempts[0] / "audit" / "validation_failure.txt").is_file()
+    assert (attempts[0] / "audit" / "source_pre_inventory.jsonl").is_file()
 
 
 def test_existing_canonical_destination_is_refused_before_start(closeout_env):

@@ -55,6 +55,8 @@ _MATERIALIZED_VECTOR_RTOL = 5e-6
 _RAWMAXMIN_MIN_REL_DIAGONAL = 1e-12
 _RAWMAXMIN_OBJECTIVE_ATOL = 1e-10
 _RAWMAXMIN_OBJECTIVE_RTOL = 1e-8
+_HIGHS_OPTIMAL_MESSAGE = (
+    "Optimization terminated successfully. (HiGHS Status 7: Optimal)")
 
 # The applied step norm and the median active client norm reach the same
 # quantity by different routes: one through the float64 geometry scale
@@ -582,6 +584,17 @@ def _validate_rawmaxmin_round(result, payload, round_label):
              and record.get("fallback") is None,
              f"{round_label}: rawmaxmin record is not a no-fallback optimal "
              "solve")
+    solver_status = record.get("solver_status")
+    _require(isinstance(solver_status, int)
+             and not isinstance(solver_status, bool)
+             and solver_status == 0,
+             f"{round_label}: rawmaxmin solver status must be integer 0, "
+             f"got {solver_status!r}")
+    solver_message = record.get("solver_message")
+    _require(isinstance(solver_message, str)
+             and solver_message == _HIGHS_OPTIMAL_MESSAGE,
+             f"{round_label}: rawmaxmin solver message does not match the "
+             f"frozen HiGHS success message: {solver_message!r}")
     weights = record.get("weights")
     _require(isinstance(weights, list)
              and len(weights) == len(result["slices"]),

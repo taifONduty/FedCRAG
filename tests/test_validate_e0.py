@@ -718,8 +718,14 @@ def test_rawmaxmin_degenerate_effective_update_is_refused_even_if_record_says_op
         result = json.load(handle)
     record = result["scheme_diagnostics"]["round_1"]
     assert record["fallback"] == "uniform"
-    record.update({"status": "optimal", "fallback": None,
-                   "solver_message": "forged success"})
+    record.update({
+        "status": "optimal",
+        "fallback": None,
+        "solver_status": 0,
+        "solver_message": (
+            "Optimization terminated successfully. "
+            "(HiGHS Status 7: Optimal)"),
+    })
     rewrite(result_path, result)
 
     with pytest.raises(E0ValidationError, match="degenerate diagonal"):
@@ -1616,6 +1622,55 @@ def test_missing_scheme_diagnostics_are_refused(monkeypatch, tmp_path):
 
     with pytest.raises(E0ValidationError,
                        match="not recorded at full precision"):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("solver_status", 2, "rawmaxmin solver status"),
+        ("solver_status", True, "rawmaxmin solver status"),
+        ("solver_status", False, "rawmaxmin solver status"),
+        ("solver_status", 0.0, "rawmaxmin solver status"),
+        ("solver_status", "0", "rawmaxmin solver status"),
+        ("solver_status", None, "rawmaxmin solver status"),
+        ("solver_message", "The problem is infeasible.",
+         "rawmaxmin solver message"),
+        ("solver_message", 7, "rawmaxmin solver message"),
+        ("solver_message", None, "rawmaxmin solver message"),
+    ],
+)
+def test_rawmaxmin_contradictory_solver_metadata_is_refused(
+        monkeypatch, tmp_path, field, value, message):
+    """An optimal vector cannot repair an infeasible or malformed audit."""
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "rawmaxmin")
+    with result_path.open() as handle:
+        result = json.load(handle)
+    result["scheme_diagnostics"]["round_1"][field] = value
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match=message):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("solver_status", "rawmaxmin solver status"),
+        ("solver_message", "rawmaxmin solver message"),
+    ],
+)
+def test_rawmaxmin_missing_solver_metadata_is_refused(
+        monkeypatch, tmp_path, field, message):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "trainable-ab", "rawmaxmin")
+    with result_path.open() as handle:
+        result = json.load(handle)
+    del result["scheme_diagnostics"]["round_1"][field]
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match=message):
         validate_run_directory(tmp_path)
 
 

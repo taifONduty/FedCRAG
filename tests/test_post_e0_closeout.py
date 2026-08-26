@@ -52,6 +52,8 @@ def closeout_env(tmp_path):
     remote_tmp.mkdir()
     status_file = tmp_path / "statuses"
     status_file.write_text("RUNNING")
+    ssh_readiness_file = tmp_path / "ssh-readiness"
+    ssh_readiness_file.write_text("ready")
     fake_gcloud = bin_dir / "gcloud"
     fake_gcloud.write_text("""#!/bin/sh
 set -eu
@@ -124,6 +126,15 @@ if [ \"$1\" = compute ] && [ \"$2\" = ssh ]; then
     shift
   done
   [ -n \"$command\" ] || exit 98
+  if [ \"$command\" = true ]; then
+    values=$(cat \"$FAKE_SSH_READINESS_FILE\")
+    value=${values%%,*}
+    if [ \"$values\" != \"$value\" ]; then
+      printf '%s' \"${values#*,}\" > \"$FAKE_SSH_READINESS_FILE\"
+    fi
+    [ \"$value\" = ready ] && exit 0
+    exit 1
+  fi
   /bin/bash -c \"$command\"
   exit $?
 fi
@@ -145,6 +156,7 @@ printf '{"manifest_verified": true, "dataset_content_verified": true, "runtime_p
         "PATH": str(bin_dir) + os.pathsep + env["PATH"],
         "FAKE_GCLOUD_LOG": str(gcloud_log),
         "FAKE_STATUS_FILE": str(status_file),
+        "FAKE_SSH_READINESS_FILE": str(ssh_readiness_file),
         "POST_E0_DEST": str(destination),
         "POST_E0_TEST_MODE": "1",
         "POST_E0_TEST_REMOTE_ROOT": str(source),
@@ -163,6 +175,8 @@ def run_driver(closeout_env, **extra_env):
     env.update({key: str(value) for key, value in extra_env.items()})
     if "FAKE_STATUSES" in extra_env:
         Path(env["FAKE_STATUS_FILE"]).write_text(str(extra_env["FAKE_STATUSES"]))
+    if "FAKE_SSH_READINESS" in extra_env:
+        Path(env["FAKE_SSH_READINESS_FILE"]).write_text(str(extra_env["FAKE_SSH_READINESS"]))
     return subprocess.run(
         ["/bin/bash", str(SCRIPT)], cwd=ROOT, env=env,
         capture_output=True, text=True)
@@ -220,6 +234,45 @@ def test_success_snapshots_exactly_eleven_regular_files_and_stops_vm(closeout_en
                      "Measured total row runtimes", "Schema-v1", "post-hoc", "paper-scale"):
         assert required in closeout
     assert not failed_attempts(closeout_env)
+
+
+def test_started_vm_waits_for_ssh_before_first_scp(closeout_env):
+    completed = run_driver(
+        closeout_env,
+        FAKE_STATUSES="TERMINATED,RUNNING,TERMINATED",
+        FAKE_SSH_READINESS="unready,ready",
+        POST_E0_SSH_READY_LIMIT="2",
+        POST_E0_SSH_READY_SLEEP="0",
+    )
+    assert completed.returncode == 0, completed.stderr
+    calls = cloud_calls(closeout_env)
+    readiness = [index for index, call in enumerate(calls)
+                 if "compute ssh thesis-fedcrag" in call and "--command true" in call]
+    first_scp = next(index for index, call in enumerate(calls) if "compute scp" in call)
+    assert len(readiness) == 2
+    assert readiness[-1] < first_scp
+    assert all("--project project-e0" in calls[index] and "--zone zone-e0" in calls[index]
+               for index in readiness)
+    assert all("--ssh-flag=-oBatchMode=yes" in calls[index]
+               and "--ssh-flag=-oConnectTimeout=10" in calls[index]
+               for index in readiness)
+
+
+def test_permanently_unready_started_vm_preserves_attempt_stops_and_never_scps(closeout_env):
+    completed = run_driver(
+        closeout_env,
+        FAKE_STATUSES="TERMINATED,RUNNING,TERMINATED",
+        FAKE_SSH_READINESS="unready,unready",
+        POST_E0_SSH_READY_LIMIT="2",
+        POST_E0_SSH_READY_SLEEP="0",
+    )
+    assert completed.returncode == 20
+    assert_not_published(closeout_env)
+    calls = cloud_calls(closeout_env)
+    assert sum("compute ssh thesis-fedcrag" in call and "--command true" in call
+               for call in calls) == 2
+    assert not any("compute scp" in call for call in calls)
+    assert any("instances stop thesis-fedcrag" in call for call in calls)
 
 
 @pytest.mark.parametrize("values", ["", "zone-a,zone-b"])

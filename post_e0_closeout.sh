@@ -18,6 +18,8 @@ readonly CRITICAL_SHUTDOWN=70
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 DEST=${POST_E0_DEST:-/Users/turjo/Desktop/FedCRAG/post_e0_audit/2026-08-25}
 RETRY_SLEEP=${POST_E0_RETRY_SLEEP:-2}
+SSH_READY_LIMIT=${POST_E0_SSH_READY_LIMIT:-30}
+SSH_READY_SLEEP=${POST_E0_SSH_READY_SLEEP:-2}
 PYTHON_BIN=${POST_E0_PYTHON:-python3}
 REMOTE_TMP_ROOT=/tmp
 EXECUTION_SOURCE_ROOT=/home/turjo/FedCRAG
@@ -162,6 +164,27 @@ get_status() {
         RUNNING|TERMINATED) printf '%s\n' "$output" ;;
         *) return 1 ;;
     esac
+}
+
+wait_for_ssh_ready() {
+    local attempt
+    case "$SSH_READY_LIMIT" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$SSH_READY_LIMIT" -gt 0 ] || return 1
+    attempt=1
+    while [ "$attempt" -le "$SSH_READY_LIMIT" ]; do
+        # A successful VM status only establishes that the instance is running;
+        # this explicit noninteractive SSH probe establishes that SCP can use it.
+        if gcloud compute ssh "$INSTANCE" --project "$E0_PROJECT" --zone "$E0_ZONE" \
+            --quiet --ssh-flag=-oBatchMode=yes --ssh-flag=-oConnectTimeout=10 \
+            --command true >/dev/null 2>&1; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        [ "$attempt" -le "$SSH_READY_LIMIT" ] && sleep "$SSH_READY_SLEEP"
+    done
+    return 1
 }
 
 ensure_terminated() {
@@ -617,6 +640,9 @@ main() {
         after=$before
     fi
     printf 'after=%s\n' "$after" >> "$ATTEMPT/audit/vm_state.txt" || fail "cannot record post-start VM state"
+    if [ "$before" = TERMINATED ]; then
+        wait_for_ssh_ready || fail "VM SSH did not become ready after bounded probes"
+    fi
 
     run_production_snapshot || fail "remote snapshot/validation gate failed"
     write_reports || fail "report gate failed"

@@ -2310,7 +2310,8 @@ def _git_capture(source_root, *arguments, text=False):
     return completed.stdout
 
 
-def _validate_execution_source(result, row, execution_source_root):
+def _validate_execution_source(result, row, execution_source_root,
+                               execution_interpreter_path=None):
     _require(execution_source_root is not None,
              "manifest-backed validation requires an explicit "
              "execution source root")
@@ -2369,13 +2370,32 @@ def _validate_execution_source(result, row, execution_source_root):
                  ".venv/bin/python")
         interpreter = source_root / interpreter
     recorded_interpreter = Path(os.path.abspath(interpreter))
+    supplied_interpreter = None
+    if execution_interpreter_path is not None:
+        supplied_interpreter = Path(execution_interpreter_path).expanduser()
+        _require(supplied_interpreter.is_absolute(),
+                 "execution interpreter path anchor must be absolute")
+        supplied_interpreter = Path(os.path.abspath(supplied_interpreter))
+    try:
+        recorded_interpreter.relative_to(source_root)
+        in_execution_source = True
+    except ValueError:
+        in_execution_source = False
+    if not in_execution_source:
+        _require(execution_interpreter_path is not None,
+                 "manifest absolute interpreter outside the execution source "
+                 "requires an explicit execution interpreter path anchor")
+        expected_interpreter = supplied_interpreter
+    elif execution_interpreter_path is not None:
+        expected_interpreter = supplied_interpreter
     _require(recorded_interpreter == expected_interpreter,
-             "manifest command interpreter differs from the exact frozen E0 "
-             f"execution source interpreter {expected_interpreter}")
+             "manifest command interpreter differs from the exact execution "
+             f"interpreter path anchor {expected_interpreter}")
     return source_root
 
 
-def _validate_manifest_row(result, row, run_id, execution_source_root):
+def _validate_manifest_row(result, row, run_id, execution_source_root,
+                           execution_interpreter_path=None):
     _require_json_equal(row["run_id"], run_id, "manifest row run_id")
     commit_mismatch = _first_json_mismatch(
         result["commit"], row["commit"], "result commit")
@@ -2383,7 +2403,8 @@ def _validate_manifest_row(result, row, run_id, execution_source_root):
         commit_mismatch is None,
         f"run commit {result['commit']!r} differs from the manifest commit "
         f"{row['commit']!r}: {commit_mismatch}")
-    _validate_execution_source(result, row, execution_source_root)
+    _validate_execution_source(
+        result, row, execution_source_root, execution_interpreter_path)
     launched = _parse_manifest_argv(row["argv"])
 
     arguments = result.get("args")
@@ -2511,7 +2532,8 @@ def _validate_resource_record(run_directory, result):
 
 
 def validate_run_directory(run_directory, manifest_row=None,
-                           execution_source_root=None):
+                           execution_source_root=None,
+                           execution_interpreter_path=None):
     run_directory = Path(run_directory)
     result_path = _single(
         run_directory.glob("federated_*.json"), "federated result JSON")
@@ -2567,7 +2589,7 @@ def validate_run_directory(run_directory, manifest_row=None,
     if manifest_row is not None:
         launched, data_fingerprints = _validate_manifest_row(
             result, manifest_row, run_directory.name,
-            execution_source_root)
+            execution_source_root, execution_interpreter_path)
         resources = _validate_resource_record(run_directory, result)
         installed_torch = runtime["installed_packages"].get("torch")
         _require(isinstance(installed_torch, str) and bool(installed_torch),
@@ -2753,6 +2775,10 @@ def main():
         help="exact frozen Git repository that contains the recorded E0 "
              "commit (required with --manifest)")
     parser.add_argument(
+        "--execution_interpreter_path",
+        help="exact lexical interpreter path recorded by a manifest when it "
+             "is outside --execution_source_root")
+    parser.add_argument(
         "--allow_missing_manifest", action="store_true",
         help="validate contracts only; the report records that the run was "
              "not checked against the manifest that launched it")
@@ -2771,7 +2797,8 @@ def main():
 
     report = validate_run_directory(
         args.run_directory, manifest_row,
-        execution_source_root=args.execution_source_root)
+        execution_source_root=args.execution_source_root,
+        execution_interpreter_path=args.execution_interpreter_path)
     if not report["manifest_verified"]:
         print("WARNING: run was not checked against a launch manifest",
               file=sys.stderr)

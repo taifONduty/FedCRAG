@@ -146,6 +146,17 @@ exit 99
     validator = tmp_path / "validator"
     validator.write_text("""#!/bin/sh
 if [ \"${POST_E0_TEST_FAIL:-}\" = validation ]; then echo 'scientific refusal: synthetic validator failure' >&2; exit 41; fi
+source_anchor=
+interpreter_anchor=
+while [ \"$#\" -gt 0 ]; do
+  case \"$1\" in
+    --execution_source_root) shift; source_anchor=$1 ;;
+    --execution_interpreter_path) shift; interpreter_anchor=$1 ;;
+  esac
+  shift
+done
+[ \"$source_anchor\" = \"$EXPECTED_EXECUTION_SOURCE_ROOT\" ] || exit 42
+[ \"$interpreter_anchor\" = \"$EXPECTED_EXECUTION_INTERPRETER_PATH\" ] || exit 43
 printf '{"manifest_verified": true, "dataset_content_verified": true, "runtime_provenance_verified": true, "continuity_boundaries_checked": 4, "aggregate_recomputation_worst_tolerance_ratio": 0.1, "fedspan_direction_residuals": {}, "rawmaxmin_direction_residuals": {}}\\n'
 """)
     validator.chmod(validator.stat().st_mode | stat.S_IXUSR)
@@ -162,6 +173,9 @@ printf '{"manifest_verified": true, "dataset_content_verified": true, "runtime_p
         "POST_E0_TEST_REMOTE_ROOT": str(source),
         "POST_E0_REMOTE_TMP": str(remote_tmp),
         "POST_E0_TEST_EXECUTION_SOURCE_ROOT": str(ROOT),
+        "POST_E0_TEST_EXECUTION_INTERPRETER_PATH": "/shared/FedCRAG/.venv/bin/python",
+        "EXPECTED_EXECUTION_SOURCE_ROOT": str(ROOT),
+        "EXPECTED_EXECUTION_INTERPRETER_PATH": "/shared/FedCRAG/.venv/bin/python",
         "POST_E0_VALIDATOR": str(validator),
         "POST_E0_RETRY_SLEEP": "0",
     })
@@ -229,6 +243,9 @@ def test_success_snapshots_exactly_eleven_regular_files_and_stops_vm(closeout_en
     assert summary["validated_rows"] == 11
     assert summary["legacy_schema_v1_per_round"] == "unavailable"
     assert len(summary["measured_total_row_runtimes"]) == 11
+    validator_command = (destination / "audit" / "validator_command.txt").read_text()
+    assert f"--execution_source_root {ROOT}" in validator_command
+    assert "--execution_interpreter_path /shared/FedCRAG/.venv/bin/python" in validator_command
     closeout = (destination / "audit" / "2026-08-25_E0_STRENGTHENED_VALIDATION_CLOSEOUT.md").read_text()
     for required in ("direction residuals", "Continuity boundaries", "tolerance ratios",
                      "Measured total row runtimes", "Schema-v1", "post-hoc", "paper-scale"):

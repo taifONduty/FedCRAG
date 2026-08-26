@@ -22,14 +22,16 @@ SSH_READY_LIMIT=${POST_E0_SSH_READY_LIMIT:-30}
 SSH_READY_SLEEP=${POST_E0_SSH_READY_SLEEP:-2}
 PYTHON_BIN=${POST_E0_PYTHON:-python3}
 REMOTE_TMP_ROOT=/tmp
-EXECUTION_SOURCE_ROOT=/home/turjo/FedCRAG
+EXECUTION_SOURCE_ROOT=/home/turjo/fedspan-e0
 EXECUTION_PYTHON=/home/turjo/FedCRAG/.venv/bin/python
+EXECUTION_INTERPRETER_PATH=$EXECUTION_PYTHON
 VALIDATOR_BIN=
 if [ "${POST_E0_TEST_MODE:-}" = 1 ]; then
     REMOTE_ARTIFACT_ROOT=${POST_E0_TEST_REMOTE_ROOT:?test remote root required}
     REMOTE_TMP_ROOT=${POST_E0_REMOTE_TMP:?test remote tmp required}
     EXECUTION_SOURCE_ROOT=${POST_E0_TEST_EXECUTION_SOURCE_ROOT:?test execution source root required}
     EXECUTION_PYTHON=${POST_E0_PYTHON:-python3}
+    EXECUTION_INTERPRETER_PATH=${POST_E0_TEST_EXECUTION_INTERPRETER_PATH:?test execution interpreter path required}
 fi
 VALIDATOR_BIN=$EXECUTION_PYTHON
 if [ "${POST_E0_TEST_MODE:-}" = 1 ]; then
@@ -445,6 +447,7 @@ remote_worker() {
     {
         printf 'audit_clone=%s\n' "$repo"
         printf 'execution_source_root=%s\n' "$EXECUTION_SOURCE_ROOT"
+        printf 'execution_interpreter_path=%s\n' "$EXECUTION_INTERPRETER_PATH"
         git -C "$EXECUTION_SOURCE_ROOT" rev-parse HEAD
         git -C "$EXECUTION_SOURCE_ROOT" status --porcelain
     } > "$stage/audit/execution_source_identity.txt" || return 1
@@ -462,11 +465,13 @@ PY
         [ -n "$run" ] || continue
         printf '%q ' "$VALIDATOR_BIN" "$repo/validate_e0.py" "$stage/artifacts/$run" \
             --manifest "$stage/artifacts/manifest.json" --run_id "$run" \
-            --execution_source_root "$EXECUTION_SOURCE_ROOT" >> "$stage/audit/validator_command.txt"
+            --execution_source_root "$EXECUTION_SOURCE_ROOT" \
+            --execution_interpreter_path "$EXECUTION_INTERPRETER_PATH" >> "$stage/audit/validator_command.txt"
         printf '\n' >> "$stage/audit/validator_command.txt"
         "$VALIDATOR_BIN" "$repo/validate_e0.py" "$stage/artifacts/$run" \
             --manifest "$stage/artifacts/manifest.json" --run_id "$run" \
             --execution_source_root "$EXECUTION_SOURCE_ROOT" \
+            --execution_interpreter_path "$EXECUTION_INTERPRETER_PATH" \
             >> "$stage/audit/validator_output.jsonl" 2> "$stage/audit/validator-${run}.stderr"
         validator_status=$?
         printf '%s\t%s\n' "$run" "$validator_status" >> "$stage/audit/validator_exit_status.tsv"

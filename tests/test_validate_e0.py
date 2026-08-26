@@ -10,6 +10,7 @@ import copy
 import hashlib
 import math
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -54,7 +55,8 @@ RESOURCE_SCHEMA_V2 = "fedcrag-e0-resources/2"
 
 
 def validate_run_directory(run_directory, manifest_row=None,
-                           execution_source_root=None):
+                           execution_source_root=None,
+                           execution_interpreter_path=None):
     """Give manifest tests their independent frozen execution-source anchor."""
     if manifest_row is not None and execution_source_root is None:
         execution_source_root = prepare_execution_source(Path(run_directory))
@@ -63,7 +65,8 @@ def validate_run_directory(run_directory, manifest_row=None,
             run_directory, manifest_row=manifest_row)
     return _validate_run_directory(
         run_directory, manifest_row=manifest_row,
-        execution_source_root=execution_source_root)
+        execution_source_root=execution_source_root,
+        execution_interpreter_path=execution_interpreter_path)
 
 
 def build_run(monkeypatch, tmp_path, lora_mode="frozen-a", arm="normmaxmin",
@@ -2377,6 +2380,81 @@ def test_manifest_relative_repo_interpreter_validates(monkeypatch, tmp_path):
     report = validate_run_directory(tmp_path, manifest_row=row)
 
     assert report["manifest_verified"] is True
+
+
+def split_execution_interpreter(tmp_path, row):
+    interpreter = tmp_path / "shared-fedcrag" / ".venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("separate frozen interpreter path\n")
+    row["argv"][0] = str(interpreter)
+    return interpreter
+
+
+def test_manifest_split_absolute_interpreter_requires_exact_anchor(
+        monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    interpreter = split_execution_interpreter(tmp_path, row)
+
+    report = validate_run_directory(
+        tmp_path, manifest_row=row,
+        execution_source_root=tmp_path / "execution-source",
+        execution_interpreter_path=interpreter)
+
+    assert report["manifest_verified"] is True
+    assert report["interpreter_provenance_status"] == \
+        "lexical-path-bound-no-executable-digest"
+    assert report["interpreter_executable_digest_verified"] is False
+
+
+@pytest.mark.parametrize("anchor", [None, "mismatched", "relative"])
+def test_manifest_split_absolute_interpreter_refuses_absent_or_mismatched_anchor(
+        monkeypatch, tmp_path, anchor):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    interpreter = split_execution_interpreter(tmp_path, row)
+    if anchor == "relative":
+        supplied = Path(os.path.relpath(interpreter, Path.cwd()))
+    else:
+        supplied = (None if anchor is None else tmp_path / anchor / "python")
+
+    with pytest.raises(E0ValidationError, match="execution interpreter path"):
+        validate_run_directory(
+            tmp_path, manifest_row=row,
+            execution_source_root=tmp_path / "execution-source",
+            execution_interpreter_path=supplied)
+
+
+def test_manifest_cli_forwards_explicit_interpreter_anchor(
+        monkeypatch, tmp_path, capsys):
+    calls = {}
+
+    def fake_validate(run_directory, manifest_row=None,
+                      execution_source_root=None,
+                      execution_interpreter_path=None):
+        calls.update({
+            "run_directory": run_directory,
+            "manifest_row": manifest_row,
+            "execution_source_root": execution_source_root,
+            "execution_interpreter_path": execution_interpreter_path,
+        })
+        return {"manifest_verified": True}
+
+    monkeypatch.setattr(validator, "_load_manifest_row", lambda *_: {"run_id": "row"})
+    monkeypatch.setattr(validator, "validate_run_directory", fake_validate)
+    monkeypatch.setattr(sys, "argv", [
+        "validate_e0.py", str(tmp_path / "row"), "--manifest", str(tmp_path / "manifest.json"),
+        "--execution_source_root", "/source-anchor",
+        "--execution_interpreter_path", "/shared/.venv/bin/python",
+    ])
+
+    validator.main()
+
+    assert calls["execution_source_root"] == "/source-anchor"
+    assert calls["execution_interpreter_path"] == "/shared/.venv/bin/python"
+    assert json.loads(capsys.readouterr().out)["manifest_verified"] is True
 
 
 def test_manifest_requires_explicit_execution_source_anchor(

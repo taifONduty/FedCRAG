@@ -4,6 +4,7 @@
 launched, so ``verify`` — the subcommand ``run`` and ``resume`` both begin
 with — is exercised here for real, in a hermetic clean worktree.
 """
+import csv
 import os
 import re
 import select
@@ -247,6 +248,24 @@ def test_help_and_readme_require_an_explicit_frozen_a_row_scale():
     assert "unit" in help_text and "peft-init" in help_text
     assert "separate explicit choices" in readme
     assert "no safe implicit row-scale default" in readme
+
+
+def test_task_tracker_separates_completed_e0_from_method_validation():
+    with (ROOT / "task.tsv").open(newline="") as stream:
+        rows = list(csv.DictReader(stream, delimiter="\t"))
+    row = next(item for item in rows if item["id"] == "4.1")
+    gate = _prose(row["gate_or_expected"])
+
+    assert set(row) == {
+        "id", "phase", "task", "command", "depends_on", "status",
+        "gate_or_expected",
+    }
+    assert row["status"] == "implemented-unvalidated"
+    assert "external eleven-row e0 correctness campaign completed" in gate
+    assert "strengthened post-hoc validation is pending" in gate
+    assert "e1–e5 and paper-scale efficacy evidence remain absent" in gate
+    assert "method-validation gate is unmet" in gate
+    assert "not run" not in gate
 
 
 # -------------------------------------------------- the verify subcommand

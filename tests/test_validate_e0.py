@@ -2068,6 +2068,8 @@ def prepare_execution_source(tmp_path):
         subprocess.run(
             ["git", "commit", "-q", "-m", "frozen fixture"],
             cwd=root, check=True)
+        (root / ".git" / "info" / "exclude").write_text(
+            ".venv/\nbase-python\n")
         (root / ".venv" / "bin").mkdir(parents=True)
         (root / "base-python").write_text("fixture interpreter\n")
         (root / ".venv" / "bin" / "python").symlink_to(
@@ -2390,6 +2392,25 @@ def split_execution_interpreter(tmp_path, row):
     return interpreter
 
 
+def raw_interpreter_spelling(interpreter, spelling):
+    value = str(interpreter)
+    if spelling == "exact":
+        return value
+    if spelling == "dot":
+        return f"{interpreter.parent}/./{interpreter.name}"
+    if spelling == "parent":
+        return f"{interpreter.parent}/../{interpreter.parent.name}/{interpreter.name}"
+    if spelling == "redundant":
+        return value.replace("/shared-fedcrag/", "/shared-fedcrag//", 1)
+    if spelling == "tilde":
+        return "~/shared-fedcrag/.venv/bin/python"
+    if spelling == "symlink":
+        alias = interpreter.parents[2].with_name("shared-fedcrag-alias")
+        alias.symlink_to(interpreter.parents[2], target_is_directory=True)
+        return str(alias / ".venv" / "bin" / "python")
+    raise AssertionError(f"unknown spelling {spelling}")
+
+
 def test_manifest_split_absolute_interpreter_requires_exact_anchor(
         monkeypatch, tmp_path):
     build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
@@ -2400,12 +2421,38 @@ def test_manifest_split_absolute_interpreter_requires_exact_anchor(
     report = validate_run_directory(
         tmp_path, manifest_row=row,
         execution_source_root=tmp_path / "execution-source",
-        execution_interpreter_path=interpreter)
+        execution_interpreter_path=str(interpreter))
 
     assert report["manifest_verified"] is True
     assert report["interpreter_provenance_status"] == \
         "lexical-path-bound-no-executable-digest"
     assert report["interpreter_executable_digest_verified"] is False
+
+
+@pytest.mark.parametrize("manifest_spelling, anchor_spelling", [
+    ("dot", "exact"),
+    ("exact", "dot"),
+    ("parent", "exact"),
+    ("exact", "parent"),
+    ("redundant", "exact"),
+    ("exact", "redundant"),
+    ("exact", "tilde"),
+    ("symlink", "exact"),
+])
+def test_manifest_external_interpreter_anchor_requires_exact_raw_spelling(
+        monkeypatch, tmp_path, manifest_spelling, anchor_spelling):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    interpreter = split_execution_interpreter(tmp_path, row)
+    row["argv"][0] = raw_interpreter_spelling(interpreter, manifest_spelling)
+    anchor = raw_interpreter_spelling(interpreter, anchor_spelling)
+
+    with pytest.raises(E0ValidationError, match="execution interpreter path|interpreter"):
+        validate_run_directory(
+            tmp_path, manifest_row=row,
+            execution_source_root=tmp_path / "execution-source",
+            execution_interpreter_path=anchor)
 
 
 @pytest.mark.parametrize("anchor", [None, "mismatched", "relative"])
@@ -2529,6 +2576,36 @@ def test_manifest_source_anchor_must_contain_recorded_commit(
             tmp_path, manifest_row=row, execution_source_root=unrelated)
 
 
+def test_manifest_source_checkout_head_must_equal_recorded_commit(
+        monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    source_root = tmp_path / "execution-source"
+    (source_root / "later.txt").write_text("different checkout head\n")
+    subprocess.run(["git", "add", "later.txt"], cwd=source_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "later checkout"],
+        cwd=source_root, check=True)
+
+    with pytest.raises(E0ValidationError, match="checkout HEAD"):
+        _validate_run_directory(
+            tmp_path, manifest_row=row, execution_source_root=source_root)
+
+
+@pytest.mark.parametrize("dirty_name", ["untracked.txt", "federated_forgetting.py"])
+def test_manifest_source_checkout_must_be_clean(monkeypatch, tmp_path, dirty_name):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    source_root = tmp_path / "execution-source"
+    (source_root / dirty_name).write_text("dirty checkout\n")
+
+    with pytest.raises(E0ValidationError, match="checkout.*clean"):
+        _validate_run_directory(
+            tmp_path, manifest_row=row, execution_source_root=source_root)
+
+
 def test_manifest_commit_identity_must_be_frozen_12_hex(
         monkeypatch, tmp_path):
     _, result_path = build_run(
@@ -2624,6 +2701,10 @@ def test_manifest_source_hash_ignores_git_replacement_objects(
         for name in SOURCE_FILES
     }
     rewrite(result_path, result)
+    subprocess.run(
+        ["git", "checkout", "--quiet", "--detach", original],
+        cwd=source_root, check=True,
+        env=dict(os.environ, GIT_NO_REPLACE_OBJECTS="1"))
 
     with pytest.raises(E0ValidationError, match="source_sha256"):
         _validate_run_directory(

@@ -2332,6 +2332,15 @@ def _validate_execution_source(result, row, execution_source_root,
              and full_commit.startswith(commit),
              f"execution source resolved OID {full_commit!r} does not start "
              f"with the recorded commit prefix {commit}")
+    checkout_head = _git_capture(
+        source_root, "rev-parse", "HEAD", text=True).strip()
+    _require(checkout_head == full_commit,
+             f"execution source checkout HEAD {checkout_head!r} differs "
+             f"from the recorded full commit {full_commit!r}")
+    checkout_status = _git_capture(
+        source_root, "status", "--porcelain", text=True)
+    _require(checkout_status == "",
+             "execution source checkout must be clean")
     provenance = result.get("provenance") or {}
     _require(provenance.get("git_commit") == commit,
              "result provenance git_commit differs from the recorded run "
@@ -2363,34 +2372,42 @@ def _validate_execution_source(result, row, execution_source_root,
              f"source object at {expected_script}")
     expected_interpreter = Path(os.path.abspath(
         source_root / ".venv" / "bin" / "python"))
-    interpreter = Path(tokens[0]).expanduser()
-    if not interpreter.is_absolute():
-        _require(interpreter == Path(".venv/bin/python"),
+    raw_interpreter = tokens[0]
+    _require(isinstance(raw_interpreter, str),
+             "manifest command interpreter token is not a string")
+    if not os.path.isabs(raw_interpreter):
+        _require(raw_interpreter == ".venv/bin/python",
                  "manifest command relative interpreter must be exactly "
                  ".venv/bin/python")
-        interpreter = source_root / interpreter
-    recorded_interpreter = Path(os.path.abspath(interpreter))
-    supplied_interpreter = None
-    if execution_interpreter_path is not None:
-        supplied_interpreter = Path(execution_interpreter_path).expanduser()
-        _require(supplied_interpreter.is_absolute(),
-                 "execution interpreter path anchor must be absolute")
-        supplied_interpreter = Path(os.path.abspath(supplied_interpreter))
-    try:
-        recorded_interpreter.relative_to(source_root)
-        in_execution_source = True
-    except ValueError:
-        in_execution_source = False
-    if not in_execution_source:
+        recorded_interpreter = Path(os.path.abspath(
+            source_root / raw_interpreter))
+        if execution_interpreter_path is not None:
+            supplied_interpreter = Path(execution_interpreter_path).expanduser()
+            _require(supplied_interpreter.is_absolute(),
+                     "execution interpreter path anchor must be absolute")
+            expected_interpreter = Path(os.path.abspath(supplied_interpreter))
+        _require(recorded_interpreter == expected_interpreter,
+                 "manifest command interpreter differs from the exact execution "
+                 f"interpreter path anchor {expected_interpreter}")
+        return source_root
+
+    if raw_interpreter != str(expected_interpreter):
         _require(execution_interpreter_path is not None,
                  "manifest absolute interpreter outside the execution source "
                  "requires an explicit execution interpreter path anchor")
-        expected_interpreter = supplied_interpreter
+        _require(isinstance(execution_interpreter_path, str)
+                 and os.path.isabs(execution_interpreter_path),
+                 "execution interpreter path anchor must be an absolute raw path")
+        _require(raw_interpreter == execution_interpreter_path,
+                 "manifest command interpreter differs from the exact raw "
+                 "execution interpreter path anchor")
     elif execution_interpreter_path is not None:
-        expected_interpreter = supplied_interpreter
-    _require(recorded_interpreter == expected_interpreter,
-             "manifest command interpreter differs from the exact execution "
-             f"interpreter path anchor {expected_interpreter}")
+        supplied_interpreter = Path(execution_interpreter_path).expanduser()
+        _require(supplied_interpreter.is_absolute(),
+                 "execution interpreter path anchor must be absolute")
+        _require(Path(os.path.abspath(supplied_interpreter)) == expected_interpreter,
+                 "manifest command interpreter differs from the exact execution "
+                 f"interpreter path anchor {expected_interpreter}")
     return source_root
 
 

@@ -50,6 +50,13 @@ def closeout_env(tmp_path):
     gcloud_log = tmp_path / "gcloud.log"
     remote_tmp = tmp_path / "remote-tmp"
     remote_tmp.mkdir()
+    execution_source = tmp_path / "execution-source"
+    subprocess.run(
+        ["git", "clone", "--quiet", "--shared", str(ROOT), str(execution_source)],
+        check=True)
+    subprocess.run(
+        ["git", "checkout", "--quiet", "--detach", EXPECTED_COMMIT],
+        cwd=execution_source, check=True)
     status_file = tmp_path / "statuses"
     status_file.write_text("RUNNING")
     ssh_readiness_file = tmp_path / "ssh-readiness"
@@ -172,15 +179,16 @@ printf '{"manifest_verified": true, "dataset_content_verified": true, "runtime_p
         "POST_E0_TEST_MODE": "1",
         "POST_E0_TEST_REMOTE_ROOT": str(source),
         "POST_E0_REMOTE_TMP": str(remote_tmp),
-        "POST_E0_TEST_EXECUTION_SOURCE_ROOT": str(ROOT),
+        "POST_E0_TEST_EXECUTION_SOURCE_ROOT": str(execution_source),
         "POST_E0_TEST_EXECUTION_INTERPRETER_PATH": "/shared/FedCRAG/.venv/bin/python",
-        "EXPECTED_EXECUTION_SOURCE_ROOT": str(ROOT),
+        "EXPECTED_EXECUTION_SOURCE_ROOT": str(execution_source),
         "EXPECTED_EXECUTION_INTERPRETER_PATH": "/shared/FedCRAG/.venv/bin/python",
         "POST_E0_VALIDATOR": str(validator),
         "POST_E0_RETRY_SLEEP": "0",
     })
     return {"env": env, "destination": destination, "log": gcloud_log,
-            "source": source, "remote_tmp": remote_tmp}
+            "source": source, "remote_tmp": remote_tmp,
+            "execution_source": execution_source}
 
 
 def run_driver(closeout_env, **extra_env):
@@ -244,13 +252,35 @@ def test_success_snapshots_exactly_eleven_regular_files_and_stops_vm(closeout_en
     assert summary["legacy_schema_v1_per_round"] == "unavailable"
     assert len(summary["measured_total_row_runtimes"]) == 11
     validator_command = (destination / "audit" / "validator_command.txt").read_text()
-    assert f"--execution_source_root {ROOT}" in validator_command
+    assert f"--execution_source_root {closeout_env['execution_source']}" in validator_command
     assert "--execution_interpreter_path /shared/FedCRAG/.venv/bin/python" in validator_command
     closeout = (destination / "audit" / "2026-08-25_E0_STRENGTHENED_VALIDATION_CLOSEOUT.md").read_text()
     for required in ("direction residuals", "Continuity boundaries", "tolerance ratios",
                      "Measured total row runtimes", "Schema-v1", "post-hoc", "paper-scale"):
         assert required in closeout
     assert not failed_attempts(closeout_env)
+
+
+@pytest.mark.parametrize("state", ["different-head", "dirty"])
+def test_remote_worker_refuses_nonexact_or_dirty_execution_source(closeout_env, state):
+    execution_source = closeout_env["execution_source"]
+    if state == "different-head":
+        subprocess.run(
+            ["git", "checkout", "--quiet", "--detach", "HEAD^"],
+            cwd=execution_source, check=True)
+    else:
+        (execution_source / "untracked-closeout.txt").write_text("dirty\n")
+
+    completed = run_driver(closeout_env, FAKE_STATUSES="RUNNING,TERMINATED")
+
+    assert completed.returncode == 20
+    assert_not_published(closeout_env)
+    attempts = failed_attempts(closeout_env)
+    assert (attempts[0] / "audit" / "execution_source_identity.txt").is_file()
+    identity = (attempts[0] / "audit" / "execution_source_identity.txt").read_text()
+    assert "execution_source_head_status=0" in identity
+    assert "execution_source_status_status=0" in identity
+    assert any("instances stop thesis-fedcrag" in call for call in cloud_calls(closeout_env))
 
 
 def test_started_vm_waits_for_ssh_before_first_scp(closeout_env):

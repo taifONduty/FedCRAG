@@ -354,6 +354,26 @@ resolve_execution_commit() {
     [ "$resolved" = "$EXECUTION_COMMIT" ]
 }
 
+record_and_validate_execution_source() {
+    local head head_status source_status source_status_status
+    head=$(git -C "$EXECUTION_SOURCE_ROOT" rev-parse HEAD)
+    head_status=$?
+    source_status=$(git -C "$EXECUTION_SOURCE_ROOT" status --porcelain)
+    source_status_status=$?
+    {
+        printf 'execution_source_root=%s\n' "$EXECUTION_SOURCE_ROOT"
+        printf 'execution_interpreter_path=%s\n' "$EXECUTION_INTERPRETER_PATH"
+        printf 'execution_source_head_status=%s\n' "$head_status"
+        printf 'execution_source_head=%s\n' "$head"
+        printf 'execution_source_status_status=%s\n' "$source_status_status"
+        printf 'execution_source_status_porcelain=%s\n' "$source_status"
+    } >> "$1" || return 1
+    [ "$head_status" -eq 0 ] || return 1
+    [ "$source_status_status" -eq 0 ] || return 1
+    [ "$head" = "$EXECUTION_COMMIT" ] || return 1
+    [ -z "$source_status" ] || return 1
+}
+
 write_remote_worker() {
     # The production worker is this same audited script in an explicit remote
     # mode.  It is copied to /tmp and never checked out over the E0 execution
@@ -444,13 +464,10 @@ remote_worker() {
     git clone "$bundle" "$repo" || return 1
     [ "$(git -C "$repo" rev-parse HEAD)" = "$audit_commit" ] || return 1
     resolve_execution_commit "$repo" || return 1
-    {
-        printf 'audit_clone=%s\n' "$repo"
-        printf 'execution_source_root=%s\n' "$EXECUTION_SOURCE_ROOT"
-        printf 'execution_interpreter_path=%s\n' "$EXECUTION_INTERPRETER_PATH"
-        git -C "$EXECUTION_SOURCE_ROOT" rev-parse HEAD
-        git -C "$EXECUTION_SOURCE_ROOT" status --porcelain
-    } > "$stage/audit/execution_source_identity.txt" || return 1
+    printf 'audit_clone=%s\n' "$repo" \
+        > "$stage/audit/execution_source_identity.txt" || return 1
+    record_and_validate_execution_source \
+        "$stage/audit/execution_source_identity.txt" || return 1
     rows=$("$PYTHON_BIN" - "$stage/artifacts/manifest.json" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))

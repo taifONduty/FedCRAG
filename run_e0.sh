@@ -30,6 +30,7 @@ E0_MANIFEST="$E0_OUT/manifest.json"
 E0_STATUS="$E0_OUT/status.tsv"
 E0_COMPLETE="$E0_OUT/COMPLETE.json"
 GPU_SAMPLE_SECONDS=5
+E0_RESOURCE_SCHEMA="fedcrag-e0-resources/2"
 E0_ACTIVE_ROW_LOCK=""
 E0_ACTIVE_ROW_OWNER=""
 
@@ -72,6 +73,7 @@ build_command() {
   ROW_CMD=(
     "$PYTHON" federated_forgetting.py
     --model "$MODEL"
+    --resource_schema "$E0_RESOURCE_SCHEMA"
     --slices "${SLICES[@]}"
     --seed "$SEED"
     --num_rounds "$ROUNDS"

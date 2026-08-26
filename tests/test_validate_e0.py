@@ -49,6 +49,8 @@ SOURCE_FILES = (
     "fedcrag_common.py",
     "requirements.txt",
 )
+V2_SOURCE_FILES = SOURCE_FILES + ("e0_resources.py", "run_e0.sh")
+RESOURCE_SCHEMA_V2 = "fedcrag-e0-resources/2"
 
 
 def validate_run_directory(run_directory, manifest_row=None,
@@ -65,9 +67,12 @@ def validate_run_directory(run_directory, manifest_row=None,
 
 
 def build_run(monkeypatch, tmp_path, lora_mode="frozen-a", arm="normmaxmin",
-              num_rounds=1):
+              num_rounds=1, resource_schema=None):
+    extra = () if resource_schema is None else (
+        "--resource_schema", resource_schema)
     result, result_path = driver_harness.run_driver(
-        monkeypatch, tmp_path, lora_mode, arm, num_rounds=num_rounds)
+        monkeypatch, tmp_path, lora_mode, arm, num_rounds=num_rounds,
+        extra=extra)
     return result, result_path
 
 
@@ -1894,7 +1899,9 @@ def test_persisted_evidence_symlink_is_refused_without_following_target(
 def test_raw_resource_evidence_symlink_is_refused(
         monkeypatch, tmp_path, evidence):
     run_dir = tmp_path / "e0-test-row"
-    build_run(monkeypatch, run_dir, "frozen-a", "normmaxmin")
+    build_run(
+        monkeypatch, run_dir, "frozen-a", "normmaxmin",
+        resource_schema=RESOURCE_SCHEMA_V2)
     log, samples, boundaries = write_v2_resource_record(run_dir)
     path = {"log": log, "gpu": samples, "boundaries": boundaries}[evidence]
     external = tmp_path.parent / f"{tmp_path.name}-{evidence}-raw"
@@ -2044,7 +2051,7 @@ def prepare_execution_source(tmp_path):
     root = Path(tmp_path) / "execution-source"
     if not (root / ".git").is_dir():
         root.mkdir()
-        for index, name in enumerate(SOURCE_FILES):
+        for index, name in enumerate(V2_SOURCE_FILES):
             (root / name).write_text(f"frozen source {index}: {name}\n")
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
         subprocess.run(
@@ -2053,7 +2060,8 @@ def prepare_execution_source(tmp_path):
         subprocess.run(
             ["git", "config", "user.name", "E0 Fixture"],
             cwd=root, check=True)
-        subprocess.run(["git", "add", *SOURCE_FILES], cwd=root, check=True)
+        subprocess.run(
+            ["git", "add", *V2_SOURCE_FILES], cwd=root, check=True)
         subprocess.run(
             ["git", "commit", "-q", "-m", "frozen fixture"],
             cwd=root, check=True)
@@ -2065,15 +2073,18 @@ def prepare_execution_source(tmp_path):
         ["git", "rev-parse", "HEAD"], cwd=root, check=True,
         text=True, capture_output=True).stdout.strip()
     commit = full_commit[:12]
+    result_path = _single_for_test(Path(tmp_path).glob("federated_*.json"))
+    with result_path.open() as handle:
+        result = json.load(handle)
+    source_files = (V2_SOURCE_FILES
+                    if result.get("args", {}).get("resource_schema")
+                    == RESOURCE_SCHEMA_V2 else SOURCE_FILES)
     source_hashes = {
         name: hashlib.sha256(subprocess.run(
             ["git", "show", f"{full_commit}:{name}"], cwd=root, check=True,
             capture_output=True).stdout).hexdigest()
-        for name in SOURCE_FILES
+        for name in source_files
     }
-    result_path = _single_for_test(Path(tmp_path).glob("federated_*.json"))
-    with result_path.open() as handle:
-        result = json.load(handle)
     result["commit"] = commit
     result["provenance"]["git_commit"] = commit
     result["provenance"]["source_sha256"] = source_hashes
@@ -2093,6 +2104,12 @@ def manifest_row(tmp_path, lora_mode="frozen-a", arm="normmaxmin",
     commit = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=source_root, check=True,
         text=True, capture_output=True).stdout.strip()[:12]
+    result_path = _single_for_test(Path(tmp_path).glob("federated_*.json"))
+    with result_path.open() as handle:
+        result = json.load(handle)
+    resource_schema = result.get("args", {}).get("resource_schema")
+    extra = (() if resource_schema in (None, "fedcrag-e0-resources/1")
+             else ("--resource_schema", resource_schema))
     return {
         "run_id": tmp_path.name,
         "commit": commit,
@@ -2102,9 +2119,31 @@ def manifest_row(tmp_path, lora_mode="frozen-a", arm="normmaxmin",
         "max_steps": 0,
         "argv": [str(source_root / ".venv" / "bin" / "python")]
                 + driver_harness.build_argv(
-                    tmp_path, lora_mode, arm, num_rounds=num_rounds)
+                    tmp_path, lora_mode, arm, num_rounds=num_rounds,
+                    extra=extra)
                 + ["--seed", "42", "--max_steps_per_round", "0"],
     }
+
+
+def bind_v2_source_contract(run_dir, row, source_files):
+    source_root = Path(run_dir) / "execution-source"
+    full_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source_root, check=True,
+        text=True, capture_output=True).stdout.strip()
+    result_path = _single_for_test(Path(run_dir).glob("federated_*.json"))
+    with result_path.open() as handle:
+        result = json.load(handle)
+    result["args"]["resource_schema"] = RESOURCE_SCHEMA_V2
+    result["provenance"]["resource_schema"] = RESOURCE_SCHEMA_V2
+    result["provenance"]["source_sha256"] = {
+        name: hashlib.sha256(subprocess.run(
+            ["git", "show", f"{full_commit}:{name}"], cwd=source_root,
+            check=True, capture_output=True).stdout).hexdigest()
+        for name in source_files
+    }
+    if "--resource_schema" not in row["argv"]:
+        row["argv"].extend(["--resource_schema", RESOURCE_SCHEMA_V2])
+    rewrite(result_path, result)
 
 
 def write_resource_record(tmp_path, num_rounds=1):
@@ -2811,8 +2850,9 @@ def test_truncated_round_timings_are_refused(monkeypatch, tmp_path):
 def test_resource_schema_v2_is_replayed_from_raw_evidence(
         monkeypatch, tmp_path):
     run_dir = tmp_path / "e0-test-row"
-    build_run(monkeypatch, run_dir, "frozen-a", "normmaxmin",
-              num_rounds=2)
+    build_run(
+        monkeypatch, run_dir, "frozen-a", "normmaxmin", num_rounds=2,
+        resource_schema=RESOURCE_SCHEMA_V2)
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
     log = log_dir / "e0-test-row.log"
@@ -2869,6 +2909,62 @@ def test_resource_schema_v2_is_replayed_from_raw_evidence(
         [1.5e-7, 4e-7]
 
 
+def test_resource_schema_v2_refuses_legacy_four_file_source_scope(
+        monkeypatch, tmp_path):
+    run_dir = tmp_path / "e0-test-row"
+    build_run(
+        monkeypatch, run_dir, "frozen-a", "normmaxmin",
+        resource_schema=RESOURCE_SCHEMA_V2)
+    write_v2_resource_record(run_dir)
+    row = manifest_row(run_dir)
+    bind_v2_source_contract(run_dir, row, SOURCE_FILES)
+
+    with pytest.raises(E0ValidationError, match="source_sha256"):
+        validate_run_directory(
+            run_dir, manifest_row=row,
+            execution_source_root=run_dir / "execution-source")
+
+
+def test_resource_schema_v2_accepts_exact_six_file_source_scope(
+        monkeypatch, tmp_path):
+    run_dir = tmp_path / "e0-test-row"
+    build_run(
+        monkeypatch, run_dir, "frozen-a", "normmaxmin",
+        resource_schema=RESOURCE_SCHEMA_V2)
+    write_v2_resource_record(run_dir)
+    row = manifest_row(run_dir)
+    bind_v2_source_contract(run_dir, row, V2_SOURCE_FILES)
+
+    report = validate_run_directory(
+        run_dir, manifest_row=row,
+        execution_source_root=run_dir / "execution-source")
+
+    assert report["runtime_provenance_verified"] is True
+
+
+@pytest.mark.parametrize("mutation", ["extra", "drift"])
+def test_resource_schema_v2_refuses_noncanonical_source_scope(
+        monkeypatch, tmp_path, mutation):
+    run_dir = tmp_path / "e0-test-row"
+    _, result_path = build_run(
+        monkeypatch, run_dir, "frozen-a", "normmaxmin")
+    write_v2_resource_record(run_dir)
+    row = manifest_row(run_dir)
+    bind_v2_source_contract(run_dir, row, V2_SOURCE_FILES)
+    with result_path.open() as handle:
+        result = json.load(handle)
+    if mutation == "extra":
+        result["provenance"]["source_sha256"]["unbound.py"] = "0" * 64
+    else:
+        result["provenance"]["source_sha256"]["e0_resources.py"] = "0" * 64
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="source_sha256"):
+        validate_run_directory(
+            run_dir, manifest_row=row,
+            execution_source_root=run_dir / "execution-source")
+
+
 @pytest.mark.parametrize(("target", "mutation"), [
     ("json", "timing"),
     ("json", "gpu"),
@@ -2882,7 +2978,9 @@ def test_resource_schema_v2_is_replayed_from_raw_evidence(
 def test_resource_schema_v2_refuses_mutated_claims_or_evidence(
         monkeypatch, tmp_path, target, mutation):
     run_dir = tmp_path / "e0-test-row"
-    build_run(monkeypatch, run_dir, "frozen-a", "normmaxmin")
+    build_run(
+        monkeypatch, run_dir, "frozen-a", "normmaxmin",
+        resource_schema=RESOURCE_SCHEMA_V2)
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
     log = log_dir / "e0-test-row.log"
@@ -2958,7 +3056,9 @@ def test_resource_schema_v2_refuses_mutated_claims_or_evidence(
 def test_resource_schema_v2_requires_raw_boundary_sidecar(
         monkeypatch, tmp_path):
     run_dir = tmp_path / "e0-test-row"
-    build_run(monkeypatch, run_dir, "frozen-a", "normmaxmin")
+    build_run(
+        monkeypatch, run_dir, "frozen-a", "normmaxmin",
+        resource_schema=RESOURCE_SCHEMA_V2)
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
     log = log_dir / "e0-test-row.log"

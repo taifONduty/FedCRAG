@@ -533,6 +533,29 @@ def test_driver_direction_policy_changes_the_configuration_hash(
 # ------------------------------------------------------ provenance refusal
 
 
+def test_schema_v2_producer_hashes_resource_parser_and_launcher(
+        monkeypatch, tmp_path):
+    result, _ = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        extra=["--resource_schema", "fedcrag-e0-resources/2"])
+
+    expected = {
+        "federated_forgetting.py",
+        "aggregation_schemes.py",
+        "fedcrag_common.py",
+        "requirements.txt",
+        "e0_resources.py",
+        "run_e0.sh",
+    }
+    assert result["provenance"]["resource_schema"] == \
+        "fedcrag-e0-resources/2"
+    assert set(result["provenance"]["source_sha256"]) == expected
+    assert set(driver._provenance_sources(
+        driver.RESOURCE_SCHEMA_V2)) == expected
+    assert set(driver._provenance_sources(driver.RESOURCE_SCHEMA_V1)) == \
+        expected - {"e0_resources.py", "run_e0.sh"}
+
+
 @pytest.mark.parametrize("commit", ["abc123def456-dirty", "unknown",
                                     "abc123def456-unknown-worktree"])
 def test_normmaxmin_refuses_unclean_source_provenance(

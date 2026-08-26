@@ -115,7 +115,8 @@ def module_scales(lora_mode, row_scale_c=1.0, row_scale_mode="unit"):
 
 
 def fixture_runtime_provenance(commit, requested_model, model_path, model,
-                               scales, data_root, data_sha256):
+                               scales, data_root, data_sha256,
+                               resource_schema="fedcrag-e0-resources/1"):
     """Complete synthetic provenance accepted by the hardened validator."""
     installed = {
         "numpy": "fixture-1",
@@ -126,12 +127,17 @@ def fixture_runtime_provenance(commit, requested_model, model_path, model,
     }
     encoded = json.dumps(
         installed, sort_keys=True, separators=(",", ":")).encode()
+    source_files = (
+        "federated_forgetting.py", "aggregation_schemes.py",
+        "fedcrag_common.py", "requirements.txt",
+    )
+    if resource_schema == "fedcrag-e0-resources/2":
+        source_files += ("e0_resources.py", "run_e0.sh")
     return {
         "git_commit": commit,
+        "resource_schema": resource_schema,
         "source_sha256": {
-            name: "0" * 64 for name in (
-                "federated_forgetting.py", "aggregation_schemes.py",
-                "fedcrag_common.py", "requirements.txt")
+            name: "0" * 64 for name in source_files
         },
         "python": "fixture-python 3",
         "platform": "fixture-platform",

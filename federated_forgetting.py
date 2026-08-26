@@ -16,7 +16,12 @@ from peft import (LoraConfig, TaskType,
 from fedcrag_common import (load_slice_with_train, doc_text, resolve_local,
                             evaluate_metrics, check_lora_targets, LORA_TARGETS,
                             amp_enabled, get_git_commit)
-from e0_resources import ResourceValidationError, validate_run_id
+from e0_resources import (
+    RESOURCE_SCHEMA_V1,
+    RESOURCE_SCHEMA_V2,
+    ResourceValidationError,
+    validate_run_id,
+)
 
 
 def get_adapter_state(model):
@@ -48,6 +53,24 @@ from aggregation_schemes import (SchemeResult, afl_update, apply_delta_weights,
                                  validate_frozen_a_states)
 
 LORA_A_SUFFIX = ".lora_A.weight"
+_LEGACY_PROVENANCE_SOURCES = (
+    "federated_forgetting.py",
+    "aggregation_schemes.py",
+    "fedcrag_common.py",
+    "requirements.txt",
+)
+_V2_PROVENANCE_SOURCES = _LEGACY_PROVENANCE_SOURCES + (
+    "e0_resources.py",
+    "run_e0.sh",
+)
+
+
+def _provenance_sources(resource_schema):
+    if resource_schema == RESOURCE_SCHEMA_V1:
+        return _LEGACY_PROVENANCE_SOURCES
+    if resource_schema == RESOURCE_SCHEMA_V2:
+        return _V2_PROVENANCE_SOURCES
+    raise ValueError(f"unsupported resource schema: {resource_schema!r}")
 
 
 def _assert_finite_state(state, context):
@@ -160,10 +183,10 @@ def _data_fingerprints(data):
 
 
 def _runtime_provenance(commit, requested_model, model_path, model,
-                        module_scales, data_root, data_sha256):
+                        module_scales, data_root, data_sha256,
+                        resource_schema=RESOURCE_SCHEMA_V1):
     root = os.path.dirname(os.path.abspath(__file__))
-    source_files = ("federated_forgetting.py", "aggregation_schemes.py",
-                    "fedcrag_common.py", "requirements.txt")
+    source_files = _provenance_sources(resource_schema)
     versions = {}
     for package in ("torch", "sentence-transformers", "peft", "scipy",
                     "numpy"):
@@ -185,6 +208,7 @@ def _runtime_provenance(commit, requested_model, model_path, model,
         separators=(",", ":")).encode("utf-8")
     return {
         "git_commit": commit,
+        "resource_schema": resource_schema,
         "source_sha256": {
             name: _sha256_file(os.path.join(root, name))
             for name in source_files
@@ -477,6 +501,12 @@ def main():
     ap.add_argument("--no_grad_ckpt", action="store_true",
                     help="disable gradient checkpointing (faster when VRAM "
                          "allows; no effect on results)")
+    ap.add_argument(
+        "--resource_schema",
+        choices=[RESOURCE_SCHEMA_V1, RESOURCE_SCHEMA_V2],
+        default=RESOURCE_SCHEMA_V1,
+        help="resource evidence schema whose implementation sources are "
+             "bound into runtime provenance")
     ap.add_argument("--data_root", default="./beir_data")
     ap.add_argument("--out", default="./results")
     args = ap.parse_args()
@@ -628,7 +658,7 @@ def main():
            },
            "provenance": _runtime_provenance(
                commit, args.model, model_path, model, module_scales,
-               args.data_root, data_sha256),
+               args.data_root, data_sha256, args.resource_schema),
            "args": vars(args), "clients": {}, "R_matrix": {}, "BWT": None}
     R = out["R_matrix"]
 

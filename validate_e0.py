@@ -27,6 +27,8 @@ from e0_direction_oracle import (
     min_norm_simplex_oracle,
 )
 from e0_resources import (
+    RESOURCE_SCHEMA_V1,
+    RESOURCE_SCHEMA_V2,
     ResourceValidationError,
     validate_resource_record,
 )
@@ -71,12 +73,29 @@ _APPLIED_NORM_RTOL = 1e-9
 
 _MANIFEST_SCHEMA = "fedcrag-e0-manifest/1"
 _RESOURCE_FILENAME = "e0_resources.json"
-_SOURCE_FILES = (
+_LEGACY_SOURCE_FILES = (
     "federated_forgetting.py",
     "aggregation_schemes.py",
     "fedcrag_common.py",
     "requirements.txt",
 )
+_V2_SOURCE_FILES = _LEGACY_SOURCE_FILES + (
+    "e0_resources.py",
+    "run_e0.sh",
+)
+
+
+def _resource_schema(arguments):
+    schema = arguments.get("resource_schema", RESOURCE_SCHEMA_V1)
+    _require(schema in (RESOURCE_SCHEMA_V1, RESOURCE_SCHEMA_V2),
+             f"unsupported resource schema {schema!r}")
+    return schema
+
+
+def _source_files(arguments):
+    if _resource_schema(arguments) == RESOURCE_SCHEMA_V1:
+        return _LEGACY_SOURCE_FILES
+    return _V2_SOURCE_FILES
 
 
 class E0ValidationError(RuntimeError):
@@ -1870,6 +1889,10 @@ def _manifest_argument_parser():
     parser.add_argument("--save_states", action="store_true")
     parser.add_argument("--max_steps_per_round", type=int, default=0)
     parser.add_argument("--no_grad_ckpt", action="store_true")
+    parser.add_argument(
+        "--resource_schema",
+        choices=[RESOURCE_SCHEMA_V1, RESOURCE_SCHEMA_V2],
+        default=RESOURCE_SCHEMA_V1)
     parser.add_argument("--data_root", default="./beir_data")
     parser.add_argument("--out", default="./results")
     return parser
@@ -1877,6 +1900,7 @@ def _manifest_argument_parser():
 
 def _validate_driver_argument_legality(arguments, label):
     """Mirror every cross-field launch constraint that defines E0 legality."""
+    _resource_schema(arguments)
     positive_integers = (
         "num_rounds", "local_epochs", "batch_size", "eval_batch_size",
         "lora_rank", "loss_sample",
@@ -1996,7 +2020,8 @@ _EXECUTION_FIELDS = (
     "fedspan_step_norm", "fedspan_active_abs_tol",
     "fedspan_active_rel_tol", "fedspan_mixture_norm_tol",
     "fedspan_max_abs_delta_weight", "allow_dirty_provenance", "save_states",
-    "max_steps_per_round", "no_grad_ckpt", "data_root", "out",
+    "max_steps_per_round", "no_grad_ckpt", "resource_schema", "data_root",
+    "out",
 )
 
 
@@ -2147,9 +2172,21 @@ def _validate_runtime_provenance(result, arguments):
     _require_json_equal(
         provenance.get("git_commit"), result.get("commit"),
         "runtime provenance git_commit vs result commit")
+    resource_schema = _resource_schema(arguments)
+    recorded_resource_schema = provenance.get(
+        "resource_schema", RESOURCE_SCHEMA_V1)
+    _require_json_equal(
+        recorded_resource_schema, resource_schema,
+        "runtime provenance resource_schema vs result arguments")
+    if resource_schema == RESOURCE_SCHEMA_V2:
+        _require("resource_schema" in arguments
+                 and "resource_schema" in provenance,
+                 "schema v2 runtime provenance must explicitly record its "
+                 "resource_schema")
+    source_files = _source_files(arguments)
     source_hashes = provenance.get("source_sha256")
     _require(isinstance(source_hashes, dict)
-             and sorted(source_hashes) == sorted(_SOURCE_FILES),
+             and sorted(source_hashes) == sorted(source_files),
              "runtime provenance source_sha256 does not cover canonical "
              "source files")
     for name, digest in sorted(source_hashes.items()):
@@ -2299,14 +2336,15 @@ def _validate_execution_source(result, row, execution_source_root):
              "result provenance git_commit differs from the recorded run "
              "commit")
     recorded_hashes = provenance.get("source_sha256")
+    source_files = _source_files(result.get("args") or {})
     _require(isinstance(recorded_hashes, dict)
-             and sorted(recorded_hashes) == sorted(_SOURCE_FILES),
+             and sorted(recorded_hashes) == sorted(source_files),
              "result provenance source_sha256 does not cover the canonical "
              "frozen E0 source files")
     source_hashes = {
         name: hashlib.sha256(_git_capture(
             source_root, "show", f"{full_commit}:{name}")).hexdigest()
-        for name in _SOURCE_FILES
+        for name in source_files
     }
     _require(recorded_hashes == source_hashes,
              "result provenance source_sha256 differs from canonical files "
@@ -2353,15 +2391,18 @@ def _validate_manifest_row(result, row, run_id, execution_source_root):
              "result records no argument namespace to compare")
     contract = result.get("method_contract") or {}
     for field in _EXECUTION_FIELDS:
-        _require(field in arguments,
-                 f"result argument namespace omits {field}")
+        if field != "resource_schema":
+            _require(field in arguments,
+                     f"result argument namespace omits {field}")
         expected = launched[field]
+        recorded = (arguments.get(field, RESOURCE_SCHEMA_V1)
+                    if field == "resource_schema" else arguments[field])
         mismatch = _first_json_mismatch(
-            arguments[field], expected, f"result args.{field}")
+            recorded, expected, f"result args.{field}")
         _require(
             mismatch is None,
             f"manifest row '{run_id}' launched {field}={expected!r} but the "
-            f"result records {arguments[field]!r}: {mismatch}")
+            f"result records {recorded!r}: {mismatch}")
     for field in ("model", "slices", "metrics", "seed", "num_rounds",
                   "lora_mode", "weighted"):
         _require_json_equal(
@@ -2450,6 +2491,10 @@ def _validate_resource_record(run_directory, result):
             f"run directory has no safe {_RESOURCE_FILENAME}, so its "
             f"GPU-hour and determinism claims are unauditable: {exc}") from exc
     run_id = Path(run_directory).name
+    expected_schema = _resource_schema(result.get("args") or {})
+    _require(record.get("schema") == expected_schema,
+             f"{_RESOURCE_FILENAME} schema {record.get('schema')!r} differs "
+             f"from result provenance resource_schema {expected_schema!r}")
     log_directory = Path(run_directory).parent / "logs"
     log_path = log_directory / f"{run_id}.log"
     samples_path = log_directory / f"{run_id}.gpu"

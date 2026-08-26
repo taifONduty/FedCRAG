@@ -86,6 +86,7 @@ def test_e0_commands_freeze_shared_scientific_contract():
         command = row["command"]
         for required in (
             "--model contriever",
+            "--resource_schema fedcrag-e0-resources/2",
             "--slices nfcorpus fiqa scifact arguana",
             "--seed 42",
             "--num_rounds 5",

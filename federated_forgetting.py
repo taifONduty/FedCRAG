@@ -397,11 +397,12 @@ def main():
     ap.add_argument("--frozen_a_row_scale", choices=["unit", "peft-init"],
                     default=None,
                     help="row constant c in A A^T = c^2 I for --lora_mode "
-                         "frozen-a (default 'unit'). 'peft-init' rescales the "
-                         "orthonormal rows to the module's own measured "
-                         "pre-orthogonalization row RMS, so client effective "
-                         "step magnitudes are comparable with trainable-ab. "
-                         "The two modes are distinct arms, not interchangeable "
+                         "frozen-a; required, so choose explicitly: 'unit' "
+                         "fixes c=1, while 'peft-init' rescales the orthonormal "
+                         "rows to the module's own measured pre-"
+                         "orthogonalization row RMS so client effective step "
+                         "magnitudes are comparable with trainable-ab. The "
+                         "two choices are distinct arms, not interchangeable "
                          "settings of one arm")
     ap.add_argument("--weighted", action="store_true")
     ap.add_argument("--weight_by",

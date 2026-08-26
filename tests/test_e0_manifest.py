@@ -5,7 +5,9 @@ launched, so ``verify`` — the subcommand ``run`` and ``resume`` both begin
 with — is exercised here for real, in a hermetic clean worktree.
 """
 import os
+import re
 import select
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -126,6 +128,125 @@ def test_e0_commands_freeze_shared_scientific_contract():
             assert "--fedspan_step_norm" not in command
             # The driver rejects the direction policy on any other arm.
             assert "--fedspan_direction_policy" not in command
+
+
+# ------------------------------------------------ documentation contract
+
+
+def _readme_corrected_fedspan_command():
+    readme = (ROOT / "README.md").read_text()
+    match = re.search(
+        r"Corrected FedSpan requires all of:\s*```bash\s*(.*?)\s*```",
+        readme, flags=re.DOTALL)
+    assert match, "README has no canonical corrected-FedSpan command"
+    return shlex.split(match.group(1).replace("\\\n", " "))
+
+
+def _flag_values(tokens, flags):
+    values = {}
+    for flag in flags:
+        occurrences = [index for index, token in enumerate(tokens)
+                       if token == flag]
+        assert len(occurrences) == 1, f"expected exactly one {flag}"
+        index = occurrences[0]
+        assert index + 1 < len(tokens), f"{flag} has no value"
+        values[flag] = tokens[index + 1]
+    return values
+
+
+def _prose(text):
+    """Normalize Markdown wrapping without weakening wording assertions."""
+    return " ".join(text.replace(">", " ").split()).lower()
+
+
+def _method_flags(tokens):
+    return {
+        token for token in tokens
+        if token.startswith(("--lora_", "--frozen_a_", "--fedspan_"))
+        or token in {"--weighted", "--weight_by"}
+    }
+
+
+def test_readme_canonical_fedspan_command_matches_frozen_manifest_method():
+    readme_tokens = _readme_corrected_fedspan_command()
+    frozen = next(
+        row for row in manifest_rows()
+        if row["run_id"] == "e0-frozen-a-normmaxmin-full")
+    manifest_tokens = shlex.split(frozen["command"])
+    value_flags = {
+        "--lora_rank",
+        "--lora_mode",
+        "--frozen_a_row_scale",
+        "--weight_by",
+        "--fedspan_step_policy",
+        "--fedspan_direction_policy",
+        "--fedspan_active_abs_tol",
+        "--fedspan_active_rel_tol",
+        "--fedspan_mixture_norm_tol",
+    }
+
+    expected = _flag_values(manifest_tokens, value_flags)
+    assert expected == {
+        "--lora_rank": "16",
+        "--lora_mode": "frozen-a",
+        "--frozen_a_row_scale": "peft-init",
+        "--weight_by": "normmaxmin",
+        "--fedspan_step_policy": "median-active",
+        "--fedspan_direction_policy": "minnorm",
+        "--fedspan_active_abs_tol": "1e-12",
+        "--fedspan_active_rel_tol": "1e-8",
+        "--fedspan_mixture_norm_tol": "1e-6",
+    }
+    assert _flag_values(readme_tokens, value_flags) == expected
+    assert _method_flags(readme_tokens) == _method_flags(manifest_tokens)
+    assert "--weighted" in readme_tokens
+    assert "--save_states" in readme_tokens
+    assert "--fedspan_max_abs_delta_weight" not in readme_tokens
+    assert "--fedspan_max_abs_delta_weight" not in manifest_tokens
+
+
+def test_readme_reports_completed_eleven_row_correctness_campaign_only():
+    readme = (ROOT / "README.md").read_text()
+    e0 = readme.split("### E0 correctness grid", 1)[1].split(
+        "### API retrievers", 1)[0]
+    status = readme.split("> ## Status:", 1)[1].split("---", 1)[0]
+
+    status_prose = _prose(status)
+    assert "eleven-row" in _prose(status + e0)
+    assert "correctness campaign completed" in status_prose
+    assert "strengthened post-hoc validation is pending" in status_prose
+    assert "no paper-scale efficacy claim" in status_prose
+    assert "ten-row" not in e0.lower()
+    assert "exact ten commands" not in e0.lower()
+    assert "no E0 run exists" not in readme
+
+
+def test_readme_discloses_legacy_timing_limit_without_discarding_total_runtime():
+    readme = _prose((ROOT / "README.md").read_text())
+
+    assert "legacy e0 per-round timings are unavailable" in readme
+    assert "total row runtime remains usable" in readme
+
+
+def test_help_and_readme_require_an_explicit_frozen_a_row_scale():
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "federated_forgetting.py"), "--help"],
+        cwd=ROOT, check=True, capture_output=True, text=True)
+    help_text = completed.stdout.lower()
+    readme = _prose((ROOT / "README.md").read_text())
+
+    for text in (help_text, readme):
+        assert "unit is the default" not in text
+        assert "unit is an implicit" not in text
+        assert "default 'unit'" not in text
+        assert 'default "unit"' not in text
+        assert not re.search(r"\bunit\b.{0,60}\b(?:default|implicit)\b", text)
+        assert not re.search(r"\b(?:default|implicit)\b.{0,60}\bunit\b", text)
+    assert "required" in help_text
+    assert "choose explicitly" in help_text
+    assert "unit" in help_text and "peft-init" in help_text
+    assert "separate explicit choices" in readme
+    assert "no safe implicit row-scale default" in readme
 
 
 # -------------------------------------------------- the verify subcommand

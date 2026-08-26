@@ -4,12 +4,13 @@ A research codebase for studying **catastrophic forgetting in dense retrievers u
 temporally evolving / federated client knowledge**, and for building a continual
 adapter-based federated retriever that prevents it without sharing raw documents.
 
-> ## Status: implemented, NOT validated
+> ## Status: implemented; E0 correctness campaign complete; strengthened validation pending
 >
-> **No E0 run and no E1–E5 run exists in this repository.** The frozen-A,
-> norm-consistent `normmaxmin` (FedSpan) path is implemented with fail-closed
-> diagnostics and covered by CPU unit tests, and nothing more. No claim about whether
-> it works is supported by a completed experiment.
+> **An external eleven-row E0 correctness campaign completed; strengthened post-hoc
+> validation is pending.** This is correctness/attribution evidence only: it supports
+> no paper-scale efficacy claim, and no E1–E5 run exists. The frozen-A, norm-consistent
+> `normmaxmin` (FedSpan) path is implemented with fail-closed diagnostics and covered by
+> CPU tests.
 >
 > - Everything in `results/` is a **historical `bge-m3` trainable-A+B run**. `bge-m3`
 >   fails this repo's own headroom gate (below), so those files are not paper evidence.
@@ -204,9 +205,13 @@ Flags specific to this script:
   python federated_forgetting.py \
       --model contriever --slices nfcorpus fiqa scifact arguana \
       --num_rounds 5 --seed 42 --weighted \
-      --lora_mode frozen-a --weight_by normmaxmin \
+      --lora_rank 16 --lora_mode frozen-a \
+      --frozen_a_row_scale peft-init --weight_by normmaxmin \
       --fedspan_step_policy median-active \
       --fedspan_direction_policy minnorm \
+      --fedspan_active_abs_tol 1e-12 \
+      --fedspan_active_rel_tol 1e-8 \
+      --fedspan_mixture_norm_tol 1e-6 \
       --save_states
   ```
 
@@ -240,13 +245,14 @@ Flags specific to this script:
   in `fedspan_diagnostics`, alongside `direction_policy` and `direction_policy_specified`.
 
   `--frozen_a_row_scale` (frozen-A only) sets the row constant `c` in `A Aᵀ = c² I`.
-  `unit` (`c = 1`) is the default and today's behavior; `peft-init` rescales the
-  orthonormal rows to the module's own measured pre-orthogonalization row RMS, matching
-  PEFT's initialization scale. **The two are separate arms, not interchangeable
-  settings** — switching rescales every client's effective step, so they must be declared
-  and run separately. The resolved value, its explicitness, and the per-module record are
-  written to `method_contract`, folded into the configuration hash, and tagged into the
-  output filename so the two arms cannot overwrite each other.
+  `unit` fixes `c = 1`; `peft-init` rescales the orthonormal rows to the module's own
+  measured pre-orthogonalization row RMS, matching PEFT's initialization scale. These
+  are **separate explicit choices**, not interchangeable settings, and there is no safe
+  implicit row-scale default. Every frozen-A invocation must declare one because
+  switching rescales every client's effective step. The resolved value, its
+  explicitness, and the per-module record are written to `method_contract`, folded into
+  the configuration hash, and tagged into the output filename so the two arms cannot
+  overwrite each other.
 
   `--save_states` is mandatory. The command refuses
   unknown or dirty Git provenance unless `--allow_dirty_provenance` is supplied for a
@@ -282,10 +288,10 @@ Run this before committing the narrative.
 <a id="e0-correctness-grid"></a>
 ### E0 correctness grid
 
-The frozen ten-row E0 grid is exposed separately:
+The frozen eleven-row E0 grid is exposed separately:
 
 ```bash
-bash run_e0.sh manifest  # print the exact ten commands; no tests or training
+bash run_e0.sh manifest  # print the exact eleven commands; no tests or training
 bash run_e0.sh verify    # require clean provenance and run CPU gates; no training
 bash run_e0.sh run       # execute only after cloud spend is explicitly authorized
 bash run_e0.sh resume    # continue an interrupted campaign against its frozen manifest
@@ -295,6 +301,12 @@ bash run_e0.sh resume    # continue an interrupted campaign against its frozen m
 worktree so completed rows cannot dirty provenance for later rows. `run` freezes a
 `manifest.json` and refuses to start on top of an existing one; `resume` refuses to
 continue if the manifest's commit or rows no longer match the tree.
+
+For the completed legacy campaign, legacy E0 per-round timings are unavailable because
+buffered output did not preserve trustworthy round boundaries. The total row runtime
+remains usable from the row-level launcher timestamps. Future launcher artifacts use the
+strengthened timing evidence contract; this does not retroactively reconstruct legacy
+round timings.
 
 **E0 numbers are not comparable to the paper's cells. Do not quote them as results.**
 
@@ -322,8 +334,9 @@ continue if the manifest's commit or rows no longer match the tree.
   (`train_samples_per_second × train_runtime` per client, floor-divided by 32, matching
   `NoDuplicatesDataLoader.__len__`). The nfcorpus figure is the least precise of the four
   because the log rates are rounded — but it is an order of magnitude above the cap, so
-  its exact value does not affect which client binds. No E0 run exists to read these off
-  directly.
+  its exact value does not affect which client binds. The external E0 correctness
+  campaign has completed, but these figures remain estimates from the cited `f42` log,
+  not measurements read from E0.
 
 ### API retrievers (OpenRouter / OpenAI / Cohere / Voyage)
 Benchmark-only — no weight access, so API models **cannot** be LoRA-trained and never enter

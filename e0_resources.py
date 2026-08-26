@@ -621,6 +621,7 @@ def validate_resource_record(record, expected_run_id, num_rounds,
         "elapsed_seconds": elapsed,
         "peak_gpu_memory_mib": peak,
         "deterministic_algorithms": record["deterministic_algorithms"],
+        "torch_version": record["torch_version"],
     }
     if schema == RESOURCE_SCHEMA_V1:
         started = _legacy_utc(record.get("started_utc"), "started_utc")

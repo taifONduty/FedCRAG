@@ -5,6 +5,7 @@ aggregation dispatch, the diagnostics, the persisted states and hashes — is
 the production code path. Only the parts that need a GPU and a corpus are
 replaced.
 """
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -113,6 +114,43 @@ def module_scales(lora_mode, row_scale_c=1.0, row_scale_mode="unit"):
     return scales
 
 
+def fixture_runtime_provenance(commit, requested_model, model_path, model,
+                               scales, data_root, data_sha256):
+    """Complete synthetic provenance accepted by the hardened validator."""
+    installed = {
+        "numpy": "fixture-1",
+        "peft": "fixture-1",
+        "scipy": "fixture-1",
+        "sentence-transformers": "fixture-1",
+        "torch": torch.__version__,
+    }
+    encoded = json.dumps(
+        installed, sort_keys=True, separators=(",", ":")).encode()
+    return {
+        "git_commit": commit,
+        "source_sha256": {
+            name: "0" * 64 for name in (
+                "federated_forgetting.py", "aggregation_schemes.py",
+                "fedcrag_common.py", "requirements.txt")
+        },
+        "python": "fixture-python 3",
+        "platform": "fixture-platform",
+        "packages": dict(installed),
+        "installed_packages": installed,
+        "installed_packages_sha256": hashlib.sha256(encoded).hexdigest(),
+        "model": {
+            "requested_name": requested_model,
+            "resolved_path": model_path,
+            "config_name_or_path": requested_model,
+            "upstream_commit_hash": None,
+            "config_sha256": "1" * 64,
+        },
+        "data_root": str(Path(data_root).resolve()),
+        "data_sha256": data_sha256,
+        "module_scales": scales,
+    }
+
+
 def effective_updates(states, broadcast):
     """Dense sigma * (B_k A_k - B_g A_g) per client, flattened to float64."""
     vectors = []
@@ -152,14 +190,7 @@ def install_mocks(monkeypatch, commit=CLEAN_COMMIT, clients=None,
         driver, "get_adapter_state",
         lambda model: {key: value.clone() for key, value in base.items()})
     monkeypatch.setattr(
-        driver, "_runtime_provenance",
-        lambda commit, requested_model, model_path, model, scales,
-               data_root, data_sha256: {
-                   "test": True,
-                   "data_root": str(Path(data_root).resolve()),
-                   "data_sha256": data_sha256,
-                   "module_scales": scales,
-               })
+        driver, "_runtime_provenance", fixture_runtime_provenance)
     monkeypatch.setattr(
         driver, "client_train",
         lambda model, global_state, data, q_prefix, d_prefix, epochs,

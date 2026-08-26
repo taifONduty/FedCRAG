@@ -2113,6 +2113,131 @@ def _validate_configuration_hash(result, arguments, data_sha256):
         "contract and dataset fingerprints")
 
 
+def _validate_runtime_provenance(result, arguments):
+    """Cross-bind runtime/model/data duplicates and certify package inventory."""
+    provenance = result.get("provenance")
+    _require(isinstance(provenance, dict),
+             "result runtime provenance is not an object")
+    for field in ("python", "platform"):
+        value = provenance.get(field)
+        _require(isinstance(value, str) and bool(value.strip()),
+                 f"runtime provenance {field} must be nonempty text")
+
+    _require_json_equal(
+        provenance.get("git_commit"), result.get("commit"),
+        "runtime provenance git_commit vs result commit")
+    source_hashes = provenance.get("source_sha256")
+    _require(isinstance(source_hashes, dict)
+             and sorted(source_hashes) == sorted(_SOURCE_FILES),
+             "runtime provenance source_sha256 does not cover canonical "
+             "source files")
+    for name, digest in sorted(source_hashes.items()):
+        _require(isinstance(digest, str)
+                 and re.fullmatch(r"[0-9a-f]{64}", digest) is not None,
+                 f"runtime provenance source_sha256 for {name!r} is invalid")
+
+    installed = provenance.get("installed_packages")
+    _require(isinstance(installed, dict) and bool(installed),
+             "runtime provenance installed_packages must be a nonempty object")
+    normalized_installed = {}
+    for name, version in installed.items():
+        _require(isinstance(name, str) and bool(name.strip())
+                 and isinstance(version, str) and bool(version.strip()),
+                 "runtime provenance installed_packages has invalid metadata")
+        canonical = name.lower()
+        _require(canonical not in normalized_installed,
+                 f"runtime provenance installed_packages has a "
+                 f"case-normalized collision at {canonical!r}")
+        normalized_installed[canonical] = version
+    encoded = json.dumps(
+        installed, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    expected_digest = hashlib.sha256(encoded).hexdigest()
+    recorded_digest = provenance.get("installed_packages_sha256")
+    _require(isinstance(recorded_digest, str)
+             and re.fullmatch(r"[0-9a-f]{64}", recorded_digest) is not None,
+             "runtime provenance installed_packages_sha256 is invalid")
+    _require(recorded_digest == expected_digest,
+             "runtime provenance installed_packages_sha256 does not match "
+             "the canonical installed_packages JSON")
+
+    packages = provenance.get("packages")
+    _require(isinstance(packages, dict) and bool(packages),
+             "runtime provenance packages must be a nonempty object")
+    for name, version in sorted(packages.items()):
+        _require(isinstance(name, str) and bool(name.strip())
+                 and isinstance(version, str) and bool(version.strip()),
+                 "runtime provenance packages has invalid metadata")
+        canonical = name.lower()
+        _require(canonical in normalized_installed,
+                 f"runtime provenance packages entry {name!r} is absent from "
+                 "installed_packages")
+        _require(normalized_installed[canonical] == version,
+                 f"runtime provenance packages entry {name!r} differs from "
+                 "installed_packages")
+
+    model = provenance.get("model")
+    _require(isinstance(model, dict),
+             "runtime provenance model metadata is not an object")
+    for field in ("requested_name", "resolved_path", "config_name_or_path"):
+        value = model.get(field)
+        _require(isinstance(value, str) and bool(value.strip()),
+                 f"runtime provenance model.{field} must be nonempty text")
+    config_digest = model.get("config_sha256")
+    _require(isinstance(config_digest, str)
+             and re.fullmatch(r"[0-9a-f]{64}", config_digest) is not None,
+             "runtime provenance model.config_sha256 is invalid")
+    _require_json_equal(
+        model["requested_name"], result.get("model"),
+        "runtime provenance model.requested_name vs result model")
+    _require_json_equal(
+        model["requested_name"], arguments.get("model"),
+        "runtime provenance model.requested_name vs args.model")
+
+    data_root = provenance.get("data_root")
+    _require(isinstance(data_root, str) and bool(data_root.strip()),
+             "runtime provenance data_root must be nonempty text")
+    _require(
+        Path(data_root).resolve()
+        == Path(arguments.get("data_root", "")).expanduser().resolve(),
+        "runtime provenance data_root differs from args.data_root")
+    data_hashes = provenance.get("data_sha256")
+    slices = arguments.get("slices")
+    _require(isinstance(data_hashes, dict)
+             and isinstance(slices, list)
+             and sorted(data_hashes) == sorted(slices),
+             "runtime provenance data_sha256 does not cover args.slices")
+    for name, digest in sorted(data_hashes.items()):
+        _require(isinstance(digest, str)
+                 and re.fullmatch(r"[0-9a-f]{64}", digest) is not None,
+                 f"runtime provenance data_sha256 for {name!r} is invalid")
+
+    scales = provenance.get("module_scales")
+    if result.get("lora_mode") == "frozen-a":
+        records = (result.get("method_contract") or {}).get(
+            "frozen_a_row_scale_records")
+        _require(isinstance(records, dict) and bool(records),
+                 "runtime provenance cannot bind missing frozen-A scale "
+                 "records")
+        expected_scales = {}
+        for name, record in sorted(records.items()):
+            _require(isinstance(record, dict)
+                     and _finite(record.get("geometry_scale")),
+                     f"runtime provenance cannot bind invalid scale record "
+                     f"for {name!r}")
+            expected_scales[name] = record["geometry_scale"]
+        _require_json_equal(
+            scales, expected_scales,
+            "runtime provenance module_scales vs frozen-A scale records")
+    else:
+        _require(_finite(scales) and float(scales) > 0.0,
+                 "runtime provenance module_scales must be positive and "
+                 "finite")
+    return {
+        "installed_packages": normalized_installed,
+        "packages": packages,
+    }
+
+
 def _git_capture(source_root, *arguments, text=False):
     environment = dict(os.environ)
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
@@ -2348,6 +2473,7 @@ def validate_run_directory(run_directory, manifest_row=None,
         "result does not have clean Git provenance: execution commit must be "
         "exactly 12 lowercase hex "
         f"characters, recorded {commit!r}")
+    runtime = _validate_runtime_provenance(result, arguments)
 
     num_rounds = result["num_rounds"]
     state_paths = sorted(run_directory.glob("states_*.pt"))
@@ -2373,6 +2499,12 @@ def validate_run_directory(run_directory, manifest_row=None,
             result, manifest_row, run_directory.name,
             execution_source_root)
         resources = _validate_resource_record(run_directory, result)
+        installed_torch = runtime["installed_packages"].get("torch")
+        _require(isinstance(installed_torch, str) and bool(installed_torch),
+                 "runtime provenance has no installed torch package version")
+        _require(resources.get("torch_version") == installed_torch,
+                 "resource torch_version differs from runtime provenance "
+                 "installed torch package")
     elif result["lora_mode"] == "frozen-a":
         provenance = result.get("provenance") or {}
         recorded_fingerprints = provenance.get("data_sha256")
@@ -2520,6 +2652,14 @@ def validate_run_directory(run_directory, manifest_row=None,
         "dataset_content_verified": data_fingerprints is not None,
         "recorded_fingerprint_cross_binding_verified": (
             manifest_row is not None),
+        "runtime_provenance_verified": True,
+        "interpreter_provenance_status": (
+            "lexical-path-bound-no-executable-digest"
+            if manifest_row is not None else
+            "not-manifest-bound-no-executable-digest"),
+        "interpreter_executable_digest_verified": False,
+        "initial_adapter_trust_anchor_status": (
+            "post-hoc-self-recorded-anchor-no-external-digest"),
         "frozen_a_scale_audit": scale_audit,
         "fedspan_direction_residuals": direction_audit,
         "rawmaxmin_direction_residuals": rawmaxmin_audit,

@@ -191,7 +191,8 @@ def test_driver_normmaxmin_dispatch_persists_exact_round_record(
         driver, "get_adapter_state",
         lambda model: {key: value.clone() for key, value in broadcast.items()})
     monkeypatch.setattr(
-        driver, "_runtime_provenance", lambda *args, **kwargs: {"test": True})
+        driver, "_runtime_provenance",
+        driver_harness.fixture_runtime_provenance)
     monkeypatch.setattr(
         driver, "client_train",
         lambda model, global_state, data, q_prefix, d_prefix, epochs,

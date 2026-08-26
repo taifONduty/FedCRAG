@@ -1900,12 +1900,13 @@ def test_nested_duplicate_json_key_is_refused(monkeypatch, tmp_path):
     _, result_path = build_run(
         monkeypatch, tmp_path, "frozen-a", "normmaxmin")
     raw = result_path.read_text()
-    needle = '"test": true'
+    needle = '"requested_name": "bge-m3"'
     assert needle in raw
     result_path.write_text(raw.replace(
-        needle, '"test": true, "test": true', 1))
+        needle,
+        '"requested_name": "bge-m3", "requested_name": "bge-m3"', 1))
 
-    with pytest.raises(E0ValidationError, match="duplicate.*test"):
+    with pytest.raises(E0ValidationError, match="duplicate.*requested_name"):
         validate_run_directory(tmp_path)
 
 
@@ -2128,6 +2129,7 @@ def test_a_matching_manifest_row_validates(monkeypatch, tmp_path):
         "elapsed_seconds": 12.0,
         "peak_gpu_memory_mib": None,
         "deterministic_algorithms": False,
+        "torch_version": torch.__version__,
         "round_timing_valid": False,
         "round_timing_status": "legacy-buffered-unavailable",
         "round_elapsed_seconds": None,
@@ -2173,6 +2175,98 @@ def test_manifest_comparison_is_type_exact_for_integer_fields(
 
     with pytest.raises(E0ValidationError, match="seed.*(?:type|integer)"):
         validate_run_directory(tmp_path, manifest_row=manifest_row(tmp_path))
+
+
+def test_runtime_provenance_digest_is_recomputed(monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    result = json.loads(result_path.read_text())
+    result["provenance"]["installed_packages_sha256"] = "0" * 64
+    rewrite(result_path, result)
+
+    with pytest.raises(
+            E0ValidationError, match="installed_packages_sha256"):
+        validate_run_directory(tmp_path)
+
+
+def test_named_package_versions_bind_to_installed_packages(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    result = json.loads(result_path.read_text())
+    result["provenance"]["packages"]["torch"] = "stale-version"
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="packages.*torch"):
+        validate_run_directory(tmp_path)
+
+
+def test_resource_torch_version_binds_to_runtime_package(
+        monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    resource = tmp_path / "e0_resources.json"
+    record = json.loads(resource.read_text())
+    record["torch_version"] = "stale-version"
+    resource.write_text(json.dumps(record))
+
+    with pytest.raises(E0ValidationError, match="torch_version.*torch"):
+        validate_run_directory(tmp_path, manifest_row=manifest_row(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "field_path",
+    ["python", "platform", "model.requested_name", "model.resolved_path"],
+)
+def test_runtime_and_model_identity_fields_must_be_nonempty(
+        monkeypatch, tmp_path, field_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    result = json.loads(result_path.read_text())
+    target = result["provenance"]
+    components = field_path.split(".")
+    for component in components[:-1]:
+        target = target[component]
+    target[components[-1]] = ""
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match=field_path.replace(".", ".*")):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize("duplicate", ["model", "data", "module_scales"])
+def test_runtime_duplicate_fields_bind_to_validated_values(
+        monkeypatch, tmp_path, duplicate):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    result = json.loads(result_path.read_text())
+    provenance = result["provenance"]
+    if duplicate == "model":
+        provenance["model"]["requested_name"] = "different-model"
+    elif duplicate == "data":
+        provenance["data_sha256"][driver_harness.SLICES[0]] = "f" * 64
+    else:
+        provenance["module_scales"][driver_harness.MODULE] *= 2.0
+    rewrite(result_path, result)
+    write_resource_record(tmp_path)
+
+    with pytest.raises(E0ValidationError, match=duplicate.replace("_", ".*")):
+        validate_run_directory(tmp_path, manifest_row=manifest_row(tmp_path))
+
+
+def test_report_describes_lexical_interpreter_and_posthoc_anchor_limits(
+        monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+
+    report = validate_run_directory(
+        tmp_path, manifest_row=manifest_row(tmp_path))
+
+    assert report["interpreter_provenance_status"] == \
+        "lexical-path-bound-no-executable-digest"
+    assert report["interpreter_executable_digest_verified"] is False
+    assert report["initial_adapter_trust_anchor_status"] == \
+        "post-hoc-self-recorded-anchor-no-external-digest"
 
 
 def test_manifest_relative_repo_interpreter_validates(monkeypatch, tmp_path):

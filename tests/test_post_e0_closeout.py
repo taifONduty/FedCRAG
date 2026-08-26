@@ -17,6 +17,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "post_e0_closeout.sh"
 EXPECTED_COMMIT = "7325bf56381c24c6a4af013688bdd417c95d7d7d"
+EXPECTED_COMMIT_SHORT = "7325bf56381c"
 
 
 @pytest.fixture
@@ -25,20 +26,22 @@ def closeout_env(tmp_path):
     source = tmp_path / "remote-e0-results"
     source.mkdir()
     (source / "COMPLETE.json").write_text(json.dumps({
-        "commit": EXPECTED_COMMIT,
+        "commit": EXPECTED_COMMIT_SHORT,
         "rows": [f"row-{index}" for index in range(11)],
     }))
     (source / "manifest.json").write_text(json.dumps({
-        "commit": EXPECTED_COMMIT,
+        "commit": EXPECTED_COMMIT_SHORT,
         "rows": [
-            {"run_id": f"row-{index}", "commit": EXPECTED_COMMIT}
+            {"run_id": f"row-{index}", "commit": EXPECTED_COMMIT_SHORT}
             for index in range(11)
         ],
     }))
     for index in range(11):
         row = source / f"row-{index}"
         row.mkdir()
-        (row / "result.json").write_text("{}\n")
+        (row / "federated_result.json").write_text(json.dumps({
+            "commit": EXPECTED_COMMIT_SHORT,
+        }))
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -50,6 +53,7 @@ def closeout_env(tmp_path):
 set -eu
 printf '%s\\n' \"$*\" >> \"$FAKE_GCLOUD_LOG\"
 if [ \"$1\" = config ]; then
+  [ \"${FAKE_CONFIG_FAIL:-0}\" = 0 ] || exit 1
   printf '%s\\n' \"${FAKE_PROJECT:-project-e0}\"
   exit 0
 fi
@@ -170,6 +174,20 @@ def test_refuses_literal_unset_project(closeout_env):
     assert completed.returncode == 4
     assert_not_published(closeout_env)
     assert not cloud_calls(closeout_env)[1:]
+
+
+def test_refuses_failed_project_query_before_any_instance_call(closeout_env):
+    completed = run_driver(closeout_env, FAKE_CONFIG_FAIL="1")
+    assert completed.returncode == 3
+    assert_not_published(closeout_env)
+    assert cloud_calls(closeout_env) == ["config get-value project"]
+
+
+def test_refuses_failed_zone_query_before_start(closeout_env):
+    completed = run_driver(closeout_env, FAKE_LIST_FAIL="1")
+    assert completed.returncode == 3
+    assert_not_published(closeout_env)
+    assert not any("instances start" in call for call in cloud_calls(closeout_env))
 
 
 @pytest.mark.parametrize("failure", ["validation", "copy", "checksum"])

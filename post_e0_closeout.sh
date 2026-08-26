@@ -46,7 +46,10 @@ preserve_attempt() {
     local failure
     [ -n "$ATTEMPT" ] && [ -d "$ATTEMPT" ] || return 0
     failure=$(new_failure_path)
-    mv "$ATTEMPT" "$failure"
+    mv "$ATTEMPT" "$failure" || {
+        say "CRITICAL: cannot preserve failed attempt at $failure"
+        return 1
+    }
     ATTEMPT=
 }
 
@@ -119,8 +122,10 @@ require_clean_worktree() {
 }
 
 discover_target() {
-    local discovery_status zone
+    local discovery_status project_status zone
     E0_PROJECT="$(gcloud config get-value project)"
+    project_status=$?
+    [ "$project_status" -eq 0 ] || return 3
     [ -n "$E0_PROJECT" ] && [ "$E0_PROJECT" != "(unset)" ] || return 4
 
     # Deliberately capture the command status before interpreting stdout.
@@ -194,20 +199,37 @@ copy_regular_tree() {
 }
 
 check_identity_and_rows() {
-    local root=$1 rows
+    local root=$1
     [ -f "$root/COMPLETE.json" ] && [ -f "$root/manifest.json" ] || return 1
-    grep -F "$EXECUTION_COMMIT_SHORT" "$root/COMPLETE.json" >/dev/null || return 1
-    grep -F "$EXECUTION_COMMIT" "$root/COMPLETE.json" >/dev/null || return 1
-    grep -F "$EXECUTION_COMMIT_SHORT" "$root/manifest.json" >/dev/null || return 1
-    grep -F "$EXECUTION_COMMIT" "$root/manifest.json" >/dev/null || return 1
-    rows=$("$PYTHON_BIN" - "$root/manifest.json" <<'PY'
-import json, sys
-value = json.load(open(sys.argv[1], encoding="utf-8"))
-rows = value.get("rows", value if isinstance(value, list) else [])
-print(len(rows))
+    "$PYTHON_BIN" - "$root" "$EXECUTION_COMMIT_SHORT" "$EXPECTED_ROWS" <<'PY'
+import glob, json, os, sys
+root, expected_commit, expected_rows = sys.argv[1], sys.argv[2], int(sys.argv[3])
+complete = json.load(open(os.path.join(root, "COMPLETE.json"), encoding="utf-8"))
+manifest = json.load(open(os.path.join(root, "manifest.json"), encoding="utf-8"))
+rows = manifest.get("rows")
+if complete.get("commit") != expected_commit or manifest.get("commit") != expected_commit:
+    raise SystemExit("completion or manifest commit is not the frozen short identity")
+if not isinstance(rows, list) or len(rows) != expected_rows:
+    raise SystemExit("manifest does not contain eleven rows")
+if complete.get("validated_rows") and len(complete["validated_rows"]) != expected_rows:
+    raise SystemExit("completion does not record eleven validated rows")
+run_ids = [row.get("run_id") for row in rows if isinstance(row, dict)]
+if len(run_ids) != expected_rows or len(set(run_ids)) != expected_rows or not all(run_ids):
+    raise SystemExit("manifest row identities are invalid")
+for run_id in run_ids:
+    paths = glob.glob(os.path.join(root, run_id, "federated_*.json"))
+    if len(paths) != 1:
+        raise SystemExit("row lacks one federated result: " + run_id)
+    result = json.load(open(paths[0], encoding="utf-8"))
+    if result.get("commit") != expected_commit:
+        raise SystemExit("result commit is not the frozen short identity: " + run_id)
 PY
-)
-    [ "$rows" = "$EXPECTED_ROWS" ]
+}
+
+resolve_execution_commit() {
+    local repository=$1 resolved
+    resolved=$(git -C "$repository" rev-parse "${EXECUTION_COMMIT_SHORT}^{commit}") || return 1
+    [ "$resolved" = "$EXECUTION_COMMIT" ]
 }
 
 run_test_snapshot() {
@@ -218,6 +240,7 @@ run_test_snapshot() {
     if [ "${POST_E0_TEST_FAIL:-}" = copy ]; then return 1; fi
     copy_regular_tree "$source" "$ATTEMPT/artifacts" || return 1
     check_identity_and_rows "$ATTEMPT/artifacts" || return 1
+    resolve_execution_commit "$SCRIPT_DIR" || return 1
     inventory_tree "$ATTEMPT/artifacts" > "$ATTEMPT/audit/local_inventory.jsonl" || return 1
     cmp "$ATTEMPT/audit/remote_pre_inventory.jsonl" \
         "$ATTEMPT/audit/local_inventory.jsonl" || return 1
@@ -254,8 +277,10 @@ run_production_snapshot() {
     # The remote subcommand refuses unsafe entries, copies only inventoried
     # regular files to /tmp, and runs the strengthened validator from the
     # fresh audit-commit clone.  Its outputs remain in /tmp until copied back.
+    printf '%s\n' "POST_E0_REMOTE_WORKER=1 bash /tmp/post_e0_closeout.sh '$REMOTE_ARTIFACT_ROOT' '$remote_base' '$audit_commit' '$EXECUTION_COMMIT'" \
+        > "$ATTEMPT/audit/remote_command.txt" || return 1
     gcloud compute ssh "$INSTANCE" --project "$E0_PROJECT" --zone "$E0_ZONE" \
-        --command "POST_E0_REMOTE_WORKER=1 bash /tmp/post_e0_closeout.sh '$REMOTE_ARTIFACT_ROOT' '$remote_base' '$audit_commit' '$EXECUTION_COMMIT'" || return 1
+        --command "$(cat "$ATTEMPT/audit/remote_command.txt")" || return 1
     gcloud compute scp --recurse "$INSTANCE:$remote_base/artifacts" \
         "$INSTANCE:$remote_base/audit" "$ATTEMPT/" --project "$E0_PROJECT" \
         --zone "$E0_ZONE" || return 1
@@ -279,6 +304,13 @@ remote_worker() {
     repo="/tmp/fedspan-post-e0-audit-${audit_commit}"
     rm -rf "$repo"
     git clone "/tmp/fedspan-post-e0-audit-${audit_commit}.bundle" "$repo" || return 1
+    resolve_execution_commit "$repo" || return 1
+    {
+        printf 'audit_clone=%s\n' "$repo"
+        printf 'execution_source_root=/home/turjo/FedCRAG\n'
+        git -C /home/turjo/FedCRAG rev-parse HEAD
+        git -C /home/turjo/FedCRAG status --porcelain
+    } > "$stage/audit/execution_source_identity.txt" || return 1
     rows=$("$PYTHON_BIN" - "$stage/artifacts/manifest.json" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -287,7 +319,10 @@ for row in value["rows"]:
 PY
 ) || return 1
     : > "$stage/audit/validator_output.jsonl"
-    for run in $rows; do
+    printf '%s\n' "/home/turjo/FedCRAG/.venv/bin/python $repo/validate_e0.py <row> --manifest $stage/artifacts/manifest.json --run_id <row> --execution_source_root /home/turjo/FedCRAG" \
+        > "$stage/audit/validator_command.txt" || return 1
+    while IFS= read -r run; do
+        [ -n "$run" ] || continue
         /home/turjo/FedCRAG/.venv/bin/python "$repo/validate_e0.py" "$stage/artifacts/$run" \
             --manifest "$stage/artifacts/manifest.json" --run_id "$run" \
             --execution_source_root /home/turjo/FedCRAG \
@@ -296,7 +331,9 @@ PY
                     > "$stage/audit/validation_failure.txt"
                 return 1
             }
-    done
+    done <<EOF
+$rows
+EOF
     /home/turjo/FedCRAG/.venv/bin/python - <<'PY' > "$stage/audit/runtime_versions.txt"
 import numpy, sys, torch
 print("python=" + sys.version.replace("\n", " "))
@@ -326,12 +363,54 @@ PY
     [ -f "$ATTEMPT/audit/2026-08-25_E0_STRENGTHENED_VALIDATION_CLOSEOUT.md" ] || \
         printf '%s\n' "Post-hoc internally consistent preservation; not a signed historical attestation." \
             > "$ATTEMPT/audit/2026-08-25_E0_STRENGTHENED_VALIDATION_CLOSEOUT.md"
-    /bin/bash --version > "$ATTEMPT/audit/bash_version.txt"
+    /bin/bash --version > "$ATTEMPT/audit/bash_version.txt" || return 1
+    "$PYTHON_BIN" - "$ATTEMPT/artifacts/manifest.json" \
+        "$ATTEMPT/audit/staged_manifest_digest.json" <<'PY' || return 1
+import hashlib, json, os, sys
+path, output = sys.argv[1:]
+digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+json.dump({"path": "artifacts/manifest.json", "size": os.path.getsize(path),
+           "sha256": digest}, open(output, "w", encoding="utf-8"),
+          sort_keys=True)
+PY
+}
+
+verify_manifest_digest() {
+    "$PYTHON_BIN" - "$ATTEMPT/artifacts/manifest.json" \
+        "$ATTEMPT/audit/staged_manifest_digest.json" <<'PY'
+import hashlib, json, os, sys
+path, record_path = sys.argv[1:]
+record = json.load(open(record_path, encoding="utf-8"))
+actual = {"path": "artifacts/manifest.json", "size": os.path.getsize(path),
+          "sha256": hashlib.sha256(open(path, "rb").read()).hexdigest()}
+raise SystemExit(0 if actual == record else "exported manifest digest changed")
+PY
 }
 
 package_and_verify() {
-    (cd "$ATTEMPT" && shasum -a 256 SOURCE_SHA256SUMS audit/* > PACKAGE_SHA256SUMS) || return 1
-    (cd "$ATTEMPT" && shasum -a 256 -c PACKAGE_SHA256SUMS >/dev/null) || return 1
+    "$PYTHON_BIN" - "$ATTEMPT" <<'PY' || return 1
+import hashlib, json, os, sys
+root = sys.argv[1]
+paths = ["SOURCE_SHA256SUMS"]
+for base, dirs, files in os.walk(os.path.join(root, "audit")):
+    dirs.sort(key=os.fsencode); files.sort(key=os.fsencode)
+    for name in files:
+        paths.append(os.path.relpath(os.path.join(base, name), root))
+with open(os.path.join(root, "PACKAGE_SHA256SUMS"), "w", encoding="utf-8") as output:
+    for relative in sorted(paths, key=os.fsencode):
+        path = os.path.join(root, relative)
+        digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        output.write(json.dumps({"path": relative, "sha256": digest}, sort_keys=True) + "\n")
+PY
+    "$PYTHON_BIN" - "$ATTEMPT" <<'PY'
+import hashlib, json, os, sys
+root = sys.argv[1]
+for line in open(os.path.join(root, "PACKAGE_SHA256SUMS"), encoding="utf-8"):
+    record = json.loads(line)
+    path = os.path.join(root, record["path"])
+    if hashlib.sha256(open(path, "rb").read()).hexdigest() != record["sha256"]:
+        raise SystemExit("package checksum mismatch: " + record["path"])
+PY
 }
 
 main() {
@@ -352,7 +431,7 @@ main() {
     CLEANUP_ARMED=1
 
     before=$(get_status) || fail "initial VM status query was malformed or failed"
-    printf 'before=%s\n' "$before" > "$ATTEMPT/audit/vm_state.txt"
+    printf 'before=%s\n' "$before" > "$ATTEMPT/audit/vm_state.txt" || fail "cannot record initial VM state"
     if [ "$before" = TERMINATED ]; then
         gcloud compute instances start "$INSTANCE" --project "$E0_PROJECT" \
             --zone "$E0_ZONE" --quiet || fail "could not start terminated VM"
@@ -362,7 +441,7 @@ main() {
     else
         after=$before
     fi
-    printf 'after=%s\n' "$after" >> "$ATTEMPT/audit/vm_state.txt"
+    printf 'after=%s\n' "$after" >> "$ATTEMPT/audit/vm_state.txt" || fail "cannot record post-start VM state"
 
     if [ "${POST_E0_TEST_MODE:-}" = 1 ]; then
         run_test_snapshot "${POST_E0_TEST_REMOTE_ROOT:-}" \
@@ -378,8 +457,9 @@ main() {
         CLEANUP_DONE=1
         fail "explicit shutdown could not be verified" "$CRITICAL_SHUTDOWN"
     fi
-    printf 'final=TERMINATED\n' >> "$ATTEMPT/audit/vm_state.txt"
+    printf 'final=TERMINATED\n' >> "$ATTEMPT/audit/vm_state.txt" || fail "cannot record final VM state"
     package_and_verify || fail "package checksum gate failed"
+    verify_manifest_digest || fail "exported manifest digest gate failed"
     mv "$ATTEMPT" "$DEST" || fail "atomic publication rename failed"
     ATTEMPT=
 }

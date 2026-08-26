@@ -51,19 +51,24 @@ new_failure_path() {
     local stamp counter candidate
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
     counter=0
-    while :; do
+    while [ "$counter" -lt 100 ]; do
         candidate="${DEST}.failed-${stamp}-${counter}"
         if [ ! -e "$candidate" ] && [ ! -L "$candidate" ] && mkdir "$candidate"; then
             printf '%s\n' "$candidate"; return
         fi
-        counter=$((counter + 1))
+        if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+            counter=$((counter + 1))
+        else
+            return 1
+        fi
     done
+    return 1
 }
 
 preserve_attempt() {
     local failure
     [ -n "$ATTEMPT" ] && [ -d "$ATTEMPT" ] || return 0
-    failure=$(new_failure_path)
+    failure=$(new_failure_path) || { say "CRITICAL: cannot reserve failure path"; return 1; }
     mv "$ATTEMPT"/* "$failure/" && rmdir "$ATTEMPT" || {
         say "CRITICAL: cannot preserve failed attempt at $failure"
         return 1
@@ -74,7 +79,7 @@ preserve_attempt() {
 preserve_preflight_failure() {
     local message=$1 failure
     mkdir -p "$(dirname "$DEST")" || return 0
-    failure=$(new_failure_path)
+    failure=$(new_failure_path) || return 0
     mkdir "$failure/audit" || return 0
     printf '%s\n' "$message" > "$failure/audit/preflight_failure.txt"
 }
@@ -406,7 +411,7 @@ PY
     "$PYTHON_BIN" - "$stage/audit/validator_output.jsonl" "$stage/artifacts/status.tsv" \
         "$stage/artifacts/manifest.json" \
         "$stage/audit/validation_summary.json" <<'PY' || return 1
-import json, os, sys
+import datetime, json, os, sys
 reports_path, status_path, manifest_path, output = sys.argv[1:]
 reports = [json.loads(line) for line in open(reports_path, encoding="utf-8") if line.strip()]
 if len(reports) != 11:
@@ -423,13 +428,17 @@ rows = [row["run_id"] for row in json.load(open(manifest_path))["rows"]]
 seen = {}
 for line in open(status_path, encoding="utf-8"):
     fields = line.rstrip("\n").split("\t")
-    if len(fields) != 3 or fields[1] != "VALIDATED":
+    if len(fields) != 4 or fields[1] != "VALIDATED":
         continue
-    run_id, _, seconds = fields
+    run_id, _, seconds, timestamp = fields
     if run_id not in rows or run_id in seen:
         raise SystemExit("status records do not uniquely bind validated rows")
     try: seen[run_id] = float(seconds)
     except ValueError: raise SystemExit("status runtime is not numeric")
+    try:
+        parsed = datetime.datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+        if parsed.tzinfo is not None: raise ValueError
+    except ValueError: raise SystemExit("status timestamp is not UTC RFC3339 seconds")
 if set(seen) != set(rows) or len(seen) != 11:
     raise SystemExit("status records do not cover every validated row")
 summary = {"validated_rows": len(reports), "reports": reports,

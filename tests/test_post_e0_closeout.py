@@ -43,7 +43,7 @@ def closeout_env(tmp_path):
             "commit": EXPECTED_COMMIT_SHORT,
         }))
     (source / "status.tsv").write_text("".join(
-        f"row-{index}\tVALIDATED\t{index + 1}.5\n" for index in range(11)))
+        f"row-{index}\tVALIDATED\t{index + 1}.5\t2026-08-25T12:00:00Z\n" for index in range(11)))
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -286,6 +286,14 @@ def test_refuses_missing_empty_duplicate_or_wrong_completion_rows(
 ])
 def test_refuses_status_rows_that_do_not_bind_each_validated_run(closeout_env, status_rows):
     (closeout_env["source"] / "status.tsv").write_text(status_rows)
+    completed = run_driver(closeout_env, FAKE_STATUSES="RUNNING,TERMINATED")
+    assert completed.returncode == 20
+    assert_not_published(closeout_env)
+
+
+def test_refuses_malformed_real_status_timestamp(closeout_env):
+    status = closeout_env["source"] / "status.tsv"
+    status.write_text(status.read_text().replace("2026-08-25T12:00:00Z", "not-a-timestamp", 1))
     completed = run_driver(closeout_env, FAKE_STATUSES="RUNNING,TERMINATED")
     assert completed.returncode == 20
     assert_not_published(closeout_env)

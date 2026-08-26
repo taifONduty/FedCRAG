@@ -82,6 +82,7 @@ if [ \"$1\" = compute ] && [ \"$2\" = instances ] && [ \"$3\" = start ]; then
   exit 0
 fi
 if [ \"$1\" = compute ] && [ \"$2\" = instances ] && [ \"$3\" = stop ]; then
+  if [ \"${FAKE_CREATE_DEST_ON_STOP:-0}\" = 1 ]; then mkdir -p \"$POST_E0_DEST\"; printf foreign > \"$POST_E0_DEST/marker\"; fi
   [ \"${FAKE_STOP_FAIL:-0}\" = 0 ] || exit 1
   exit 0
 fi
@@ -299,6 +300,15 @@ def test_refuses_malformed_real_status_timestamp(closeout_env):
     assert_not_published(closeout_env)
 
 
+@pytest.mark.parametrize("runtime", ["NaN", "inf", "0", "-1"])
+def test_refuses_nonpositive_or_nonfinite_runtime(closeout_env, runtime):
+    status = closeout_env["source"] / "status.tsv"
+    status.write_text(status.read_text().replace("1.5", runtime, 1))
+    completed = run_driver(closeout_env, FAKE_STATUSES="RUNNING,TERMINATED")
+    assert completed.returncode == 20
+    assert_not_published(closeout_env)
+
+
 @pytest.mark.parametrize("failure", ["validation", "copy", "checksum"])
 def test_failure_gates_preserve_unique_attempt_and_refuse_publication(closeout_env, failure):
     completed = run_driver(
@@ -328,6 +338,15 @@ def test_existing_canonical_destination_is_refused_before_start(closeout_env):
     assert closeout_env["destination"].is_dir()
     assert not failed_attempts(closeout_env)
     assert not any("instances start" in call for call in cloud_calls(closeout_env))
+
+
+def test_refuses_concurrent_destination_before_promotion_without_nesting(closeout_env):
+    completed = run_driver(closeout_env, FAKE_CREATE_DEST_ON_STOP="1",
+                           FAKE_STATUSES="RUNNING,TERMINATED")
+    assert completed.returncode == 20
+    assert (closeout_env["destination"] / "marker").read_text() == "foreign"
+    assert not (closeout_env["destination"] / "2026-08-25.attempt").exists()
+    assert failed_attempts(closeout_env)
 
 
 @pytest.mark.parametrize("extra", [

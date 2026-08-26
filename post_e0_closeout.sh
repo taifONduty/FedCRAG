@@ -42,6 +42,7 @@ E0_ZONE=
 CLEANUP_ARMED=0
 CLEANUP_DONE=0
 VM_TOUCHED=0
+PUBLICATION_LOCK=
 
 say() { printf '%s\n' "$*" >&2; }
 
@@ -100,6 +101,17 @@ create_attempt() {
     return 1
 }
 
+verify_canonical_layout() {
+    "$PYTHON_BIN" - "$DEST" <<'PY'
+import os, sys
+root = sys.argv[1]
+if set(os.listdir(root)) != {"artifacts", "audit", "SOURCE_SHA256SUMS", "PACKAGE_SHA256SUMS"}:
+    raise SystemExit("canonical top-level layout is not exact")
+if not os.path.isdir(os.path.join(root, "artifacts")) or not os.path.isdir(os.path.join(root, "audit")):
+    raise SystemExit("canonical directories are missing")
+PY
+}
+
 get_status() {
     local output status
     output=$(gcloud compute instances describe "$INSTANCE" --project "$E0_PROJECT" \
@@ -143,6 +155,7 @@ cleanup() {
     if [ "$original" -ne 0 ]; then
         preserve_attempt
     fi
+    [ -z "$PUBLICATION_LOCK" ] || rmdir "$PUBLICATION_LOCK" 2>/dev/null || :
     exit "$original"
 }
 
@@ -411,7 +424,7 @@ PY
     "$PYTHON_BIN" - "$stage/audit/validator_output.jsonl" "$stage/artifacts/status.tsv" \
         "$stage/artifacts/manifest.json" \
         "$stage/audit/validation_summary.json" <<'PY' || return 1
-import datetime, json, os, sys
+import datetime, json, math, os, sys
 reports_path, status_path, manifest_path, output = sys.argv[1:]
 reports = [json.loads(line) for line in open(reports_path, encoding="utf-8") if line.strip()]
 if len(reports) != 11:
@@ -435,6 +448,8 @@ for line in open(status_path, encoding="utf-8"):
         raise SystemExit("status records do not uniquely bind validated rows")
     try: seen[run_id] = float(seconds)
     except ValueError: raise SystemExit("status runtime is not numeric")
+    if not math.isfinite(seen[run_id]) or seen[run_id] <= 0:
+        raise SystemExit("status runtime must be finite and positive")
     try:
         parsed = datetime.datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
         if parsed.tzinfo is not None: raise ValueError
@@ -546,6 +561,8 @@ main() {
     trap on_signal INT TERM
     [ ! -e "$DEST" ] && [ ! -L "$DEST" ] || fail "canonical destination already exists" 5
     mkdir -p "$(dirname "$DEST")" || fail "cannot create preservation parent"
+    PUBLICATION_LOCK="${DEST}.publication-lock"
+    mkdir "$PUBLICATION_LOCK" || fail "cannot reserve sibling publication lock" 5
     create_attempt || fail "cannot create exclusive attempt"
     CLEANUP_ARMED=1
 
@@ -574,8 +591,12 @@ main() {
     printf 'final=TERMINATED\n' >> "$ATTEMPT/audit/vm_state.txt" || fail "cannot record final VM state"
     package_and_verify || fail "package checksum gate failed"
     verify_manifest_digest || fail "exported manifest digest gate failed"
-    mv "$ATTEMPT" "$DEST" || fail "atomic publication rename failed"
+    [ ! -e "$DEST" ] && [ ! -L "$DEST" ] || fail "canonical destination appeared before promotion"
+    mv "$ATTEMPT" "$DEST" || fail "guarded publication rename failed"
     ATTEMPT=
+    verify_canonical_layout || fail "canonical layout verification failed"
+    rmdir "$PUBLICATION_LOCK" || fail "cannot release publication lock"
+    PUBLICATION_LOCK=
 }
 
 if [ "${POST_E0_REMOTE_WORKER:-}" = 1 ]; then

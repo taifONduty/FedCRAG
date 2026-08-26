@@ -2220,6 +2220,8 @@ def test_resource_schema_v2_is_replayed_from_raw_evidence(
     ("log", "raw"),
     ("samples", "raw"),
     ("boundaries", "raw"),
+    ("boundaries", "unicode-clock"),
+    ("boundaries", "oversized-clock"),
 ])
 def test_resource_schema_v2_refuses_mutated_claims_or_evidence(
         monkeypatch, tmp_path, target, mutation):
@@ -2258,6 +2260,7 @@ def test_resource_schema_v2_refuses_mutated_claims_or_evidence(
         "gpu_available": True,
         "peak_gpu_memory_mib": 250,
         "gpu_memory_samples": 1,
+        "determinism_probe": "separate interpreter, same environment",
         "deterministic_algorithms": False,
         "cudnn_deterministic": False,
         "cudnn_benchmark": False,
@@ -2281,10 +2284,17 @@ def test_resource_schema_v2_refuses_mutated_claims_or_evidence(
         log.write_text(log.read_text() + "mutation\n")
     elif target == "samples":
         samples.write_text("999\n")
-    else:
+    elif mutation == "raw":
         boundaries.write_text(boundaries.read_text() + "mutation\n")
+    else:
+        bad_clock = "١" if mutation == "unicode-clock" else "9" * 5000
+        boundaries.write_text(
+            f"E0_BOUNDARY\tstart\te0-test-row\t{bad_clock}\t100\n"
+            "E0_BOUNDARY\tfinish\te0-test-row\t900\t1000\n")
 
-    with pytest.raises(E0ValidationError):
+    message = "bounded ASCII decimal" if mutation in (
+        "unicode-clock", "oversized-clock") else None
+    with pytest.raises(E0ValidationError, match=message):
         validate_run_directory(
             run_dir, manifest_row=manifest_row(run_dir))
 

@@ -1920,11 +1920,10 @@ def _validate_resource_record(run_directory, result):
     log_directory = Path(run_directory).parent / "logs"
     log_path = log_directory / f"{run_id}.log"
     samples_path = log_directory / f"{run_id}.gpu"
-    boundaries_path = log_directory / f"{run_id}.boundaries"
     try:
         return validate_resource_record(
             record, run_id, int(result["num_rounds"]),
-            log_path, samples_path, boundaries_path)
+            log_path, samples_path)
     except (ResourceValidationError, OSError, UnicodeError) as exc:
         raise E0ValidationError(
             f"{_RESOURCE_FILENAME} is invalid: {exc}") from exc

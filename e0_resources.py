@@ -25,8 +25,10 @@ RESOURCE_FILENAME = "e0_resources.json"
 
 _RUN_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _ROUND_MARKER = re.compile(
-    r"E0_ROUND_(START|END) ([a-z0-9]+(?:-[a-z0-9]+)*) (\d+)/(\d+)")
+    r"E0_ROUND_(START|END) ([a-z0-9]+(?:-[a-z0-9]+)*) "
+    r"([0-9]+)/([0-9]+)")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_MAX_CLOCK_VALUE = (1 << 63) - 1
 
 
 class ResourceValidationError(RuntimeError):
@@ -45,8 +47,20 @@ def _is_int(value):
 def _is_finite(value):
     try:
         return not isinstance(value, bool) and math.isfinite(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
+
+
+def _parse_ascii_decimal(text, field):
+    """Parse one bounded, nonnegative base-10 integer from raw evidence."""
+    _require(
+        isinstance(text, str) and 1 <= len(text) <= 19
+        and re.fullmatch(r"[0-9]+", text) is not None,
+        f"{field} is not a bounded ASCII decimal integer")
+    value = int(text)
+    _require(value <= _MAX_CLOCK_VALUE,
+             f"{field} exceeds the supported integer range")
+    return value
 
 
 def validate_run_id(run_id):
@@ -95,10 +109,12 @@ def _read_boundary_rows(boundaries_path):
                      and len(run_id) <= 128,
                      f"boundary evidence line {line_number} has malformed "
                      "run identity")
-            _require(wall_text.isdigit() and mono_text.isdigit(),
-                     f"boundary evidence line {line_number} has a "
-                     "non-integer clock")
-            rows.append((event, run_id, int(wall_text), int(mono_text)))
+            wall_ns = _parse_ascii_decimal(
+                wall_text, f"boundary evidence line {line_number} wall clock")
+            mono_ns = _parse_ascii_decimal(
+                mono_text,
+                f"boundary evidence line {line_number} monotonic clock")
+            rows.append((event, run_id, wall_ns, mono_ns))
     return rows
 
 
@@ -126,8 +142,35 @@ def parse_boundary_evidence(boundaries_path, expected_run_id):
     }
 
 
+def boundary_path_for_log(log_path, run_id):
+    """Locate independent boundary evidence from the bound row identity."""
+    validate_run_id(run_id)
+    return Path(log_path).parent / f"{run_id}.boundaries"
+
+
+def _atomic_replace_text(path, content):
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent,
+                prefix=f".{path.name}.", suffix=".tmp",
+                delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def record_boundary_evidence(boundaries_path, run_id, event):
-    """Persist and fsync one raw launcher boundary event."""
+    """Atomically persist and fsync one raw launcher boundary event."""
     validate_run_id(run_id)
     _require(event in ("start", "finish"),
              "boundary event must be 'start' or 'finish'")
@@ -135,20 +178,19 @@ def record_boundary_evidence(boundaries_path, run_id, event):
     if event == "start":
         _require(not path.exists(),
                  f"boundary evidence already exists: {path}")
-        mode = "x"
+        previous = ""
     else:
         rows = _read_boundary_rows(path)
         _require(len(rows) == 1 and rows[0][0] == "start"
                  and rows[0][1] == run_id,
                  "finish boundary requires exactly one matching start event")
-        mode = "a"
+        previous = (
+            f"E0_BOUNDARY\tstart\t{run_id}\t{rows[0][2]}\t{rows[0][3]}\n")
     wall_ns = time.time_ns()
     mono_ns = time.monotonic_ns()
-    with path.open(mode, encoding="utf-8") as handle:
-        handle.write(
-            f"E0_BOUNDARY\t{event}\t{run_id}\t{wall_ns}\t{mono_ns}\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    _atomic_replace_text(
+        path, previous
+        + f"E0_BOUNDARY\t{event}\t{run_id}\t{wall_ns}\t{mono_ns}\n")
     return wall_ns, mono_ns
 
 
@@ -173,10 +215,11 @@ def parse_timestamped_rounds(log_path, expected_run_id, num_rounds,
                 f"timestamped log line {line_number} lacks wall/monotonic "
                 "nanosecond prefixes")
             wall_text, mono_text, text = fields
-            _require(
-                wall_text.isdigit() and mono_text.isdigit(),
-                f"timestamped log line {line_number} has a non-integer "
-                "clock prefix")
+            _parse_ascii_decimal(
+                wall_text, f"timestamped log line {line_number} wall clock")
+            monotonic_ns = _parse_ascii_decimal(
+                mono_text,
+                f"timestamped log line {line_number} monotonic clock")
             match = _ROUND_MARKER.fullmatch(text)
             if match is None:
                 _require(
@@ -186,8 +229,13 @@ def parse_timestamped_rounds(log_path, expected_run_id, num_rounds,
                     "E0 round marker")
                 continue
             kind, run_id, round_text, denominator_text = match.groups()
-            observed.append((kind, run_id, int(round_text),
-                             int(denominator_text), int(mono_text),
+            observed.append((kind, run_id, _parse_ascii_decimal(
+                                 round_text,
+                                 f"timestamped log line {line_number} round"),
+                             _parse_ascii_decimal(
+                                 denominator_text,
+                                 f"timestamped log line {line_number} "
+                                 "denominator"), monotonic_ns,
                              line_number))
 
     expected_count = 2 * num_rounds
@@ -256,10 +304,8 @@ def _gpu_summary(samples_path):
                                  errors="strict") as samples:
         for line_number, line in enumerate(samples, 1):
             value = line.strip()
-            _require(value.isdigit(),
-                     f"GPU sample line {line_number} is not a nonnegative "
-                     "integer MiB value")
-            values.append(int(value))
+            values.append(_parse_ascii_decimal(
+                value, f"GPU sample line {line_number}"))
     return {
         "gpu_available": bool(values),
         "peak_gpu_memory_mib": max(values) if values else None,
@@ -287,10 +333,23 @@ def _determinism_metadata():
 
 
 def build_resource_record(run_id, log_path, samples_path, *,
-                          boundaries_path, num_rounds):
+                          started_wall_ns, finished_wall_ns,
+                          started_mono_ns, finished_mono_ns, num_rounds):
     """Construct schema v2 exclusively from launcher boundaries/raw evidence."""
     validate_run_id(run_id)
+    boundaries_path = boundary_path_for_log(log_path, run_id)
     boundaries = parse_boundary_evidence(boundaries_path, run_id)
+    supplied = {
+        "started_wall_ns": started_wall_ns,
+        "finished_wall_ns": finished_wall_ns,
+        "started_mono_ns": started_mono_ns,
+        "finished_mono_ns": finished_mono_ns,
+    }
+    for field, value in supplied.items():
+        _require(_is_int(value) and value >= 0,
+                 f"{field} must be a nonnegative integer")
+        _require(value == boundaries[field],
+                 f"{field} does not match raw boundary evidence")
     timing = parse_timestamped_rounds(
         log_path, run_id, num_rounds, boundaries["started_mono_ns"],
         boundaries["finished_mono_ns"])
@@ -378,7 +437,7 @@ def _legacy_utc(value, field):
 
 
 def validate_resource_record(record, expected_run_id, num_rounds,
-                             log_path, samples_path, boundaries_path=None):
+                             log_path, samples_path):
     """Validate a legacy total or fully replay schema-v2 raw evidence."""
     _require(_is_int(num_rounds) and num_rounds > 0,
              "num_rounds must be a positive integer")
@@ -407,8 +466,7 @@ def validate_resource_record(record, expected_run_id, num_rounds,
         }
 
     validate_run_id(expected_run_id)
-    _require(boundaries_path is not None,
-             "schema v2 requires raw boundary evidence")
+    boundaries_path = boundary_path_for_log(log_path, expected_run_id)
     raw_boundaries = parse_boundary_evidence(
         boundaries_path, expected_run_id)
     for field, value in raw_boundaries.items():
@@ -506,8 +564,7 @@ def write_resource_record(run_id, run_dir, log_path, samples_path, **kwargs):
         with temporary.open("r", encoding="utf-8") as handle:
             serialized = json.load(handle)
         validate_resource_record(
-            serialized, run_id, kwargs["num_rounds"], log_path, samples_path,
-            kwargs["boundaries_path"])
+            serialized, run_id, kwargs["num_rounds"], log_path, samples_path)
         os.replace(temporary, destination)
         temporary = None
     finally:
@@ -525,27 +582,38 @@ def _timestamp_filter():
         sys.stdout.flush()
 
 
-def _clock():
-    print(f"{time.time_ns()}\t{time.monotonic_ns()}", flush=True)
+def _clock(run_id=None, log_path=None, event=None):
+    persistence = (run_id, log_path, event)
+    _require(
+        all(value is None for value in persistence)
+        or all(value is not None for value in persistence),
+        "clock persistence requires --run-id, --log, and --event together")
+    if run_id is None:
+        wall_ns, mono_ns = time.time_ns(), time.monotonic_ns()
+    else:
+        wall_ns, mono_ns = record_boundary_evidence(
+            boundary_path_for_log(log_path, run_id), run_id, event)
+    print(f"{wall_ns}\t{mono_ns}", flush=True)
 
 
 def _parser():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("timestamp")
-    subparsers.add_parser("clock")
-    boundary = subparsers.add_parser("boundary")
-    boundary.add_argument("--run-id", required=True)
-    boundary.add_argument("--path", required=True)
-    boundary.add_argument("--event", choices=("start", "finish"),
-                          required=True)
+    clock = subparsers.add_parser("clock")
+    clock.add_argument("--run-id")
+    clock.add_argument("--log")
+    clock.add_argument("--event", choices=("start", "finish"))
     write = subparsers.add_parser("write")
     write.add_argument("--run-id", required=True)
     write.add_argument("--run-dir", required=True)
     write.add_argument("--log", required=True)
     write.add_argument("--samples", required=True)
-    write.add_argument("--boundaries", required=True)
-    write.add_argument("--num-rounds", required=True, type=int)
+    write.add_argument("--started-wall-ns", required=True)
+    write.add_argument("--finished-wall-ns", required=True)
+    write.add_argument("--started-mono-ns", required=True)
+    write.add_argument("--finished-mono-ns", required=True)
+    write.add_argument("--num-rounds", required=True)
     return parser
 
 
@@ -556,17 +624,20 @@ def main():
             _timestamp_filter()
             return
         if args.command == "clock":
-            _clock()
-            return
-        if args.command == "boundary":
-            wall_ns, mono_ns = record_boundary_evidence(
-                args.path, args.run_id, args.event)
-            print(f"{wall_ns}\t{mono_ns}", flush=True)
+            _clock(args.run_id, args.log, args.event)
             return
         record = write_resource_record(
             args.run_id, args.run_dir, args.log, args.samples,
-            boundaries_path=args.boundaries,
-            num_rounds=args.num_rounds)
+            started_wall_ns=_parse_ascii_decimal(
+                args.started_wall_ns, "--started-wall-ns"),
+            finished_wall_ns=_parse_ascii_decimal(
+                args.finished_wall_ns, "--finished-wall-ns"),
+            started_mono_ns=_parse_ascii_decimal(
+                args.started_mono_ns, "--started-mono-ns"),
+            finished_mono_ns=_parse_ascii_decimal(
+                args.finished_mono_ns, "--finished-mono-ns"),
+            num_rounds=_parse_ascii_decimal(
+                args.num_rounds, "--num-rounds"))
     except (ResourceValidationError, OSError, UnicodeError,
             json.JSONDecodeError, OverflowError, ValueError) as exc:
         print(f"e0_resources: {exc}", file=sys.stderr)

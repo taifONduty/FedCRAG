@@ -220,10 +220,16 @@ PY
 }
 
 write_resource_record() {
-  local run_id=$1 run_out=$2 log=$3 samples=$4 boundaries=$5
+  local run_id=$1 run_out=$2 log=$3 samples=$4
+  local started_wall_ns=$5 finished_wall_ns=$6
+  local started_mono_ns=$7 finished_mono_ns=$8
   "$PYTHON" e0_resources.py write \
     --run-id "$run_id" --run-dir "$run_out" --log "$log" \
-    --samples "$samples" --boundaries "$boundaries" --num-rounds "$ROUNDS"
+    --samples "$samples" \
+    --started-wall-ns "$started_wall_ns" \
+    --finished-wall-ns "$finished_wall_ns" \
+    --started-mono-ns "$started_mono_ns" \
+    --finished-mono-ns "$finished_mono_ns" --num-rounds "$ROUNDS"
 }
 
 timestamp_filter() {
@@ -273,6 +279,29 @@ row_is_validated() {
        END { exit found ? 0 : 1 }' "$E0_STATUS"
 }
 
+require_row_artifacts_absent() {
+  local run_id=$1 artifact
+  local blockers=()
+  for artifact in \
+      "$E0_OUT/$run_id" \
+      "$E0_OUT/logs/$run_id.log" \
+      "$E0_OUT/logs/$run_id.gpu" \
+      "$E0_OUT/logs/$run_id.boundaries"; do
+    if [[ -e "$artifact" ]]; then
+      blockers+=("$artifact")
+    fi
+  done
+  if [[ ${#blockers[@]} -eq 0 ]]; then
+    return 0
+  fi
+  printf 'refusing to overwrite preserved artifacts for unvalidated row %s; '\
+'remove every listed artifact before resume:\n' "$run_id" >&2
+  for artifact in "${blockers[@]}"; do
+    printf '  %s\n' "$artifact" >&2
+  done
+  return 2
+}
+
 validate_row() {
   "$PYTHON" validate_e0.py "$E0_OUT/$1" \
     --manifest "$E0_MANIFEST" --run_id "$1"
@@ -283,7 +312,6 @@ execute_row() {
   local run_out="$E0_OUT/$run_id"
   local log="$E0_OUT/logs/$run_id.log"
   local samples="$E0_OUT/logs/$run_id.gpu"
-  local boundaries="$E0_OUT/logs/$run_id.boundaries"
   local started_wall_ns finished_wall_ns started_mono_ns finished_mono_ns
   local elapsed_seconds sampler_pid="" status=0
 
@@ -291,8 +319,8 @@ execute_row() {
   build_command "$run_id" "$coordinate" "$arm" "$max_steps" "$row_scale"
   printf 'START %s\n' "$run_id"
   read -r started_wall_ns started_mono_ns \
-    < <("$PYTHON" e0_resources.py boundary --run-id "$run_id" \
-      --path "$boundaries" --event start)
+    < <("$PYTHON" e0_resources.py clock --run-id "$run_id" \
+      --log "$log" --event start)
   : > "$samples"
   if command -v nvidia-smi >/dev/null 2>&1; then
     (
@@ -316,8 +344,8 @@ execute_row() {
     wait "$sampler_pid" 2>/dev/null || true
   fi
   read -r finished_wall_ns finished_mono_ns \
-    < <("$PYTHON" e0_resources.py boundary --run-id "$run_id" \
-      --path "$boundaries" --event finish)
+    < <("$PYTHON" e0_resources.py clock --run-id "$run_id" \
+      --log "$log" --event finish)
   elapsed_seconds=$((
     (finished_mono_ns - started_mono_ns) / 1000000000
   ))
@@ -329,7 +357,9 @@ execute_row() {
   fi
 
   if ! write_resource_record \
-      "$run_id" "$run_out" "$log" "$samples" "$boundaries"; then
+      "$run_id" "$run_out" "$log" "$samples" \
+      "$started_wall_ns" "$finished_wall_ns" \
+      "$started_mono_ns" "$finished_mono_ns"; then
     append_status "$run_id" "UNAUDITABLE" "$elapsed_seconds"
     printf 'UNAUDITABLE %s: no resource record was written\n' "$run_id" >&2
     exit 1
@@ -361,7 +391,7 @@ timing_selftest_producer() {
 }
 
 timing_selftest() {
-  local scratch run_id run_out log samples boundaries
+  local scratch run_id run_out log samples
   local started_wall_ns finished_wall_ns started_mono_ns finished_mono_ns
   local status stage expected_index index
   scratch=$(mktemp -d "${TMPDIR:-/tmp}/fedcrag-e0-timing.XXXXXX")
@@ -369,21 +399,20 @@ timing_selftest() {
   run_out="$scratch/$run_id"
   log="$scratch/$run_id.log"
   samples="$scratch/$run_id.gpu"
-  boundaries="$scratch/$run_id.boundaries"
   mkdir -p "$run_out"
   : > "$samples"
   export FEDCRAG_E0_RUN_ID="$run_id"
 
   read -r started_wall_ns started_mono_ns \
-    < <("$PYTHON" e0_resources.py boundary --run-id "$run_id" \
-      --path "$boundaries" --event start)
+    < <("$PYTHON" e0_resources.py clock --run-id "$run_id" \
+      --log "$log" --event start)
   set +e
   run_timestamped_pipeline "$log" timing_selftest_producer
   status=$?
   set -e
   read -r finished_wall_ns finished_mono_ns \
-    < <("$PYTHON" e0_resources.py boundary --run-id "$run_id" \
-      --path "$boundaries" --event finish)
+    < <("$PYTHON" e0_resources.py clock --run-id "$run_id" \
+      --log "$log" --event finish)
   if [[ $status -ne 0 ]]; then
     printf 'timing self-test success pipeline failed\n' >&2
     rm -rf "$scratch"
@@ -391,7 +420,11 @@ timing_selftest() {
   fi
   if ! "$PYTHON" e0_resources.py write \
       --run-id "$run_id" --run-dir "$run_out" --log "$log" \
-      --samples "$samples" --boundaries "$boundaries" \
+      --samples "$samples" \
+      --started-wall-ns "$started_wall_ns" \
+      --finished-wall-ns "$finished_wall_ns" \
+      --started-mono-ns "$started_mono_ns" \
+      --finished-mono-ns "$finished_mono_ns" \
       --num-rounds 2 >/dev/null; then
     rm -rf "$scratch"
     return 1
@@ -565,11 +598,7 @@ campaign() {
       printf 'SKIP %s (already validated)\n' "$run_id"
       continue
     fi
-    if [[ -e "$run_out" ]]; then
-      printf 'refusing to overwrite the unvalidated E0 run directory %s; '\
-'remove it to re-run this row\n' "$run_out" >&2
-      exit 2
-    fi
+    require_row_artifacts_absent "$run_id"
     execute_row "$run_id" "$coordinate" "$arm" "$max_steps"
   done
   write_completion_marker
@@ -577,24 +606,31 @@ campaign() {
     "${#E0_ROWS[@]}" "$E0_COMPLETE"
 }
 
-case "${1:-}" in
-  manifest)
-    print_manifest
-    ;;
-  verify)
-    verify_all
-    ;;
-  run)
-    campaign 0
-    ;;
-  resume)
-    campaign 1
-    ;;
-  timing-selftest)
-    timing_selftest
-    ;;
-  *)
-    printf 'usage: %s {manifest|verify|run|resume|timing-selftest}\n' "$0" >&2
-    exit 2
-    ;;
-esac
+main() {
+  case "${1:-}" in
+    manifest)
+      print_manifest
+      ;;
+    verify)
+      verify_all
+      ;;
+    run)
+      campaign 0
+      ;;
+    resume)
+      campaign 1
+      ;;
+    timing-selftest)
+      timing_selftest
+      ;;
+    *)
+      printf 'usage: %s {manifest|verify|run|resume|timing-selftest}\n' \
+        "$0" >&2
+      exit 2
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

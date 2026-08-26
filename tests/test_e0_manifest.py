@@ -226,13 +226,57 @@ def test_e0_launcher_timing_contract_uses_the_auditable_module():
     source = SCRIPT.read_text()
     assert "export PYTHONUNBUFFERED=1" in source
     assert '"$PYTHON" -u e0_resources.py timestamp' in source
-    assert 'e0_resources.py boundary' in source
+    assert 'e0_resources.py clock' in source
+    assert 'e0_resources.py boundary' not in source
     assert 'e0_resources.py write' in source
-    assert '--boundaries "$boundaries"' in source
-    assert "--started-wall-ns" not in source
-    assert "--started-mono-ns" not in source
+    assert '--boundaries "$boundaries"' not in source
+    for scalar in (
+        "--started-wall-ns", "--finished-wall-ns",
+        "--started-mono-ns", "--finished-mono-ns",
+    ):
+        assert scalar in source
     assert "fedcrag-e0-resources/1" not in source
     assert "PIPESTATUS[@]" in source
+
+
+def test_failed_row_retry_refuses_every_surviving_artifact_until_removed(
+        tmp_path):
+    run_id = "e0-failed-row"
+    output = tmp_path / "out"
+    logs = output / "logs"
+    logs.mkdir(parents=True)
+    status = output / "status.tsv"
+    status.write_text(f"{run_id}\tFAILED\t1\t2026-08-26T00:00:00Z\n")
+    artifacts = [
+        output / run_id,
+        logs / f"{run_id}.log",
+        logs / f"{run_id}.gpu",
+        logs / f"{run_id}.boundaries",
+    ]
+    artifacts[0].mkdir()
+    for artifact in artifacts[1:]:
+        artifact.write_text("preserved failed evidence\n")
+    command = 'source "$1"; require_row_artifacts_absent "$2"'
+    environment = dict(os.environ, E0_OUT=str(output), PYTHON=sys.executable)
+
+    rejected = subprocess.run(
+        ["bash", "-c", command, "retry-check", str(SCRIPT), run_id],
+        capture_output=True, text=True, env=environment)
+
+    assert rejected.returncode != 0
+    for artifact in artifacts:
+        assert str(artifact) in rejected.stderr
+        assert artifact.exists(), "failed evidence was deleted automatically"
+    assert "remove every listed artifact before resume" in rejected.stderr
+
+    for artifact in reversed(artifacts):
+        artifact.rmdir() if artifact.is_dir() else artifact.unlink()
+    accepted = subprocess.run(
+        ["bash", "-c", command, "retry-check", str(SCRIPT), run_id],
+        capture_output=True, text=True, env=environment)
+    assert accepted.returncode == 0, accepted.stderr
+    assert "\tFAILED\t" in status.read_text()
+    assert 'require_row_artifacts_absent "$run_id"' in SCRIPT.read_text()
 
 
 def test_e0_launcher_timing_selftest_exercises_every_pipeline_stage():

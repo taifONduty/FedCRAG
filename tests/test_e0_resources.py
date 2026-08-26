@@ -1,5 +1,6 @@
 """Auditable, monotonic resource telemetry for the E0 launcher."""
 import copy
+import inspect
 import json
 import os
 import select
@@ -57,15 +58,15 @@ def _write_boundaries(path, run_id=RUN_ID, events=None):
 
 
 def _valid_evidence(tmp_path):
-    log = _write_log(tmp_path / "row.log", [
+    log = _write_log(tmp_path / f"{RUN_ID}.log", [
         (200, f"E0_ROUND_START {RUN_ID} 1/2"),
         (350, f"E0_ROUND_END {RUN_ID} 1/2"),
         (500, f"E0_ROUND_START {RUN_ID} 2/2"),
         (900, f"E0_ROUND_END {RUN_ID} 2/2"),
     ])
-    samples = tmp_path / "row.gpu"
+    samples = tmp_path / f"{RUN_ID}.gpu"
     samples.write_text("100\n250\n175\n")
-    boundaries_path = _write_boundaries(tmp_path / "row.boundaries")
+    boundaries_path = _write_boundaries(tmp_path / f"{RUN_ID}.boundaries")
     boundaries = dict(
         started_wall_ns=1_700_000_000_000_000_000,
         finished_wall_ns=1_700_000_001_000_000_000,
@@ -79,9 +80,62 @@ def _valid_evidence(tmp_path):
 def _record(tmp_path):
     log, samples, boundaries_path, boundaries = _valid_evidence(tmp_path)
     record = resources.build_resource_record(
-        RUN_ID, log, samples, boundaries_path=boundaries_path,
-        num_rounds=boundaries["num_rounds"])
+        RUN_ID, log, samples, **boundaries)
     return record, log, samples, boundaries_path, boundaries
+
+
+def _write_cli_command(run_dir, log, samples, boundaries):
+    return [
+        sys.executable, str(resources.__file__), "write",
+        "--run-id", RUN_ID, "--run-dir", str(run_dir),
+        "--log", str(log), "--samples", str(samples),
+        "--started-wall-ns", str(boundaries["started_wall_ns"]),
+        "--finished-wall-ns", str(boundaries["finished_wall_ns"]),
+        "--started-mono-ns", str(boundaries["started_mono_ns"]),
+        "--finished-mono-ns", str(boundaries["finished_mono_ns"]),
+        "--num-rounds", str(boundaries["num_rounds"]),
+    ]
+
+
+def test_schema_v2_public_interfaces_match_the_binding_plan():
+    assert list(inspect.signature(
+        resources.validate_resource_record).parameters) == [
+            "record", "expected_run_id", "num_rounds", "log_path",
+            "samples_path",
+        ]
+    parser = resources._parser()
+    write = parser.parse_args([
+        "write", "--run-id", RUN_ID, "--run-dir", "run",
+        "--log", "log", "--samples", "samples",
+        "--started-wall-ns", "1", "--finished-wall-ns", "2",
+        "--started-mono-ns", "3", "--finished-mono-ns", "4",
+        "--num-rounds", "1",
+    ])
+    assert write.started_wall_ns == "1"
+    assert write.finished_wall_ns == "2"
+    assert write.started_mono_ns == "3"
+    assert write.finished_mono_ns == "4"
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "write", "--run-id", RUN_ID, "--run-dir", "run",
+            "--log", "log", "--samples", "samples",
+            "--boundaries", "raw.boundaries", "--num-rounds", "1",
+        ])
+
+
+@pytest.mark.parametrize("field", [
+    "started_wall_ns", "finished_wall_ns",
+    "started_mono_ns", "finished_mono_ns",
+])
+def test_writer_scalars_must_match_independent_raw_boundaries(tmp_path, field):
+    log, samples, _, boundaries = _valid_evidence(tmp_path)
+    contradictory = dict(boundaries)
+    contradictory[field] += 1
+
+    with pytest.raises(resources.ResourceValidationError,
+                       match="does not match raw boundary evidence"):
+        resources.build_resource_record(
+            RUN_ID, log, samples, **contradictory)
 
 
 def test_timestamped_rounds_partition_monotonic_runtime_exactly(tmp_path):
@@ -168,7 +222,7 @@ def test_schema_v2_record_replays_raw_timing_and_gpu_evidence(tmp_path):
     record, log, samples, boundaries_path, _ = _record(tmp_path)
 
     summary = resources.validate_resource_record(
-        record, RUN_ID, 2, log, samples, boundaries_path)
+        record, RUN_ID, 2, log, samples)
 
     assert record["schema"] == "fedcrag-e0-resources/2"
     assert record["run_id"] == RUN_ID
@@ -205,7 +259,7 @@ def test_schema_v2_refuses_mutated_json_claims(
 
     with pytest.raises(resources.ResourceValidationError):
         resources.validate_resource_record(
-            record, RUN_ID, 2, log, samples, boundaries_path)
+            record, RUN_ID, 2, log, samples)
 
 
 @pytest.mark.parametrize("evidence", ["log", "samples"])
@@ -216,7 +270,7 @@ def test_schema_v2_refuses_mutated_raw_evidence(tmp_path, evidence):
 
     with pytest.raises(resources.ResourceValidationError):
         resources.validate_resource_record(
-            record, RUN_ID, 2, log, samples, boundaries_path)
+            record, RUN_ID, 2, log, samples)
 
 
 def test_schema_v1_never_publishes_plausible_round_values(tmp_path):
@@ -289,9 +343,7 @@ def test_atomic_writer_preserves_existing_destination_on_failure(
 
     with pytest.raises((resources.ResourceValidationError, OSError)):
         resources.write_resource_record(
-            RUN_ID, run_dir, log, samples,
-            boundaries_path=boundaries_path,
-            num_rounds=boundaries["num_rounds"])
+            RUN_ID, run_dir, log, samples, **boundaries)
 
     assert destination.read_text() == "old-record\n"
     assert not list(run_dir.glob(".e0_resources.json.*.tmp"))
@@ -311,11 +363,11 @@ def test_schema_v2_refuses_self_consistent_json_boundary_rewrite(
 
     with pytest.raises(resources.ResourceValidationError):
         resources.validate_resource_record(
-            record, RUN_ID, 2, log, samples, boundaries_path)
+            record, RUN_ID, 2, log, samples)
 
 
 def test_boundary_sidecar_is_the_raw_run_bound_clock_evidence(tmp_path):
-    boundaries_path = _write_boundaries(tmp_path / "row.boundaries")
+    boundaries_path = _write_boundaries(tmp_path / f"{RUN_ID}.boundaries")
 
     assert resources.parse_boundary_evidence(boundaries_path, RUN_ID) == {
         "started_wall_ns": 1_700_000_000_000_000_000,
@@ -331,10 +383,18 @@ def test_boundary_writer_flushes_and_fsyncs_each_run_bound_event(
     wall_values = iter([10, 20])
     mono_values = iter([100, 200])
     fsynced = []
+    replaced = []
     monkeypatch.setattr(resources.time, "time_ns", lambda: next(wall_values))
     monkeypatch.setattr(
         resources.time, "monotonic_ns", lambda: next(mono_values))
     monkeypatch.setattr(resources.os, "fsync", lambda fd: fsynced.append(fd))
+    original_replace = resources.os.replace
+    monkeypatch.setattr(
+        resources.os, "replace",
+        lambda source, destination: (
+            replaced.append((Path(source), Path(destination))),
+            original_replace(source, destination),
+        )[1])
 
     assert resources.record_boundary_evidence(path, RUN_ID, "start") == \
         (10, 100)
@@ -342,6 +402,8 @@ def test_boundary_writer_flushes_and_fsyncs_each_run_bound_event(
         (20, 200)
 
     assert len(fsynced) == 2
+    assert len(replaced) == 2
+    assert not list(tmp_path.glob(f".{path.name}.*.tmp"))
     assert resources.parse_boundary_evidence(path, RUN_ID) == {
         "started_wall_ns": 10,
         "started_mono_ns": 100,
@@ -385,23 +447,79 @@ def test_schema_v2_refuses_boundary_sidecar_hash_mutation(tmp_path):
 
     with pytest.raises(resources.ResourceValidationError):
         resources.validate_resource_record(
-            record, RUN_ID, 2, log, samples, boundaries_path)
+            record, RUN_ID, 2, log, samples)
 
 
-def test_write_cli_reports_extreme_wall_clock_concisely(tmp_path):
-    log, samples, boundaries_path, _ = _valid_evidence(tmp_path)
+def test_clock_cli_atomically_persists_run_bound_pairs_next_to_log(tmp_path):
+    log = tmp_path / f"{RUN_ID}.log"
+    path = tmp_path / f"{RUN_ID}.boundaries"
+    pairs = []
+    for event in ("start", "finish"):
+        completed = subprocess.run([
+            sys.executable, str(resources.__file__), "clock",
+            "--run-id", RUN_ID, "--log", str(log), "--event", event,
+        ], check=True, capture_output=True, text=True)
+        pairs.append(tuple(int(value) for value in
+                           completed.stdout.strip().split("\t")))
+
+    assert resources.parse_boundary_evidence(path, RUN_ID) == {
+        "started_wall_ns": pairs[0][0],
+        "started_mono_ns": pairs[0][1],
+        "finished_wall_ns": pairs[1][0],
+        "finished_mono_ns": pairs[1][1],
+    }
+
+
+@pytest.mark.parametrize(
+    "bad_clock", ["١", "9" * 5000], ids=("unicode", "oversized"))
+def test_boundary_parser_rejects_unicode_and_oversized_decimal_clocks(
+        tmp_path, bad_clock):
+    path = tmp_path / f"{RUN_ID}.boundaries"
+    path.write_text(
+        f"E0_BOUNDARY\tstart\t{RUN_ID}\t{bad_clock}\t100\n"
+        f"E0_BOUNDARY\tfinish\t{RUN_ID}\t20\t200\n")
+
+    with pytest.raises(resources.ResourceValidationError,
+                       match="bounded ASCII decimal"):
+        resources.parse_boundary_evidence(path, RUN_ID)
+
+
+@pytest.mark.parametrize("target", ["log", "samples"])
+@pytest.mark.parametrize(
+    "bad_number", ["١", "9" * 5000], ids=("unicode", "oversized"))
+def test_all_raw_numeric_evidence_uses_bounded_ascii_decimals(
+        tmp_path, target, bad_number):
+    log, samples, _, boundaries = _valid_evidence(tmp_path)
+    if target == "log":
+        first, *rest = log.read_text().splitlines()
+        _, mono, marker = first.split("\t", 2)
+        log.write_text("\n".join(
+            [f"{bad_number}\t{mono}\t{marker}"] + rest) + "\n")
+        action = lambda: resources.parse_timestamped_rounds(
+            log, RUN_ID, 2, boundaries["started_mono_ns"],
+            boundaries["finished_mono_ns"])
+    else:
+        samples.write_text(f"{bad_number}\n")
+        action = lambda: resources._gpu_summary(samples)
+
+    with pytest.raises(resources.ResourceValidationError,
+                       match="bounded ASCII decimal"):
+        action()
+
+
+def test_write_cli_reports_oversized_wall_clock_concisely(tmp_path):
+    log, samples, boundaries_path, boundaries = _valid_evidence(tmp_path)
     _write_boundaries(boundaries_path, events=[
         ("start", 10**100, 100),
         ("finish", 10**100 + 1_000_000_000, 1_000),
     ])
+    boundaries["started_wall_ns"] = 10**100
+    boundaries["finished_wall_ns"] = 10**100 + 1_000_000_000
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    completed = subprocess.run([
-        sys.executable, str(resources.__file__), "write",
-        "--run-id", RUN_ID, "--run-dir", str(run_dir),
-        "--log", str(log), "--samples", str(samples),
-        "--boundaries", str(boundaries_path), "--num-rounds", "2",
-    ], capture_output=True, text=True)
+    completed = subprocess.run(
+        _write_cli_command(run_dir, log, samples, boundaries),
+        capture_output=True, text=True)
 
     assert completed.returncode != 0
     assert completed.stdout == ""
@@ -410,17 +528,35 @@ def test_write_cli_reports_extreme_wall_clock_concisely(tmp_path):
     assert len(completed.stderr.splitlines()) == 1
 
 
-def test_write_cli_reports_missing_raw_evidence_without_traceback(tmp_path):
-    log, samples, _, _ = _valid_evidence(tmp_path)
+@pytest.mark.parametrize(
+    "bad_clock", ["١", "9" * 5000], ids=("unicode", "oversized"))
+def test_write_cli_rejects_non_ascii_or_unbounded_scalars_concisely(
+        tmp_path, bad_clock):
+    log, samples, _, boundaries = _valid_evidence(tmp_path)
+    boundaries["started_wall_ns"] = bad_clock
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    completed = subprocess.run([
-        sys.executable, str(resources.__file__), "write",
-        "--run-id", RUN_ID, "--run-dir", str(run_dir),
-        "--log", str(log), "--samples", str(samples),
-        "--boundaries", str(tmp_path / "missing.boundaries"),
-        "--num-rounds", "2",
-    ], capture_output=True, text=True)
+
+    completed = subprocess.run(
+        _write_cli_command(run_dir, log, samples, boundaries),
+        capture_output=True, text=True)
+
+    assert completed.returncode != 0
+    assert completed.stdout == ""
+    assert completed.stderr.startswith("e0_resources: ")
+    assert "bounded ASCII decimal" in completed.stderr
+    assert "Traceback" not in completed.stderr
+    assert len(completed.stderr.splitlines()) == 1
+
+
+def test_write_cli_reports_missing_raw_evidence_without_traceback(tmp_path):
+    log, samples, boundaries_path, boundaries = _valid_evidence(tmp_path)
+    boundaries_path.unlink()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    completed = subprocess.run(
+        _write_cli_command(run_dir, log, samples, boundaries),
+        capture_output=True, text=True)
 
     assert completed.returncode != 0
     assert completed.stdout == ""

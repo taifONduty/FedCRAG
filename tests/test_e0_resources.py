@@ -387,10 +387,19 @@ def test_boundary_writer_flushes_and_fsyncs_each_run_bound_event(
     fsynced = []
     linked = []
     replaced = []
+    finish_open_flags = []
     monkeypatch.setattr(resources.time, "time_ns", lambda: next(wall_values))
     monkeypatch.setattr(
         resources.time, "monotonic_ns", lambda: next(mono_values))
     monkeypatch.setattr(resources.os, "fsync", lambda fd: fsynced.append(fd))
+    original_open = resources.os.open
+
+    def tracking_open(candidate, flags, *args):
+        if Path(candidate) == path:
+            finish_open_flags.append(flags)
+        return original_open(candidate, flags, *args)
+
+    monkeypatch.setattr(resources.os, "open", tracking_open)
     original_link = resources.os.link
     monkeypatch.setattr(
         resources.os, "link",
@@ -415,6 +424,12 @@ def test_boundary_writer_flushes_and_fsyncs_each_run_bound_event(
     assert len(fsynced) == 3
     assert len(linked) == 1
     assert replaced == []
+    assert len(finish_open_flags) == 1
+    for required_flag in (
+            resources.os.O_RDWR, resources.os.O_APPEND,
+            resources.os.O_NOFOLLOW,
+            getattr(resources.os, "O_CLOEXEC", 0)):
+        assert finish_open_flags[0] & required_flag == required_flag
     assert path.stat().st_ino == started_inode
     assert not list(tmp_path.glob(f".{path.name}.*.tmp"))
     assert resources.parse_boundary_evidence(path, RUN_ID) == {
@@ -542,6 +557,50 @@ def test_concurrent_boundary_finishes_publish_exactly_one_returned_pair(
         f"E0_BOUNDARY\tstart\t{RUN_ID}\t10\t100\n"
         f"E0_BOUNDARY\tfinish\t{RUN_ID}\t{successes[0][0]}\t"
         f"{successes[0][1]}\n")
+
+
+@pytest.mark.parametrize("replacement_kind", ["wrong-run", "symlink", "missing"])
+def test_boundary_finish_refuses_inode_swap_after_start_validation(
+        monkeypatch, tmp_path, replacement_kind):
+    path = _write_boundaries(
+        tmp_path / f"{RUN_ID}.boundaries",
+        events=[("start", 10, 100)])
+    displaced = tmp_path / "displaced-original.boundaries"
+    replacement = _write_boundaries(
+        tmp_path / "wrong-run-replacement.boundaries",
+        run_id="e0-wrong-row", events=[("start", 30, 300)])
+    original_reader = resources._read_boundary_rows
+    swapped = False
+
+    def swapping_reader(candidate, *args, **kwargs):
+        nonlocal swapped
+        rows = original_reader(candidate, *args, **kwargs)
+        if Path(candidate) == path and not swapped:
+            path.rename(displaced)
+            if replacement_kind == "wrong-run":
+                replacement.rename(path)
+            elif replacement_kind == "symlink":
+                path.symlink_to(replacement)
+            swapped = True
+        return rows
+
+    monkeypatch.setattr(resources, "_read_boundary_rows", swapping_reader)
+
+    with pytest.raises(resources.ResourceValidationError,
+                       match="changed|inode|canonical"):
+        resources.record_boundary_evidence(path, RUN_ID, "finish")
+
+    if replacement_kind == "wrong-run":
+        assert path.read_text() == (
+            "E0_BOUNDARY\tstart\te0-wrong-row\t30\t300\n")
+    elif replacement_kind == "symlink":
+        assert path.is_symlink()
+        assert replacement.read_text() == (
+            "E0_BOUNDARY\tstart\te0-wrong-row\t30\t300\n")
+    else:
+        assert not path.exists() and not path.is_symlink()
+    assert displaced.read_text().startswith(
+        f"E0_BOUNDARY\tstart\t{RUN_ID}\t10\t100\n")
 
 
 def test_boundary_start_never_replaces_a_dangling_symlink(tmp_path):

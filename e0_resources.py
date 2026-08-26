@@ -96,12 +96,14 @@ def _utc_from_wall_ns(wall_ns):
 
 
 @contextlib.contextmanager
-def _open_regular_text(path, label):
+def _open_regular_text(path, label, *, append=False):
     """Open one stable regular-file descriptor without following symlinks."""
     no_follow = getattr(os, "O_NOFOLLOW", None)
     _require(no_follow is not None,
              f"this platform cannot safely open {label}")
-    flags = os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+    flags = no_follow | getattr(os, "O_CLOEXEC", 0)
+    flags |= (os.O_RDWR | os.O_APPEND) if append else os.O_RDONLY
+    mode = "r+" if append else "r"
     descriptor = None
     try:
         try:
@@ -113,7 +115,7 @@ def _open_regular_text(path, label):
                  f"{label} must be a regular file, not a symlink or special "
                  "file")
         with os.fdopen(
-                descriptor, "r", encoding="utf-8", errors="strict") as handle:
+                descriptor, mode, encoding="utf-8", errors="strict") as handle:
             descriptor = None
             yield handle
     finally:
@@ -121,30 +123,37 @@ def _open_regular_text(path, label):
             os.close(descriptor)
 
 
-def _read_boundary_rows(boundaries_path):
+def _parse_boundary_rows(handle):
     rows = []
-    path = Path(boundaries_path)
-    with _open_regular_text(path, "boundary evidence") as handle:
-        for line_number, line in enumerate(handle, 1):
-            fields = line.rstrip("\n").split("\t")
-            _require(
-                len(fields) == 5 and fields[0] == "E0_BOUNDARY",
-                f"boundary evidence line {line_number} is malformed")
-            _, event, run_id, wall_text, mono_text = fields
-            _require(event in ("start", "finish"),
-                     f"boundary evidence line {line_number} has invalid "
-                     f"event {event!r}")
-            _require(_RUN_ID.fullmatch(run_id) is not None
-                     and len(run_id) <= 128,
-                     f"boundary evidence line {line_number} has malformed "
-                     "run identity")
-            wall_ns = _parse_ascii_decimal(
-                wall_text, f"boundary evidence line {line_number} wall clock")
-            mono_ns = _parse_ascii_decimal(
-                mono_text,
-                f"boundary evidence line {line_number} monotonic clock")
-            rows.append((event, run_id, wall_ns, mono_ns))
+    for line_number, line in enumerate(handle, 1):
+        fields = line.rstrip("\n").split("\t")
+        _require(
+            len(fields) == 5 and fields[0] == "E0_BOUNDARY",
+            f"boundary evidence line {line_number} is malformed")
+        _, event, run_id, wall_text, mono_text = fields
+        _require(event in ("start", "finish"),
+                 f"boundary evidence line {line_number} has invalid "
+                 f"event {event!r}")
+        _require(_RUN_ID.fullmatch(run_id) is not None
+                 and len(run_id) <= 128,
+                 f"boundary evidence line {line_number} has malformed "
+                 "run identity")
+        wall_ns = _parse_ascii_decimal(
+            wall_text, f"boundary evidence line {line_number} wall clock")
+        mono_ns = _parse_ascii_decimal(
+            mono_text,
+            f"boundary evidence line {line_number} monotonic clock")
+        rows.append((event, run_id, wall_ns, mono_ns))
     return rows
+
+
+def _read_boundary_rows(boundaries_path, *, handle=None):
+    path = Path(boundaries_path)
+    if handle is not None:
+        handle.seek(0)
+        return _parse_boundary_rows(handle)
+    with _open_regular_text(path, "boundary evidence") as opened:
+        return _parse_boundary_rows(opened)
 
 
 def parse_boundary_evidence(boundaries_path, expected_run_id):
@@ -234,23 +243,26 @@ def _publish_boundary_start(path, content):
                 pass
 
 
-def _append_boundary_finish(path, content):
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    _require(no_follow is not None,
-             "this platform cannot safely append boundary evidence")
-    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | no_follow)
+def _append_boundary_finish(handle, content):
+    written = handle.write(content)
+    _require(written == len(content),
+             "boundary finish write did not persist the complete event")
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _require_canonical_inode(path, opened_metadata):
     try:
-        _require(stat.S_ISREG(os.fstat(descriptor).st_mode),
-                 "boundary evidence must be a regular file")
-        encoded = content.encode("utf-8")
-        written = 0
-        while written < len(encoded):
-            count = os.write(descriptor, encoded[written:])
-            _require(count > 0, "boundary finish write made no progress")
-            written += count
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        current = os.lstat(path)
+    except OSError as exc:
+        raise ResourceValidationError(
+            f"canonical boundary evidence changed or disappeared: {path}: "
+            f"{exc}") from exc
+    _require(
+        stat.S_ISREG(current.st_mode)
+        and current.st_dev == opened_metadata.st_dev
+        and current.st_ino == opened_metadata.st_ino,
+        f"canonical boundary evidence changed inode during finish: {path}")
 
 
 def record_boundary_evidence(boundaries_path, run_id, event):
@@ -261,19 +273,27 @@ def record_boundary_evidence(boundaries_path, run_id, event):
     path = Path(boundaries_path)
     with _locked_boundary(path):
         if event == "finish":
-            rows = _read_boundary_rows(path)
-            _require(len(rows) == 1 and rows[0][0] == "start"
-                     and rows[0][1] == run_id,
-                     "finish boundary requires exactly one matching start "
-                     "event")
-        wall_ns = time.time_ns()
-        mono_ns = time.monotonic_ns()
-        content = (
-            f"E0_BOUNDARY\t{event}\t{run_id}\t{wall_ns}\t{mono_ns}\n")
-        if event == "start":
-            _publish_boundary_start(path, content)
+            with _open_regular_text(
+                    path, "boundary evidence", append=True) as handle:
+                opened_metadata = os.fstat(handle.fileno())
+                rows = _read_boundary_rows(path, handle=handle)
+                _require(len(rows) == 1 and rows[0][0] == "start"
+                         and rows[0][1] == run_id,
+                         "finish boundary requires exactly one matching "
+                         "start event")
+                wall_ns = time.time_ns()
+                mono_ns = time.monotonic_ns()
+                content = (
+                    f"E0_BOUNDARY\tfinish\t{run_id}\t{wall_ns}\t"
+                    f"{mono_ns}\n")
+                _append_boundary_finish(handle, content)
+                _require_canonical_inode(path, opened_metadata)
         else:
-            _append_boundary_finish(path, content)
+            wall_ns = time.time_ns()
+            mono_ns = time.monotonic_ns()
+            content = (
+                f"E0_BOUNDARY\tstart\t{run_id}\t{wall_ns}\t{mono_ns}\n")
+            _publish_boundary_start(path, content)
     return wall_ns, mono_ns
 
 

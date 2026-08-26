@@ -769,6 +769,55 @@ def test_broken_persisted_hash_is_refused(monkeypatch, tmp_path):
         validate_run_directory(tmp_path)
 
 
+def test_extra_top_level_state_payload_field_is_refused(monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    payload = load_states(tmp_path)
+    payload["unexpected"] = "forged envelope data"
+    resave_states(tmp_path, payload)
+
+    with pytest.raises(
+            E0ValidationError,
+            match=("state schema: payload fields differ; first field "
+                   "'unexpected' appears only in persisted payload")):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize("field", [
+    "broadcast_state_sha256",
+    "global_state_sha256",
+])
+def test_missing_state_hash_envelope_field_is_refused(
+        monkeypatch, tmp_path, field):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    payload = load_states(tmp_path)
+    del payload[field]
+    resave_states(tmp_path, payload)
+
+    with pytest.raises(
+            E0ValidationError,
+            match=("state schema: payload fields differ; first field "
+                   f"'{field}' appears only in required schema")):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize("field", [
+    "broadcast_state_sha256",
+    "global_state_sha256",
+])
+def test_malformed_state_hash_envelope_field_is_refused(
+        monkeypatch, tmp_path, field):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    payload = load_states(tmp_path)
+    payload[field] = "A" * 64
+    resave_states(tmp_path, payload)
+
+    with pytest.raises(
+            E0ValidationError,
+            match=(f"state schema: {field} must be a lowercase 64-hex "
+                   "string")):
+        validate_run_directory(tmp_path)
+
+
 def test_broadcast_hash_mismatch_between_json_and_states_is_refused(
         monkeypatch, tmp_path):
     _, result_path = build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")

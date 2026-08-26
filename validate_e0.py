@@ -452,9 +452,30 @@ def _validate_exact_state_schema(result, payload, round_label):
     """Validate the complete persisted tensor schema before any hash/science."""
     _require(isinstance(payload, dict),
              f"{round_label} state schema: round payload is not a dictionary")
-    for field in ("broadcast", "clients", "global"):
-        _require(field in payload,
-                 f"{round_label} state schema: payload omits {field}")
+    required_fields = {
+        "broadcast",
+        "clients",
+        "global",
+        "broadcast_state_sha256",
+        "global_state_sha256",
+    }
+    payload_fields = set(payload)
+    if payload_fields != required_fields:
+        field = sorted(
+            payload_fields ^ required_fields,
+            key=lambda value: (type(value).__name__, repr(value)),
+        )[0]
+        side = "persisted payload" if field in payload_fields else "required schema"
+        _require(
+            False,
+            f"{round_label} state schema: payload fields differ; first field "
+            f"{field!r} appears only in {side}")
+    for field in ("broadcast_state_sha256", "global_state_sha256"):
+        _require(
+            isinstance(payload[field], str)
+            and re.fullmatch(r"[0-9a-f]{64}", payload[field]) is not None,
+            f"{round_label} state schema: {field} must be a lowercase 64-hex "
+            "string")
     broadcast = payload["broadcast"]
     clients = payload["clients"]
     global_state = payload["global"]

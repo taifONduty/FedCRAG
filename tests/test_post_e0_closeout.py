@@ -42,6 +42,8 @@ def closeout_env(tmp_path):
         (row / "federated_result.json").write_text(json.dumps({
             "commit": EXPECTED_COMMIT_SHORT,
         }))
+    (source / "status.tsv").write_text("".join(
+        f"row-{index}\tVALIDATED\t{index + 1}.5\n" for index in range(11)))
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -131,8 +133,8 @@ exit 99
 
     validator = tmp_path / "validator"
     validator.write_text("""#!/bin/sh
-if [ \"${POST_E0_TEST_FAIL:-}\" = validation ]; then exit 41; fi
-printf '{"manifest_verified": true, "continuity": {"verified_rounds": 5}, "direction_residuals": {"max": 0.0}}\\n'
+if [ \"${POST_E0_TEST_FAIL:-}\" = validation ]; then echo 'scientific refusal: synthetic validator failure' >&2; exit 41; fi
+printf '{"manifest_verified": true, "dataset_content_verified": true, "runtime_provenance_verified": true, "continuity_boundaries_checked": 4, "aggregate_recomputation_worst_tolerance_ratio": 0.1, "fedspan_direction_residuals": {}, "rawmaxmin_direction_residuals": {}}\\n'
 """)
     validator.chmod(validator.stat().st_mode | stat.S_IXUSR)
 
@@ -211,6 +213,11 @@ def test_success_snapshots_exactly_eleven_regular_files_and_stops_vm(closeout_en
     summary = json.loads((destination / "audit" / "validation_summary.json").read_text())
     assert summary["validated_rows"] == 11
     assert summary["legacy_schema_v1_per_round"] == "unavailable"
+    assert len(summary["measured_total_row_runtimes"]) == 11
+    closeout = (destination / "audit" / "2026-08-25_E0_STRENGTHENED_VALIDATION_CLOSEOUT.md").read_text()
+    for required in ("direction residuals", "Continuity boundaries", "tolerance ratios",
+                     "Measured total row runtimes", "Schema-v1", "post-hoc", "paper-scale"):
+        assert required in closeout
     assert not failed_attempts(closeout_env)
 
 
@@ -236,6 +243,19 @@ def test_refuses_failed_project_query_before_any_instance_call(closeout_env):
     assert cloud_calls(closeout_env) == ["config get-value project"]
 
 
+def test_refuses_validator_override_outside_explicit_test_mode(closeout_env):
+    env = closeout_env["env"].copy()
+    for key in ("POST_E0_TEST_MODE", "POST_E0_TEST_REMOTE_ROOT",
+                "POST_E0_REMOTE_TMP", "POST_E0_TEST_EXECUTION_SOURCE_ROOT"):
+        env.pop(key, None)
+    env["POST_E0_VALIDATOR"] = "/tmp/not-a-validator"
+    completed = subprocess.run(["/bin/bash", str(SCRIPT)], cwd=ROOT, env=env,
+                               capture_output=True, text=True)
+    assert completed.returncode == 2
+    assert "test-only" in completed.stderr
+    assert not cloud_calls(closeout_env)
+
+
 def test_refuses_failed_zone_query_before_start(closeout_env):
     completed = run_driver(closeout_env, FAKE_LIST_FAIL="1")
     assert completed.returncode == 3
@@ -259,6 +279,18 @@ def test_refuses_missing_empty_duplicate_or_wrong_completion_rows(
     assert_not_published(closeout_env)
 
 
+@pytest.mark.parametrize("status_rows", [
+    "row-0\tVALIDATED\t1\n",
+    "".join(f"row-{index}\tVALIDATED\t1\n" for index in range(11)) + "row-0\tVALIDATED\t1\n",
+    "".join(f"row-{index}\tFAILED\t1\n" for index in range(11)),
+])
+def test_refuses_status_rows_that_do_not_bind_each_validated_run(closeout_env, status_rows):
+    (closeout_env["source"] / "status.tsv").write_text(status_rows)
+    completed = run_driver(closeout_env, FAKE_STATUSES="RUNNING,TERMINATED")
+    assert completed.returncode == 20
+    assert_not_published(closeout_env)
+
+
 @pytest.mark.parametrize("failure", ["validation", "copy", "checksum"])
 def test_failure_gates_preserve_unique_attempt_and_refuse_publication(closeout_env, failure):
     completed = run_driver(
@@ -277,6 +309,8 @@ def test_scientific_failure_retrieves_remote_audit_before_preservation(closeout_
     assert len(attempts) == 1
     assert (attempts[0] / "audit" / "validation_failure.txt").is_file()
     assert (attempts[0] / "audit" / "source_pre_inventory.jsonl").is_file()
+    assert "scientific refusal" in (attempts[0] / "audit" / "validator-row-0.stderr").read_text()
+    assert (attempts[0] / "audit" / "validator_exit_status.tsv").read_text().startswith("row-0\t41")
 
 
 def test_existing_canonical_destination_is_refused_before_start(closeout_env):

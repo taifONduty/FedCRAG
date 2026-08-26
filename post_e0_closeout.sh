@@ -29,7 +29,12 @@ if [ "${POST_E0_TEST_MODE:-}" = 1 ]; then
     EXECUTION_SOURCE_ROOT=${POST_E0_TEST_EXECUTION_SOURCE_ROOT:?test execution source root required}
     EXECUTION_PYTHON=${POST_E0_PYTHON:-python3}
 fi
-VALIDATOR_BIN=${POST_E0_VALIDATOR:-$EXECUTION_PYTHON}
+VALIDATOR_BIN=$EXECUTION_PYTHON
+if [ "${POST_E0_TEST_MODE:-}" = 1 ]; then
+    VALIDATOR_BIN=${POST_E0_VALIDATOR:?test validator required}
+elif [ -n "${POST_E0_VALIDATOR:-}" ]; then
+    printf '%s\n' "POST_E0_VALIDATOR is test-only" >&2; exit 2
+fi
 RETRY_LIMIT=3
 ATTEMPT=
 E0_PROJECT=
@@ -48,7 +53,9 @@ new_failure_path() {
     counter=0
     while :; do
         candidate="${DEST}.failed-${stamp}-${counter}"
-        [ ! -e "$candidate" ] && [ ! -L "$candidate" ] && { printf '%s\n' "$candidate"; return; }
+        if [ ! -e "$candidate" ] && [ ! -L "$candidate" ] && mkdir "$candidate"; then
+            printf '%s\n' "$candidate"; return
+        fi
         counter=$((counter + 1))
     done
 }
@@ -57,7 +64,7 @@ preserve_attempt() {
     local failure
     [ -n "$ATTEMPT" ] && [ -d "$ATTEMPT" ] || return 0
     failure=$(new_failure_path)
-    mv "$ATTEMPT" "$failure" || {
+    mv "$ATTEMPT"/* "$failure/" && rmdir "$ATTEMPT" || {
         say "CRITICAL: cannot preserve failed attempt at $failure"
         return 1
     }
@@ -68,7 +75,7 @@ preserve_preflight_failure() {
     local message=$1 failure
     mkdir -p "$(dirname "$DEST")" || return 0
     failure=$(new_failure_path)
-    mkdir -p "$failure/audit" || return 0
+    mkdir "$failure/audit" || return 0
     printf '%s\n' "$message" > "$failure/audit/preflight_failure.txt"
 }
 
@@ -322,7 +329,7 @@ run_production_snapshot() {
 }
 
 remote_worker() {
-    local audit_commit bundle_hash execution_commit stage repo bundle rows run
+    local audit_commit bundle_hash execution_commit stage repo bundle rows run validator_status
     [ "$#" -eq 3 ] || return 2
     audit_commit=$1
     bundle_hash=$2
@@ -369,6 +376,7 @@ PY
 ) || return 1
     : > "$stage/audit/validator_output.jsonl"
     : > "$stage/audit/validator_command.txt"
+    : > "$stage/audit/validator_exit_status.tsv"
     while IFS= read -r run; do
         [ -n "$run" ] || continue
         printf '%q ' "$VALIDATOR_BIN" "$repo/validate_e0.py" "$stage/artifacts/$run" \
@@ -378,8 +386,11 @@ PY
         "$VALIDATOR_BIN" "$repo/validate_e0.py" "$stage/artifacts/$run" \
             --manifest "$stage/artifacts/manifest.json" --run_id "$run" \
             --execution_source_root "$EXECUTION_SOURCE_ROOT" \
-            >> "$stage/audit/validator_output.jsonl" || {
-                printf 'scientific validation failed for %s\n' "$run" \
+            >> "$stage/audit/validator_output.jsonl" 2> "$stage/audit/validator-${run}.stderr"
+        validator_status=$?
+        printf '%s\t%s\n' "$run" "$validator_status" >> "$stage/audit/validator_exit_status.tsv"
+        [ "$validator_status" -eq 0 ] || {
+                printf 'scientific validation failed for %s (exit %s)\n' "$run" "$validator_status" \
                     > "$stage/audit/validation_failure.txt"
                 return 1
             }
@@ -393,29 +404,57 @@ print("torch=" + torch.__version__)
 print("numpy=" + numpy.__version__)
 PY
     "$PYTHON_BIN" - "$stage/audit/validator_output.jsonl" "$stage/artifacts/status.tsv" \
+        "$stage/artifacts/manifest.json" \
         "$stage/audit/validation_summary.json" <<'PY' || return 1
 import json, os, sys
-reports_path, status_path, output = sys.argv[1:]
+reports_path, status_path, manifest_path, output = sys.argv[1:]
 reports = [json.loads(line) for line in open(reports_path, encoding="utf-8") if line.strip()]
 if len(reports) != 11:
     raise SystemExit("validator did not produce eleven reports")
-durations = []
-if os.path.exists(status_path):
-    for line in open(status_path, encoding="utf-8"):
-        fields = line.rstrip("\n").split("\t")
-        if len(fields) >= 3:
-            try: durations.append(float(fields[2]))
-            except ValueError: pass
+required = ("manifest_verified", "dataset_content_verified", "runtime_provenance_verified",
+            "fedspan_direction_residuals", "rawmaxmin_direction_residuals",
+            "continuity_boundaries_checked", "aggregate_recomputation_worst_tolerance_ratio")
+if any(not all(key in report for key in required) for report in reports):
+    raise SystemExit("validator report schema is incomplete")
+if any(not (report["manifest_verified"] and report["dataset_content_verified"]
+            and report["runtime_provenance_verified"]) for report in reports):
+    raise SystemExit("validator verification flags are not all true")
+rows = [row["run_id"] for row in json.load(open(manifest_path))["rows"]]
+seen = {}
+for line in open(status_path, encoding="utf-8"):
+    fields = line.rstrip("\n").split("\t")
+    if len(fields) != 3 or fields[1] != "VALIDATED":
+        continue
+    run_id, _, seconds = fields
+    if run_id not in rows or run_id in seen:
+        raise SystemExit("status records do not uniquely bind validated rows")
+    try: seen[run_id] = float(seconds)
+    except ValueError: raise SystemExit("status runtime is not numeric")
+if set(seen) != set(rows) or len(seen) != 11:
+    raise SystemExit("status records do not cover every validated row")
 summary = {"validated_rows": len(reports), "reports": reports,
-           "direction_residuals": [r.get("direction_residuals") for r in reports],
-           "continuity_verified_rows": sum(bool(r.get("continuity")) for r in reports),
-           "aggregate_tolerances": [r.get("aggregate_tolerances") for r in reports],
-           "measured_total_row_runtimes": durations,
+           "fedspan_direction_residuals": [r["fedspan_direction_residuals"] for r in reports],
+           "rawmaxmin_direction_residuals": [r["rawmaxmin_direction_residuals"] for r in reports],
+           "continuity_boundaries_checked": [r["continuity_boundaries_checked"] for r in reports],
+           "aggregate_recomputation_worst_tolerance_ratio": [r["aggregate_recomputation_worst_tolerance_ratio"] for r in reports],
+           "measured_total_row_runtimes": [{"run_id": run_id, "seconds": seen[run_id]} for run_id in rows],
            "legacy_schema_v1_per_round": "unavailable"}
 json.dump(summary, open(output, "w", encoding="utf-8"), sort_keys=True)
 PY
-    printf '%s\n' "Post-hoc internally consistent preservation; not a signed historical attestation." \
-        > "$stage/audit/2026-08-25_E0_STRENGTHENED_VALIDATION_CLOSEOUT.md"
+    "$PYTHON_BIN" - "$stage/audit/validation_summary.json" \
+        "$stage/audit/2026-08-25_E0_STRENGTHENED_VALIDATION_CLOSEOUT.md" <<'PY' || return 1
+import json, sys
+summary = json.load(open(sys.argv[1], encoding="utf-8"))
+with open(sys.argv[2], "w", encoding="utf-8") as out:
+    out.write("# E0 strengthened validation closeout\n\n")
+    out.write("Validated rows: %d\n\n" % summary["validated_rows"])
+    out.write("FedSpan direction residuals: %s\n\n" % summary["fedspan_direction_residuals"])
+    out.write("RawMaxMin direction residuals: %s\n\n" % summary["rawmaxmin_direction_residuals"])
+    out.write("Continuity boundaries checked: %s\n\n" % summary["continuity_boundaries_checked"])
+    out.write("Aggregate tolerance ratios: %s\n\n" % summary["aggregate_recomputation_worst_tolerance_ratio"])
+    out.write("Measured total row runtimes: %s\n\n" % summary["measured_total_row_runtimes"])
+    out.write("Schema-v1 per-round timing is unavailable. This is a post-hoc internally consistent inventory, not a signed historical attestation. It does not support paper-scale efficacy claims.\n")
+PY
 }
 
 write_reports() {

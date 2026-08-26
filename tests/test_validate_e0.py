@@ -1690,6 +1690,127 @@ def test_unsupported_arm_has_no_recomputation_reference(monkeypatch, tmp_path):
 # --------------------------------------------------------- structural gates
 
 
+def _all_round_states(payload):
+    return [payload["broadcast"], payload["global"],
+            *payload["clients"].values()]
+
+
+def test_repaired_hash_extra_client_state_key_is_refused_before_science(
+        monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "trainable-ab", "uniform")
+    payload = load_states(tmp_path)
+    payload["clients"][driver_harness.SLICES[0]]["unexpected.weight"] = \
+        torch.zeros(1)
+    resave_states(tmp_path, payload, repair_hashes=True)
+
+    with pytest.raises(E0ValidationError, match="state schema.*key set"):
+        validate_run_directory(tmp_path)
+
+
+def test_repaired_hash_missing_client_state_key_is_refused_before_science(
+        monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "trainable-ab", "uniform")
+    payload = load_states(tmp_path)
+    for state in _all_round_states(payload):
+        state["auxiliary.weight"] = torch.zeros(1)
+    del payload["clients"][driver_harness.SLICES[-1]]["auxiliary.weight"]
+    resave_states(tmp_path, payload, repair_hashes=True)
+
+    with pytest.raises(E0ValidationError, match="state schema.*key set"):
+        validate_run_directory(tmp_path)
+
+
+def test_non_tensor_state_value_is_refused_before_hashing(
+        monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "trainable-ab", "uniform")
+    payload = load_states(tmp_path)
+    for state in _all_round_states(payload):
+        state["auxiliary.weight"] = "not-a-tensor"
+    torch.save(payload, state_path(tmp_path))
+
+    with pytest.raises(E0ValidationError, match="state schema.*tensor"):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda tensor: tensor.reshape(6, 8), "shape"),
+        (lambda tensor: tensor.double(), "dtype"),
+    ],
+)
+def test_repaired_hash_client_schema_mismatch_is_refused_before_science(
+        monkeypatch, tmp_path, mutation, message):
+    build_run(monkeypatch, tmp_path, "trainable-ab", "uniform")
+    payload = load_states(tmp_path)
+    client = payload["clients"][driver_harness.SLICES[-1]]
+    client[driver_harness.B_KEY] = mutation(client[driver_harness.B_KEY])
+    resave_states(tmp_path, payload, repair_hashes=True)
+
+    with pytest.raises(
+            E0ValidationError, match=rf"state schema.*{message}"):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.bool, torch.int64, torch.complex64],
+)
+def test_repaired_hash_nonfloating_state_dtype_is_refused(
+        monkeypatch, tmp_path, dtype):
+    build_run(monkeypatch, tmp_path, "trainable-ab", "uniform")
+    payload = load_states(tmp_path)
+    for state in _all_round_states(payload):
+        state["auxiliary.weight"] = torch.zeros(1, dtype=dtype)
+    resave_states(tmp_path, payload, repair_hashes=True)
+
+    with pytest.raises(
+            E0ValidationError, match="state schema.*floating dtype"):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize("client_change", ["extra", "missing"])
+def test_round_clients_are_exactly_the_recorded_slices(
+        monkeypatch, tmp_path, client_change):
+    build_run(monkeypatch, tmp_path, "trainable-ab", "uniform")
+    payload = load_states(tmp_path)
+    if client_change == "extra":
+        payload["clients"]["unexpected-client"] = {
+            key: value.clone() for key, value in payload["broadcast"].items()
+        }
+    else:
+        del payload["clients"][driver_harness.SLICES[-1]]
+    torch.save(payload, state_path(tmp_path))
+
+    with pytest.raises(E0ValidationError, match="state schema.*client set"):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize("mutation", ["key", "shape", "dtype"])
+def test_cross_round_continuity_reports_schema_level_mismatch(
+        monkeypatch, tmp_path, mutation):
+    build_run(
+        monkeypatch, tmp_path, "trainable-ab", "uniform", num_rounds=2)
+    payload = load_states(tmp_path, 2)
+    states = _all_round_states(payload)
+    if mutation == "key":
+        for state in states:
+            state["continuity-only.weight"] = torch.zeros(1)
+    elif mutation == "shape":
+        for state in states:
+            state[driver_harness.B_KEY] = \
+                state[driver_harness.B_KEY].reshape(6, 8)
+    else:
+        for state in states:
+            state[driver_harness.B_KEY] = \
+                state[driver_harness.B_KEY].double()
+    resave_states(tmp_path, payload, round_number=2, repair_hashes=True)
+
+    with pytest.raises(
+            E0ValidationError,
+            match=rf"round_1 -> round_2.*{mutation}"):
+        validate_run_directory(tmp_path)
+
+
 def test_missing_round_state_file_is_refused(monkeypatch, tmp_path):
     build_run(monkeypatch, tmp_path, "frozen-a", "uniform", num_rounds=2)
     state_path(tmp_path, 2).unlink()

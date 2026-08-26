@@ -333,6 +333,86 @@ def _validate_finite_states(payload, round_label):
         _assert_finite_state(state, f"{round_label} client {name}")
 
 
+def _validate_exact_state_schema(result, payload, round_label):
+    """Validate the complete persisted tensor schema before any hash/science."""
+    _require(isinstance(payload, dict),
+             f"{round_label} state schema: round payload is not a dictionary")
+    for field in ("broadcast", "clients", "global"):
+        _require(field in payload,
+                 f"{round_label} state schema: payload omits {field}")
+    broadcast = payload["broadcast"]
+    clients = payload["clients"]
+    global_state = payload["global"]
+    _require(isinstance(broadcast, dict),
+             f"{round_label} state schema: broadcast is not a dictionary")
+    _require(isinstance(clients, dict),
+             f"{round_label} state schema: clients is not a dictionary")
+    _require(isinstance(global_state, dict),
+             f"{round_label} state schema: global is not a dictionary")
+
+    slices = result.get("slices")
+    _require(isinstance(slices, list)
+             and all(isinstance(name, str) and name for name in slices)
+             and len(set(slices)) == len(slices),
+             f"{round_label} state schema: result slices are malformed")
+    client_names = set(clients)
+    expected_clients = set(slices)
+    if client_names != expected_clients:
+        name = sorted(client_names ^ expected_clients)[0]
+        side = ("persisted clients" if name in client_names
+                else "recorded slices")
+        _require(
+            False,
+            f"{round_label} state schema: client set differs; first client "
+            f"{name!r} appears only in {side}")
+
+    states = [("broadcast", broadcast), ("global", global_state)] + [
+        (f"client {name}", clients[name]) for name in sorted(clients)
+    ]
+    reference_keys = set(broadcast)
+    _require(reference_keys,
+             f"{round_label} state schema: state dictionaries are empty")
+    for label, state in states:
+        _require(isinstance(state, dict),
+                 f"{round_label} state schema: {label} is not a dictionary")
+        keys = set(state)
+        if keys != reference_keys:
+            key = sorted(keys ^ reference_keys, key=str)[0]
+            side = label if key in keys else "broadcast"
+            _require(
+                False,
+                f"{round_label} state schema: {label} key set differs; first "
+                f"key {key!r} appears only in {side}")
+
+    for key in sorted(reference_keys, key=str):
+        _require(isinstance(key, str) and key,
+                 f"{round_label} state schema: tensor key {key!r} is not "
+                 "nonempty text")
+        reference = broadcast[key]
+        _require(isinstance(reference, torch.Tensor),
+                 f"{round_label} state schema: broadcast value at {key!r} "
+                 "is not a tensor")
+        _require(reference.is_floating_point(),
+                 f"{round_label} state schema: {key!r} must have a floating "
+                 f"dtype, found {reference.dtype}")
+        for label, state in states[1:]:
+            value = state[key]
+            _require(isinstance(value, torch.Tensor),
+                     f"{round_label} state schema: {label} value at {key!r} "
+                     "is not a tensor")
+            _require(value.is_floating_point(),
+                     f"{round_label} state schema: {label} {key!r} must have "
+                     f"a floating dtype, found {value.dtype}")
+            _require(tuple(value.shape) == tuple(reference.shape),
+                     f"{round_label} state schema: {label} shape at {key!r} "
+                     f"is {tuple(value.shape)}, broadcast shape is "
+                     f"{tuple(reference.shape)}")
+            _require(value.dtype == reference.dtype,
+                     f"{round_label} state schema: {label} dtype at {key!r} "
+                     f"is {value.dtype}, broadcast dtype is "
+                     f"{reference.dtype}")
+
+
 # --------------------------------------------- independent recomputation
 
 
@@ -2170,6 +2250,7 @@ def validate_run_directory(run_directory, manifest_row=None,
             f"{round_label} state file")
         payload = torch.load(
             state_path, map_location="cpu", weights_only=True)
+        _validate_exact_state_schema(result, payload, round_label)
         _require(
             state_dict_sha256(payload["broadcast"])
             == payload["broadcast_state_sha256"],

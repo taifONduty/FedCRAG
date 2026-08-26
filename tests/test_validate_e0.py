@@ -28,6 +28,7 @@ from aggregation_schemes import (  # noqa: E402
     fedspan_delta_weights,
     state_dict_sha256,
 )
+from e0_resources import build_resource_record  # noqa: E402
 from validate_e0 import (  # noqa: E402
     E0ValidationError,
     validate_run_directory as _validate_run_directory,
@@ -1819,6 +1820,108 @@ def test_missing_round_state_file_is_refused(monkeypatch, tmp_path):
         validate_run_directory(tmp_path)
 
 
+@pytest.mark.parametrize("evidence", ["state", "result", "resource", "data"])
+def test_persisted_evidence_symlink_is_refused_without_following_target(
+        monkeypatch, tmp_path, evidence):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    targets = {
+        "state": state_path(tmp_path),
+        "result": result_path,
+        "resource": tmp_path / "e0_resources.json",
+        "data": tmp_path / "archived_data" / "c0" / "corpus.jsonl",
+    }
+    path = targets[evidence]
+    external = tmp_path.parent / f"{tmp_path.name}-{evidence}-evidence"
+    path.rename(external)
+    path.symlink_to(external)
+
+    with pytest.raises(E0ValidationError, match="symlink|safely open"):
+        validate_run_directory(tmp_path, manifest_row=manifest_row(tmp_path))
+
+
+@pytest.mark.parametrize("evidence", ["log", "gpu", "boundaries"])
+def test_raw_resource_evidence_symlink_is_refused(
+        monkeypatch, tmp_path, evidence):
+    run_dir = tmp_path / "e0-test-row"
+    build_run(monkeypatch, run_dir, "frozen-a", "normmaxmin")
+    log, samples, boundaries = write_v2_resource_record(run_dir)
+    path = {"log": log, "gpu": samples, "boundaries": boundaries}[evidence]
+    external = tmp_path.parent / f"{tmp_path.name}-{evidence}-raw"
+    path.rename(external)
+    path.symlink_to(external)
+
+    with pytest.raises(E0ValidationError, match="symlink|safely open"):
+        validate_run_directory(
+            run_dir, manifest_row=manifest_row(run_dir))
+
+
+def test_special_file_in_result_slot_is_normalized_to_validation_error(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    result_path.unlink()
+    result_path.mkdir()
+
+    with pytest.raises(E0ValidationError, match="regular file|safely open"):
+        validate_run_directory(tmp_path)
+
+
+def test_result_json_rejects_duplicate_num_rounds(monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    raw = result_path.read_text()
+    needle = '"num_rounds": 1'
+    assert needle in raw
+    result_path.write_text(raw.replace(
+        needle, '"num_rounds": 1, "num_rounds": 1', 1))
+
+    with pytest.raises(E0ValidationError, match="duplicate.*num_rounds"):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_result_json_rejects_nonfinite_constants(
+        monkeypatch, tmp_path, constant):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    raw = result_path.read_text()
+    needle = '"use_amp": false'
+    assert needle in raw
+    result_path.write_text(raw.replace(
+        needle, f'"use_amp": {constant}', 1))
+
+    with pytest.raises(E0ValidationError, match="nonfinite.*JSON"):
+        validate_run_directory(tmp_path)
+
+
+def test_nested_duplicate_json_key_is_refused(monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    raw = result_path.read_text()
+    needle = '"test": true'
+    assert needle in raw
+    result_path.write_text(raw.replace(
+        needle, '"test": true, "test": true', 1))
+
+    with pytest.raises(E0ValidationError, match="duplicate.*test"):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize("value", [True, 1.0, 0, -1])
+def test_num_rounds_must_be_a_positive_nonboolean_integer(
+        monkeypatch, tmp_path, value):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    result = json.loads(result_path.read_text())
+    result["num_rounds"] = value
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="num_rounds.*positive integer"):
+        validate_run_directory(tmp_path)
+
+
 def test_recorded_weights_that_do_not_cover_every_client_are_refused(
         monkeypatch, tmp_path):
     _, result_path = build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
@@ -1987,6 +2090,29 @@ def write_boundary_sidecar(path, run_id, started_wall_ns, started_mono_ns,
     return path
 
 
+def write_v2_resource_record(run_dir):
+    run_id = run_dir.name
+    log_dir = run_dir.parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    log = log_dir / f"{run_id}.log"
+    samples = log_dir / f"{run_id}.gpu"
+    boundaries = log_dir / f"{run_id}.boundaries"
+    log.write_text(
+        f"1000\t200\tE0_ROUND_START {run_id} 1/1\n"
+        f"1100\t800\tE0_ROUND_END {run_id} 1/1\n")
+    samples.write_text("100\n250\n")
+    write_boundary_sidecar(
+        boundaries, run_id, 1_700_000_000_000_000_000, 100,
+        1_700_000_000_000_001_000, 1000)
+    record = build_resource_record(
+        run_id, log, samples,
+        started_wall_ns=1_700_000_000_000_000_000,
+        finished_wall_ns=1_700_000_000_000_001_000,
+        started_mono_ns=100, finished_mono_ns=1000, num_rounds=1)
+    (run_dir / "e0_resources.json").write_text(json.dumps(record))
+    return log, samples, boundaries
+
+
 def test_a_matching_manifest_row_validates(monkeypatch, tmp_path):
     build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
     write_resource_record(tmp_path)
@@ -2006,6 +2132,47 @@ def test_a_matching_manifest_row_validates(monkeypatch, tmp_path):
         "round_timing_status": "legacy-buffered-unavailable",
         "round_elapsed_seconds": None,
     }
+
+
+def test_manifest_json_rejects_duplicate_keys(monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "schema": "fedcrag-e0-manifest/1",
+        "commit": row["commit"],
+        "rows": [row],
+    }).replace('"run_id":', '"run_id": "duplicate", "run_id":', 1))
+
+    with pytest.raises(E0ValidationError, match="duplicate.*run_id"):
+        validator._load_manifest_row(manifest, tmp_path.name)
+
+
+def test_resource_json_rejects_duplicate_keys(monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    resource = tmp_path / "e0_resources.json"
+    raw = resource.read_text()
+    resource.write_text(raw.replace(
+        '"elapsed_seconds": 12.0',
+        '"elapsed_seconds": 12.0, "elapsed_seconds": 12.0', 1))
+
+    with pytest.raises(E0ValidationError, match="duplicate.*elapsed_seconds"):
+        validate_run_directory(tmp_path, manifest_row=manifest_row(tmp_path))
+
+
+def test_manifest_comparison_is_type_exact_for_integer_fields(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    result = json.loads(result_path.read_text())
+    result["args"]["seed"] = 42.0
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="seed.*(?:type|integer)"):
+        validate_run_directory(tmp_path, manifest_row=manifest_row(tmp_path))
 
 
 def test_manifest_relative_repo_interpreter_validates(monkeypatch, tmp_path):

@@ -5,6 +5,7 @@ production aggregation functions would only re-run the code under test, which
 cannot detect a persisted global that the production code never produced.
 """
 import argparse
+import contextlib
 import csv
 import hashlib
 import json
@@ -12,6 +13,7 @@ import math
 import os
 import re
 import statistics
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -90,6 +92,119 @@ def _single(paths, label):
     paths = list(paths)
     _require(len(paths) == 1, f"expected one {label}, found {len(paths)}")
     return paths[0]
+
+
+@contextlib.contextmanager
+def _open_regular(path, label, *, binary=False, newline=None):
+    """Hold one non-symlink regular-file descriptor for the complete read."""
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    _require(no_follow is not None,
+             f"this platform cannot safely open {label}")
+    flags = (os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    descriptor = None
+    try:
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise E0ValidationError(
+                f"cannot safely open {label} {path}: {exc}") from exc
+        _require(stat.S_ISREG(os.fstat(descriptor).st_mode),
+                 f"{label} must be a regular file, not a symlink or special "
+                 "file")
+        options = {} if binary else {
+            "encoding": "utf-8", "errors": "strict", "newline": newline,
+        }
+        with os.fdopen(descriptor, "rb" if binary else "r", **options) as handle:
+            descriptor = None
+            yield handle
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _strict_json_load(handle, label):
+    """Decode standard JSON, refusing duplicates and nonfinite constants."""
+    def object_pairs(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise E0ValidationError(
+                    f"{label} contains duplicate JSON key {key!r}")
+            value[key] = item
+        return value
+
+    def parse_constant(value):
+        raise E0ValidationError(
+            f"{label} contains nonfinite JSON constant {value!r}")
+
+    try:
+        return json.load(
+            handle, object_pairs_hook=object_pairs,
+            parse_constant=parse_constant)
+    except E0ValidationError:
+        raise
+    except (json.JSONDecodeError, UnicodeError, OSError) as exc:
+        raise E0ValidationError(f"cannot decode {label}: {exc}") from exc
+
+
+def _strict_json_loads(text, label):
+    """Line-oriented counterpart of :func:`_strict_json_load`."""
+    def object_pairs(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise E0ValidationError(
+                    f"{label} contains duplicate JSON key {key!r}")
+            value[key] = item
+        return value
+
+    def parse_constant(value):
+        raise E0ValidationError(
+            f"{label} contains nonfinite JSON constant {value!r}")
+    try:
+        return json.loads(
+            text, object_pairs_hook=object_pairs,
+            parse_constant=parse_constant)
+    except E0ValidationError:
+        raise
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise E0ValidationError(f"cannot decode {label}: {exc}") from exc
+
+
+def _first_json_mismatch(actual, expected, path):
+    """Return a type-exact recursive JSON mismatch, if one exists."""
+    if type(actual) is not type(expected):
+        return (f"{path} has type {type(actual).__name__}, expected "
+                f"{type(expected).__name__}")
+    if isinstance(actual, dict):
+        if set(actual) != set(expected):
+            key = sorted(set(actual) ^ set(expected), key=str)[0]
+            return f"{path} differs in key {key!r}"
+        for key in sorted(actual, key=str):
+            mismatch = _first_json_mismatch(
+                actual[key], expected[key], f"{path}.{key}")
+            if mismatch is not None:
+                return mismatch
+        return None
+    if isinstance(actual, list):
+        if len(actual) != len(expected):
+            return (f"{path} has length {len(actual)}, expected "
+                    f"{len(expected)}")
+        for index, (left, right) in enumerate(zip(actual, expected)):
+            mismatch = _first_json_mismatch(
+                left, right, f"{path}[{index}]")
+            if mismatch is not None:
+                return mismatch
+        return None
+    if actual != expected:
+        return f"{path} is {actual!r}, expected {expected!r}"
+    return None
+
+
+def _require_json_equal(actual, expected, path):
+    mismatch = _first_json_mismatch(actual, expected, path)
+    _require(mismatch is None, mismatch or f"{path} differs")
 
 
 def _finite(value):
@@ -1741,6 +1856,20 @@ def _manifest_argument_parser():
 
 def _validate_driver_argument_legality(arguments, label):
     """Mirror every cross-field launch constraint that defines E0 legality."""
+    positive_integers = (
+        "num_rounds", "local_epochs", "batch_size", "eval_batch_size",
+        "lora_rank", "loss_sample",
+    )
+    for field in positive_integers:
+        value = arguments.get(field)
+        _require(type(value) is int and value > 0,
+                 f"{label}: {field} must be a positive integer")
+    seed = arguments.get("seed")
+    _require(type(seed) is int and seed >= 0,
+             f"{label}: seed must be a nonnegative integer")
+    max_steps = arguments.get("max_steps_per_round")
+    _require(type(max_steps) is int and max_steps >= 0,
+             f"{label}: max_steps_per_round must be a nonnegative integer")
     canonical_weight_by = (
         "rawmaxmin" if arguments.get("weight_by") == "maxmin"
         else arguments.get("weight_by"))
@@ -1875,11 +2004,12 @@ def _canonical_data_fingerprints(data):
 
 def _read_jsonl(path, transform):
     values = {}
-    with path.open(encoding="utf-8") as handle:
+    with _open_regular(path, "archived JSONL evidence") as handle:
         for line in handle:
             if not line.strip():
                 continue
-            record = json.loads(line)
+            record = _strict_json_loads(
+                line, f"archived JSONL evidence {path}")
             key, value = transform(record)
             values[key] = value
     return values
@@ -1887,7 +2017,8 @@ def _read_jsonl(path, transform):
 
 def _read_qrels(path):
     values = {}
-    with path.open(encoding="utf-8", newline="") as handle:
+    with _open_regular(
+            path, "archived qrels evidence", newline="") as handle:
         rows = csv.reader(handle, delimiter="\t")
         next(rows)
         for query_id, corpus_id, score, *_ in rows:
@@ -1901,9 +2032,6 @@ def _load_archived_slice(data_root, slice_name):
     corpus_path = directory / "corpus.jsonl"
     queries_path = directory / "queries.jsonl"
     test_path = directory / "qrels" / "test.tsv"
-    for path in (corpus_path, queries_path, test_path):
-        _require(path.is_file(),
-                 f"independent dataset-content gate cannot load {path}")
     corpus = _read_jsonl(
         corpus_path,
         lambda row: (row.get("_id"), {
@@ -1915,7 +2043,7 @@ def _load_archived_slice(data_root, slice_name):
     eval_qrels = _read_qrels(test_path)
     eval_q = {query_id: queries[query_id] for query_id in eval_qrels}
     train_path = directory / "qrels" / "train.tsv"
-    if train_path.is_file():
+    if os.path.lexists(train_path):
         train_qrels = _read_qrels(train_path)
         train_q = {query_id: queries[query_id] for query_id in train_qrels}
     else:
@@ -2081,21 +2209,26 @@ def _validate_manifest_row(result, row, run_id, execution_source_root):
         _require(field in arguments,
                  f"result argument namespace omits {field}")
         expected = launched[field]
+        mismatch = _first_json_mismatch(
+            arguments[field], expected, f"result args.{field}")
         _require(
-            arguments[field] == expected,
+            mismatch is None,
             f"manifest row '{run_id}' launched {field}={expected!r} but the "
-            f"result records {arguments[field]!r}")
+            f"result records {arguments[field]!r}: {mismatch}")
     for field in ("model", "slices", "metrics", "seed", "num_rounds",
                   "lora_mode", "weighted"):
-        _require(result[field] == arguments[field],
-                 f"result {field} metadata differs from its argument record")
-    _require(result["weight_by"] == (
-        arguments["weight_by"] if arguments["weighted"] else None),
-        "result weight_by metadata differs from its argument record")
+        _require_json_equal(
+            result[field], arguments[field],
+            f"result {field} metadata vs argument record")
+    _require_json_equal(
+        result["weight_by"],
+        arguments["weight_by"] if arguments["weighted"] else None,
+        "result weight_by metadata vs argument record")
     for field in ("frozen_a_row_scale", "fedspan_step_policy",
                   "fedspan_step_norm", "fedspan_direction_policy"):
-        _require(contract.get(field) == arguments[field],
-                 f"method contract {field} differs from its argument record")
+        _require_json_equal(
+            contract.get(field), arguments[field],
+            f"method contract {field} vs argument record")
     _require(row["coordinate"] == launched["lora_mode"],
              f"manifest row '{run_id}' coordinate differs from --lora_mode")
     expected_arm = None if row["arm"] == "uniform" else row["arm"]
@@ -2139,8 +2272,9 @@ def _validate_manifest_row(result, row, run_id, execution_source_root):
 
 
 def _load_manifest_row(manifest_path, run_id):
-    with Path(manifest_path).open() as handle:
-        manifest = json.load(handle)
+    with _open_regular(manifest_path, "E0 manifest JSON") as handle:
+        manifest = _strict_json_load(handle, "E0 manifest JSON")
+    _require(isinstance(manifest, dict), "E0 manifest JSON is not an object")
     _require(manifest.get("schema") == _MANIFEST_SCHEMA,
              f"manifest schema is {manifest.get('schema')!r}, expected "
              f"{_MANIFEST_SCHEMA!r}")
@@ -2158,11 +2292,13 @@ def _load_manifest_row(manifest_path, run_id):
 
 def _validate_resource_record(run_directory, result):
     path = Path(run_directory) / _RESOURCE_FILENAME
-    _require(path.is_file(),
-             f"run directory has no {_RESOURCE_FILENAME}, so its GPU-hour "
-             "and determinism claims are unauditable")
-    with path.open() as handle:
-        record = json.load(handle)
+    try:
+        with _open_regular(path, _RESOURCE_FILENAME) as handle:
+            record = _strict_json_load(handle, _RESOURCE_FILENAME)
+    except E0ValidationError as exc:
+        raise E0ValidationError(
+            f"run directory has no safe {_RESOURCE_FILENAME}, so its "
+            f"GPU-hour and determinism claims are unauditable: {exc}") from exc
     run_id = Path(run_directory).name
     log_directory = Path(run_directory).parent / "logs"
     log_path = log_directory / f"{run_id}.log"
@@ -2184,13 +2320,26 @@ def validate_run_directory(run_directory, manifest_row=None,
     run_directory = Path(run_directory)
     result_path = _single(
         run_directory.glob("federated_*.json"), "federated result JSON")
-    with result_path.open() as handle:
-        result = json.load(handle)
+    with _open_regular(result_path, "federated result JSON") as handle:
+        result = _strict_json_load(handle, "federated result JSON")
+    _require(isinstance(result, dict), "federated result JSON is not an object")
 
     arguments = result.get("args")
     _require(isinstance(arguments, dict),
              "result records no argument namespace")
     _validate_driver_argument_legality(arguments, "result arguments")
+
+    _require(type(result.get("num_rounds")) is int
+             and result["num_rounds"] > 0,
+             "result num_rounds must be a positive integer")
+
+    for field in ("model", "slices", "metrics", "seed", "num_rounds",
+                  "lora_mode", "weighted"):
+        _require(field in result and field in arguments,
+                 f"result/arguments omit gate-critical field {field}")
+        _require_json_equal(
+            result[field], arguments[field],
+            f"result {field} metadata vs argument record")
 
     commit = result.get("commit")
     _require(
@@ -2200,7 +2349,7 @@ def validate_run_directory(run_directory, manifest_row=None,
         "exactly 12 lowercase hex "
         f"characters, recorded {commit!r}")
 
-    num_rounds = int(result["num_rounds"])
+    num_rounds = result["num_rounds"]
     state_paths = sorted(run_directory.glob("states_*.pt"))
     _require(
         len(state_paths) == num_rounds,
@@ -2248,8 +2397,18 @@ def validate_run_directory(run_directory, manifest_row=None,
         state_path = _single(
             run_directory.glob(f"states_*_round{round_number}.pt"),
             f"{round_label} state file")
-        payload = torch.load(
-            state_path, map_location="cpu", weights_only=True)
+        with _open_regular(
+                state_path, f"{round_label} state evidence", binary=True
+        ) as state_handle:
+            try:
+                payload = torch.load(
+                    state_handle, map_location="cpu", weights_only=True)
+            except E0ValidationError:
+                raise
+            except Exception as exc:
+                raise E0ValidationError(
+                    f"cannot decode {round_label} state evidence: {exc}") \
+                    from exc
         _validate_exact_state_schema(result, payload, round_label)
         _require(
             state_dict_sha256(payload["broadcast"])

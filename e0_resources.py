@@ -66,6 +66,30 @@ def _parse_ascii_decimal(text, field):
     return value
 
 
+def _strict_json_load(handle, label):
+    """Decode standard JSON without duplicate keys or nonfinite constants."""
+    def object_pairs(pairs):
+        value = {}
+        for key, item in pairs:
+            _require(key not in value,
+                     f"{label} contains duplicate JSON key {key!r}")
+            value[key] = item
+        return value
+
+    def parse_constant(value):
+        raise ResourceValidationError(
+            f"{label} contains nonfinite JSON constant {value!r}")
+
+    try:
+        return json.load(
+            handle, object_pairs_hook=object_pairs,
+            parse_constant=parse_constant)
+    except ResourceValidationError:
+        raise
+    except (json.JSONDecodeError, UnicodeError, OSError) as exc:
+        raise ResourceValidationError(f"cannot decode {label}: {exc}") from exc
+
+
 def validate_run_id(run_id):
     _require(
         isinstance(run_id, str) and _RUN_ID.fullmatch(run_id) is not None
@@ -76,10 +100,20 @@ def validate_run_id(run_id):
 
 
 def _sha256(path):
+    with _open_regular_text(path, "raw evidence", errors="strict") as handle:
+        return _sha256_descriptor(handle.fileno())
+
+
+def _sha256_descriptor(descriptor):
+    """Hash the exact held inode without disturbing its parser offset."""
     digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 1024 * 1024, offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
     return digest.hexdigest()
 
 
@@ -96,12 +130,13 @@ def _utc_from_wall_ns(wall_ns):
 
 
 @contextlib.contextmanager
-def _open_regular_text(path, label, *, append=False):
+def _open_regular_text(path, label, *, append=False, errors="strict"):
     """Open one stable regular-file descriptor without following symlinks."""
     no_follow = getattr(os, "O_NOFOLLOW", None)
     _require(no_follow is not None,
              f"this platform cannot safely open {label}")
-    flags = no_follow | getattr(os, "O_CLOEXEC", 0)
+    flags = (no_follow | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NONBLOCK", 0))
     flags |= (os.O_RDWR | os.O_APPEND) if append else os.O_RDONLY
     mode = "r+" if append else "r"
     descriptor = None
@@ -115,7 +150,7 @@ def _open_regular_text(path, label, *, append=False):
                  f"{label} must be a regular file, not a symlink or special "
                  "file")
         with os.fdopen(
-                descriptor, mode, encoding="utf-8", errors="strict") as handle:
+                descriptor, mode, encoding="utf-8", errors=errors) as handle:
             descriptor = None
             yield handle
     finally:
@@ -156,10 +191,10 @@ def _read_boundary_rows(boundaries_path, *, handle=None):
         return _parse_boundary_rows(opened)
 
 
-def parse_boundary_evidence(boundaries_path, expected_run_id):
+def parse_boundary_evidence(boundaries_path, expected_run_id, *, handle=None):
     """Read the exact raw start/finish clock pairs for one launcher row."""
     validate_run_id(expected_run_id)
-    rows = _read_boundary_rows(boundaries_path)
+    rows = _read_boundary_rows(boundaries_path, handle=handle)
     _require(len(rows) == 2,
              f"expected two boundary evidence events, found {len(rows)}")
     for index, expected_event in enumerate(("start", "finish")):
@@ -298,7 +333,7 @@ def record_boundary_evidence(boundaries_path, run_id, event):
 
 
 def parse_timestamped_rounds(log_path, expected_run_id, num_rounds,
-                             started_mono_ns, finished_mono_ns):
+                             started_mono_ns, finished_mono_ns, *, handle=None):
     """Replay a strict START/END marker stream into a monotonic partition."""
     validate_run_id(expected_run_id)
     _require(_is_int(num_rounds) and num_rounds > 0,
@@ -309,8 +344,17 @@ def parse_timestamped_rounds(log_path, expected_run_id, num_rounds,
              and finished_mono_ns > started_mono_ns,
              "finished_mono_ns must be greater than started_mono_ns")
 
+    if handle is None:
+        with _open_regular_text(
+                log_path, "timestamped log evidence", errors="replace") as log:
+            return parse_timestamped_rounds(
+                log_path, expected_run_id, num_rounds, started_mono_ns,
+                finished_mono_ns, handle=log)
+
     observed = []
-    with Path(log_path).open("r", encoding="utf-8", errors="replace") as log:
+    handle.seek(0)
+    log = handle
+    try:
         for line_number, line in enumerate(log, 1):
             fields = line.rstrip("\n").split("\t", 2)
             _require(
@@ -340,6 +384,9 @@ def parse_timestamped_rounds(log_path, expected_run_id, num_rounds,
                                  f"timestamped log line {line_number} "
                                  "denominator"), monotonic_ns,
                              line_number))
+    except UnicodeError as exc:
+        raise ResourceValidationError(
+            f"timestamped log evidence is not decodable: {exc}") from exc
 
     expected_count = 2 * num_rounds
     _require(
@@ -401,14 +448,22 @@ def parse_timestamped_rounds(log_path, expected_run_id, num_rounds,
     return timing
 
 
-def _gpu_summary(samples_path):
+def _gpu_summary(samples_path, *, handle=None):
+    if handle is None:
+        with _open_regular_text(
+                samples_path, "GPU sample evidence") as samples:
+            return _gpu_summary(samples_path, handle=samples)
     values = []
-    with Path(samples_path).open("r", encoding="utf-8",
-                                 errors="strict") as samples:
+    handle.seek(0)
+    samples = handle
+    try:
         for line_number, line in enumerate(samples, 1):
             value = line.strip()
             values.append(_parse_ascii_decimal(
                 value, f"GPU sample line {line_number}"))
+    except UnicodeError as exc:
+        raise ResourceValidationError(
+            f"GPU sample evidence is not decodable: {exc}") from exc
     return {
         "gpu_available": bool(values),
         "peak_gpu_memory_mib": max(values) if values else None,
@@ -441,22 +496,36 @@ def build_resource_record(run_id, log_path, samples_path, *,
     """Construct schema v2 exclusively from launcher boundaries/raw evidence."""
     validate_run_id(run_id)
     boundaries_path = boundary_path_for_log(log_path, run_id)
-    boundaries = parse_boundary_evidence(boundaries_path, run_id)
-    supplied = {
-        "started_wall_ns": started_wall_ns,
-        "finished_wall_ns": finished_wall_ns,
-        "started_mono_ns": started_mono_ns,
-        "finished_mono_ns": finished_mono_ns,
-    }
-    for field, value in supplied.items():
-        _require(_is_int(value) and value >= 0,
-                 f"{field} must be a nonnegative integer")
-        _require(value == boundaries[field],
-                 f"{field} does not match raw boundary evidence")
-    timing = parse_timestamped_rounds(
-        log_path, run_id, num_rounds, boundaries["started_mono_ns"],
-        boundaries["finished_mono_ns"])
-    gpu = _gpu_summary(samples_path)
+    with _open_regular_text(
+            boundaries_path, "boundary evidence") as boundary_handle, \
+         _open_regular_text(
+            log_path, "timestamped log evidence",
+            errors="replace") as log_handle, \
+         _open_regular_text(
+            samples_path, "GPU sample evidence") as samples_handle:
+        boundaries = parse_boundary_evidence(
+            boundaries_path, run_id, handle=boundary_handle)
+        supplied = {
+            "started_wall_ns": started_wall_ns,
+            "finished_wall_ns": finished_wall_ns,
+            "started_mono_ns": started_mono_ns,
+            "finished_mono_ns": finished_mono_ns,
+        }
+        for field, value in supplied.items():
+            _require(_is_int(value) and value >= 0,
+                     f"{field} must be a nonnegative integer")
+            _require(value == boundaries[field],
+                     f"{field} does not match raw boundary evidence")
+        timing = parse_timestamped_rounds(
+            log_path, run_id, num_rounds, boundaries["started_mono_ns"],
+            boundaries["finished_mono_ns"], handle=log_handle)
+        gpu = _gpu_summary(samples_path, handle=samples_handle)
+        evidence_hashes = {
+            "log_sha256": _sha256_descriptor(log_handle.fileno()),
+            "samples_sha256": _sha256_descriptor(samples_handle.fileno()),
+            "boundaries_sha256": _sha256_descriptor(
+                boundary_handle.fileno()),
+        }
     elapsed_ns = (boundaries["finished_mono_ns"]
                   - boundaries["started_mono_ns"])
     return {
@@ -469,9 +538,7 @@ def build_resource_record(run_id, log_path, samples_path, *,
         **timing,
         "round_elapsed_seconds": [
             value / 1_000_000_000 for value in timing["round_ns"]],
-        "log_sha256": _sha256(log_path),
-        "samples_sha256": _sha256(samples_path),
-        "boundaries_sha256": _sha256(boundaries_path),
+        **evidence_hashes,
         **gpu,
         **_determinism_metadata(),
     }
@@ -570,8 +637,26 @@ def validate_resource_record(record, expected_run_id, num_rounds,
 
     validate_run_id(expected_run_id)
     boundaries_path = boundary_path_for_log(log_path, expected_run_id)
-    raw_boundaries = parse_boundary_evidence(
-        boundaries_path, expected_run_id)
+    with _open_regular_text(
+            boundaries_path, "boundary evidence") as boundary_handle, \
+         _open_regular_text(
+            log_path, "timestamped log evidence",
+            errors="replace") as log_handle, \
+         _open_regular_text(
+            samples_path, "GPU sample evidence") as samples_handle:
+        raw_boundaries = parse_boundary_evidence(
+            boundaries_path, expected_run_id, handle=boundary_handle)
+        replay = parse_timestamped_rounds(
+            log_path, expected_run_id, num_rounds,
+            raw_boundaries["started_mono_ns"],
+            raw_boundaries["finished_mono_ns"], handle=log_handle)
+        replay_gpu = _gpu_summary(samples_path, handle=samples_handle)
+        raw_hashes = {
+            "log_sha256": _sha256_descriptor(log_handle.fileno()),
+            "samples_sha256": _sha256_descriptor(samples_handle.fileno()),
+            "boundaries_sha256": _sha256_descriptor(
+                boundary_handle.fileno()),
+        }
     for field, value in raw_boundaries.items():
         _require(record.get(field) == value,
                  f"schema v2 {field} does not match raw boundary evidence")
@@ -593,10 +678,6 @@ def validate_resource_record(record, expected_run_id, num_rounds,
         == _utc_from_wall_ns(record["finished_wall_ns"]),
         "schema v2 UTC provenance does not match its wall nanoseconds")
 
-    replay = parse_timestamped_rounds(
-        log_path, expected_run_id, num_rounds,
-        raw_boundaries["started_mono_ns"],
-        raw_boundaries["finished_mono_ns"])
     for field in ("pre_ns", "round_ns", "between_round_ns", "post_ns"):
         _require(record.get(field) == replay[field],
                  f"schema v2 {field} does not match raw log replay")
@@ -630,9 +711,8 @@ def validate_resource_record(record, expected_run_id, num_rounds,
         value = record.get(field)
         _require(isinstance(value, str) and _SHA256.fullmatch(value),
                  f"schema v2 has invalid {field}")
-        _require(value == _sha256(path),
+        _require(value == raw_hashes[field],
                  f"schema v2 {field} does not match raw evidence")
-    replay_gpu = _gpu_summary(samples_path)
     for field in ("gpu_available", "peak_gpu_memory_mib",
                   "gpu_memory_samples"):
         _require(record.get(field) == replay_gpu[field],
@@ -664,8 +744,9 @@ def write_resource_record(run_id, run_dir, log_path, samples_path, **kwargs):
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        with temporary.open("r", encoding="utf-8") as handle:
-            serialized = json.load(handle)
+        with _open_regular_text(
+                temporary, "temporary resource JSON") as handle:
+            serialized = _strict_json_load(handle, "temporary resource JSON")
         validate_resource_record(
             serialized, run_id, kwargs["num_rounds"], log_path, samples_path)
         os.replace(temporary, destination)

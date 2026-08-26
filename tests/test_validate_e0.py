@@ -213,6 +213,45 @@ def repair_fedspan_solution(tmp_path, result_path, active_weights,
     return result, payload
 
 
+def repair_rawmaxmin_solution(tmp_path, result_path, weights,
+                              round_number=1):
+    """Forge a self-consistent rawmaxmin decision and repaired global/hash."""
+    payload = load_states(tmp_path, round_number)
+    with Path(result_path).open() as handle:
+        result = json.load(handle)
+    label = f"round_{round_number}"
+    values = [float(value) for value in weights]
+    assert len(values) == len(result["slices"])
+
+    broadcast = payload["broadcast"]
+    clients = [payload["clients"][name] for name in result["slices"]]
+    if result["lora_mode"] == "frozen-a":
+        global_state = {
+            key: value.clone() for key, value in broadcast.items()
+        }
+        base_b = broadcast[driver_harness.B_KEY].double()
+        repaired_b = base_b.clone()
+        for weight, state in zip(values, clients):
+            repaired_b += weight * (
+                state[driver_harness.B_KEY].double() - base_b)
+        global_state[driver_harness.B_KEY] = repaired_b.float()
+    else:
+        global_state = {}
+        for key in broadcast:
+            combined = sum(
+                weight * state[key].double()
+                for weight, state in zip(values, clients))
+            global_state[key] = combined.float()
+
+    payload["global"] = global_state
+    resave_states(tmp_path, payload, round_number=round_number,
+                  repair_hashes=True)
+    result["scheme_diagnostics"][label]["weights"] = values
+    result["round_weights"][label] = [round(value, 5) for value in values]
+    rewrite(result_path, result)
+    return result, payload
+
+
 def translate_round_b_state_and_repair_hashes(
         tmp_path, result_path, round_number,
         translation=2.0 ** -8):
@@ -564,6 +603,126 @@ def test_single_element_perturbation_of_the_global_is_refused(
     resave_states(tmp_path, payload, repair_hashes=True)
 
     with pytest.raises(E0ValidationError, match="persisted global disagrees"):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize("lora_mode", ["trainable-ab", "frozen-a"])
+def test_repaired_suboptimal_rawmaxmin_solution_is_refused(
+        monkeypatch, tmp_path, lora_mode):
+    """Hashes and aggregation agree, but [1,0,0] loses the cosine game."""
+    _, result_path = build_run(
+        monkeypatch, tmp_path, lora_mode, "rawmaxmin")
+    repair_rawmaxmin_solution(tmp_path, result_path, [1.0, 0.0, 0.0])
+
+    with pytest.raises(E0ValidationError,
+                       match="raw-maximin optimality gap"):
+        validate_run_directory(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("weights", "message"),
+    [
+        ([2.0, 0.0, 0.0], "sum to 1"),
+        ([1.0 + 1e-12, -1e-12, 0.0], "negative"),
+        ([1.0 + 2e-10, 0.0, 0.0], "sum to 1"),
+    ],
+)
+def test_rawmaxmin_recorded_non_simplex_weights_are_not_normalized(
+        monkeypatch, tmp_path, weights, message):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "rawmaxmin")
+    repair_rawmaxmin_solution(tmp_path, result_path, weights)
+
+    with pytest.raises(E0ValidationError, match=message):
+        validate_run_directory(tmp_path)
+
+
+def test_rawmaxmin_sum_residual_inside_tolerance_is_used_without_normalizing(
+        monkeypatch, tmp_path):
+    result, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "rawmaxmin")
+    weights = result["scheme_diagnostics"]["round_1"]["weights"]
+    weights[0] += 5e-11
+    repair_rawmaxmin_solution(tmp_path, result_path, weights)
+
+    report = validate_run_directory(tmp_path)
+
+    audit = report["rawmaxmin_direction_residuals"]["round_1"]
+    assert audit["recorded_simplex_residual"] == pytest.approx(5e-11)
+
+
+def test_rawmaxmin_nonunique_optimum_accepts_alternate_weights(
+        monkeypatch, tmp_path):
+    identical = {
+        name: {
+            key: value.clone()
+            for key, value in driver_harness.client_states()["c0"].items()
+        }
+        for name in driver_harness.SLICES
+    }
+    _, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "rawmaxmin",
+        clients=identical)
+    repair_rawmaxmin_solution(tmp_path, result_path, [0.2, 0.3, 0.5])
+
+    report = validate_run_directory(tmp_path)
+
+    audit = report["rawmaxmin_direction_residuals"]["round_1"]
+    assert audit["optimality_gap"] <= audit["optimality_tolerance"]
+
+
+def test_rawmaxmin_validator_factor_math_matches_dense_moving_a():
+    """The audit coordinate includes both moving factors and PEFT scaling."""
+    broadcast = driver_harness.broadcast_state()
+    broadcast[driver_harness.B_KEY][:, :2] = torch.tensor([
+        [0.3, -0.2], [0.1, 0.4], [-0.5, 0.2],
+    ])
+    clients = driver_harness.client_states()
+    for index, name in enumerate(driver_harness.SLICES, start=1):
+        clients[name][driver_harness.A_KEY] = (
+            clients[name][driver_harness.A_KEY]
+            + 0.01 * index * torch.flip(
+                torch.eye(16), dims=[1]))
+    payload = {"broadcast": broadcast, "clients": clients}
+    result = {"lora_mode": "trainable-ab",
+              "slices": list(driver_harness.SLICES)}
+
+    actual = validator._rawmaxmin_cosine_gram(
+        result, payload, "round_test")
+    dense = []
+    for name in result["slices"]:
+        state = clients[name]
+        update = driver_harness.MODULE_SCALE * (
+            state[driver_harness.B_KEY].double()
+            @ state[driver_harness.A_KEY].double()
+            - broadcast[driver_harness.B_KEY].double()
+            @ broadcast[driver_harness.A_KEY].double())
+        dense.append(update.reshape(-1).numpy())
+    dense = np.stack(dense)
+    norms = np.linalg.norm(dense, axis=1)
+    expected = (dense @ dense.T) / np.outer(norms, norms)
+
+    assert actual == pytest.approx(expected, rel=1e-12, abs=1e-12)
+
+
+def test_rawmaxmin_degenerate_effective_update_is_refused_even_if_record_says_optimal(
+        monkeypatch, tmp_path):
+    clients = driver_harness.client_states()
+    clients["c2"] = {
+        key: value.clone()
+        for key, value in driver_harness.broadcast_state().items()
+    }
+    _, result_path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "rawmaxmin", clients=clients)
+    with result_path.open() as handle:
+        result = json.load(handle)
+    record = result["scheme_diagnostics"]["round_1"]
+    assert record["fallback"] == "uniform"
+    record.update({"status": "optimal", "fallback": None,
+                   "solver_message": "forged success"})
+    rewrite(result_path, result)
+
+    with pytest.raises(E0ValidationError, match="degenerate diagonal"):
         validate_run_directory(tmp_path)
 
 

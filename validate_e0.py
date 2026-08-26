@@ -52,6 +52,9 @@ _SCALAR_RTOL = 1e-8
 _SIMPLEX_TOL = 1e-10
 _STORED_A_RTOL = 1e-6
 _MATERIALIZED_VECTOR_RTOL = 5e-6
+_RAWMAXMIN_MIN_REL_DIAGONAL = 1e-12
+_RAWMAXMIN_OBJECTIVE_ATOL = 1e-10
+_RAWMAXMIN_OBJECTIVE_RTOL = 1e-8
 
 # The applied step norm and the median active client norm reach the same
 # quantity by different routes: one through the float64 geometry scale
@@ -390,14 +393,22 @@ def _compare_aggregates(expected, actual, label):
 
 
 def _simplex_from_recorded(weights, label):
-    weights = [float(value) for value in weights]
+    try:
+        weights = [float(value) for value in weights]
+    except (TypeError, ValueError) as error:
+        raise E0ValidationError(
+            f"{label}: recorded weights contain a nonnumeric value") from error
     _require(all(_finite(value) for value in weights),
              f"{label}: recorded weights contain a nonfinite value")
     _require(min(weights) >= 0.0,
              f"{label}: recorded simplex weights contain a negative value")
     total = sum(weights)
-    _require(total > 0.0, f"{label}: recorded simplex weights sum to {total}")
-    return [value / total for value in weights]
+    _require(abs(total - 1.0) <= _SIMPLEX_TOL,
+             f"{label}: recorded simplex weights must sum to 1 within "
+             f"{_SIMPLEX_TOL:g}, got {total:.17g}")
+    # Deliberately return the persisted numbers. Normalizing here would let a
+    # repaired record certify a different server update than the one claimed.
+    return weights
 
 
 def _round_coefficients(result, round_label, num_clients):
@@ -463,6 +474,149 @@ def _validate_recomputed_global(result, payload, round_label):
         expected, payload["global"], round_label)
     return {"kind": kind, "max_abs_deviation": deviation,
             "max_tolerance_ratio": ratio, "worst_key": key}
+
+
+def _rawmaxmin_effective_stacks(result, payload, round_label):
+    """Independently represent sigma*(B_k A_k - B_g A_g) per client.
+
+    Each module is kept as two signed low-rank factors rather than materialized
+    as a potentially enormous dense matrix.  The companion inner-product
+    routine contracts these factors exactly in float64 and does not call any
+    production aggregation or geometry helper.
+    """
+    broadcast = payload["broadcast"]
+    modules = _lora_modules(broadcast, f"{round_label} broadcast")
+    if result["lora_mode"] == "frozen-a":
+        records = (result.get("method_contract") or {}).get(
+            "frozen_a_row_scale_records")
+        _require(isinstance(records, dict)
+                 and sorted(records) == sorted(modules),
+                 f"{round_label}: rawmaxmin PEFT scale records do not cover "
+                 "every module")
+        scales = {}
+        for name in sorted(modules):
+            value = (records.get(name) or {}).get("peft_scale")
+            _require(_finite(value) and float(value) > 0.0,
+                     f"{round_label}: invalid rawmaxmin PEFT scale for "
+                     f"'{name}'")
+            scales[name] = float(value)
+    else:
+        # The execution contract constructs every adapter with
+        # lora_alpha=2*lora_rank, so sigma is exactly 2 in this coordinate.
+        scales = {name: 2.0 for name in modules}
+
+    stacks = []
+    for client_name in result["slices"]:
+        state = payload["clients"][client_name]
+        client_modules = _lora_modules(
+            state, f"{round_label} client {client_name}")
+        _require(sorted(client_modules) == sorted(modules),
+                 f"{round_label}: rawmaxmin client {client_name} has a "
+                 "different LoRA module set")
+        stack = {}
+        for name, factors in sorted(modules.items()):
+            client_factors = client_modules[name]
+            scale = scales[name]
+            stack[name] = (
+                (scale,
+                 state[client_factors["B"]].detach().cpu().double(),
+                 state[client_factors["A"]].detach().cpu().double()),
+                (-scale,
+                 broadcast[factors["B"]].detach().cpu().double(),
+                 broadcast[factors["A"]].detach().cpu().double()),
+            )
+        stacks.append(stack)
+    return stacks
+
+
+def _rawmaxmin_stack_inner_product(left, right):
+    """Frobenius product of two signed BA stacks via an exact trace identity."""
+    total = 0.0
+    for name in sorted(left):
+        for left_scale, left_b, left_a in left[name]:
+            for right_scale, right_b, right_a in right[name]:
+                # <B1 A1, B2 A2> = sum((B1.T B2) * (A1 A2.T)).
+                value = torch.sum(
+                    (left_b.T @ right_b) * (left_a @ right_a.T))
+                total += left_scale * right_scale * float(value.item())
+    return total
+
+
+def _rawmaxmin_cosine_gram(result, payload, round_label):
+    stacks = _rawmaxmin_effective_stacks(
+        result, payload, round_label)
+    client_count = len(stacks)
+    gram = np.zeros((client_count, client_count), dtype=np.float64)
+    for left in range(client_count):
+        for right in range(left, client_count):
+            value = _rawmaxmin_stack_inner_product(
+                stacks[left], stacks[right])
+            gram[left, right] = gram[right, left] = value
+
+    diagonal = np.diag(gram)
+    largest = (float(np.max(diagonal))
+               if np.all(np.isfinite(diagonal)) else 0.0)
+    floor = max(0.0, _RAWMAXMIN_MIN_REL_DIAGONAL * largest)
+    _require(np.all(np.isfinite(gram)),
+             f"{round_label}: rawmaxmin effective-update Gram is nonfinite")
+    _require(largest > 0.0 and float(np.min(diagonal)) > floor,
+             f"{round_label}: rawmaxmin effective-update Gram has a "
+             "degenerate diagonal")
+    norms = np.sqrt(diagonal)
+    cosine = gram / np.outer(norms, norms)
+    _require(np.all(np.isfinite(cosine)),
+             f"{round_label}: rawmaxmin cosine Gram is nonfinite")
+    return cosine
+
+
+def _validate_rawmaxmin_round(result, payload, round_label):
+    if result.get("weight_by_canonical") != "rawmaxmin":
+        return None
+    record = (result.get("scheme_diagnostics") or {}).get(round_label)
+    _require(isinstance(record, dict),
+             f"{round_label}: rawmaxmin round has no scheme diagnostics, "
+             "so the applied weights are not recorded at full precision")
+    _require(record.get("scheme") == "rawmaxmin",
+             f"{round_label}: rawmaxmin scheme record is incoherent")
+    _require(record.get("status") == "optimal"
+             and record.get("fallback") is None,
+             f"{round_label}: rawmaxmin record is not a no-fallback optimal "
+             "solve")
+    weights = record.get("weights")
+    _require(isinstance(weights, list)
+             and len(weights) == len(result["slices"]),
+             f"{round_label}: rawmaxmin record does not contain one weight "
+             "per client")
+    weights = np.asarray(
+        _simplex_from_recorded(weights, round_label), dtype=np.float64)
+
+    cosine = _rawmaxmin_cosine_gram(result, payload, round_label)
+    try:
+        oracle = maximin_simplex_oracle(cosine)
+    except ValueError as error:
+        raise E0ValidationError(
+            f"{round_label}: independent rawmaxmin oracle failed: {error}") \
+            from error
+    recorded_objective = float(np.min(cosine @ weights))
+    derived_objective = float(oracle["objective"])
+    gap = derived_objective - recorded_objective
+    scale = max(1.0, abs(derived_objective),
+                abs(recorded_objective), float(np.max(np.abs(cosine))))
+    tolerance = (_RAWMAXMIN_OBJECTIVE_ATOL
+                 + _RAWMAXMIN_OBJECTIVE_RTOL * scale)
+    _require(gap <= tolerance,
+             f"{round_label}: raw-maximin optimality gap {gap:.6g} exceeds "
+             f"tolerance {tolerance:.6g} (recorded min(Cw)="
+             f"{recorded_objective:.6g}, independent optimum="
+             f"{derived_objective:.6g})")
+    return {
+        "recorded_objective": recorded_objective,
+        "derived_objective": derived_objective,
+        "optimality_gap": gap,
+        "optimality_tolerance": tolerance,
+        "recorded_simplex_residual": abs(float(np.sum(weights)) - 1.0),
+        "minimum_recorded_weight": float(np.min(weights)),
+    }
 
 
 # ------------------------------------------------------- scheme contracts
@@ -1995,6 +2149,7 @@ def validate_run_directory(run_directory, manifest_row=None,
     previous_global_hash = None
     scale_audit = {}
     direction_audit = {}
+    rawmaxmin_audit = {}
     for round_number in range(1, num_rounds + 1):
         round_label = f"round_{round_number}"
         state_path = _single(
@@ -2060,6 +2215,9 @@ def validate_run_directory(run_directory, manifest_row=None,
                     values["stored_a_off_diagonal_error"]
                     for values in scale_details.values()),
             }
+        if result.get("weight_by_canonical") == "rawmaxmin":
+            rawmaxmin_audit[round_label] = _validate_rawmaxmin_round(
+                result, payload, round_label)
         recomputation = _validate_recomputed_global(
             result, payload, round_label)
         if result.get("weight_by_canonical") == "normmaxmin":
@@ -2111,6 +2269,7 @@ def validate_run_directory(run_directory, manifest_row=None,
             manifest_row is not None),
         "frozen_a_scale_audit": scale_audit,
         "fedspan_direction_residuals": direction_audit,
+        "rawmaxmin_direction_residuals": rawmaxmin_audit,
     }
     if launched is not None:
         report["launched"] = launched

@@ -2317,12 +2317,13 @@ def _validate_execution_source(result, row, execution_source_root):
 
 
 def _validate_manifest_row(result, row, run_id, execution_source_root):
-    _require(row["run_id"] == run_id,
-             f"manifest row is for '{row['run_id']}', not '{run_id}'")
+    _require_json_equal(row["run_id"], run_id, "manifest row run_id")
+    commit_mismatch = _first_json_mismatch(
+        result["commit"], row["commit"], "result commit")
     _require(
-        result["commit"] == row["commit"],
-        f"run commit {result['commit']} differs from the manifest commit "
-        f"{row['commit']}")
+        commit_mismatch is None,
+        f"run commit {result['commit']!r} differs from the manifest commit "
+        f"{row['commit']!r}: {commit_mismatch}")
     _validate_execution_source(result, row, execution_source_root)
     launched = _parse_manifest_argv(row["argv"])
 
@@ -2354,19 +2355,22 @@ def _validate_manifest_row(result, row, run_id, execution_source_root):
         _require_json_equal(
             contract.get(field), arguments[field],
             f"method contract {field} vs argument record")
-    _require(row["coordinate"] == launched["lora_mode"],
-             f"manifest row '{run_id}' coordinate differs from --lora_mode")
+    _require_json_equal(
+        row["coordinate"], launched["lora_mode"],
+        f"manifest row '{run_id}' coordinate vs --lora_mode")
     expected_arm = None if row["arm"] == "uniform" else row["arm"]
     recorded_arm = launched["weight_by"] if launched["weighted"] else None
-    _require(recorded_arm == expected_arm,
-             f"manifest row '{run_id}' arm '{row['arm']}' differs from the "
-             f"recorded weighting {recorded_arm!r}")
-    _require(row.get("max_steps") == launched["max_steps_per_round"],
-             f"manifest row '{run_id}' max_steps differs from argv")
+    _require_json_equal(
+        recorded_arm, expected_arm,
+        f"manifest row '{run_id}' arm vs recorded weighting")
+    _require_json_equal(
+        row.get("max_steps"), launched["max_steps_per_round"],
+        f"manifest row '{run_id}' max_steps vs argv")
     expected_regime = ("full" if launched["max_steps_per_round"] == 0
                        else f"capped-{launched['max_steps_per_round']}")
-    _require(row.get("regime") == expected_regime,
-             f"manifest row '{run_id}' regime differs from argv/result")
+    _require_json_equal(
+        row.get("regime"), expected_regime,
+        f"manifest row '{run_id}' regime vs argv/result")
 
     data_root = Path(launched["data_root"]).expanduser()
     provenance = result.get("provenance") or {}

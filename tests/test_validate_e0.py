@@ -2177,6 +2177,17 @@ def test_manifest_comparison_is_type_exact_for_integer_fields(
         validate_run_directory(tmp_path, manifest_row=manifest_row(tmp_path))
 
 
+def test_manifest_row_metadata_comparison_is_type_exact(
+        monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    row = manifest_row(tmp_path)
+    row["max_steps"] = False
+
+    with pytest.raises(E0ValidationError, match="max_steps.*type"):
+        validate_run_directory(tmp_path, manifest_row=row)
+
+
 def test_runtime_provenance_digest_is_recomputed(monkeypatch, tmp_path):
     _, result_path = build_run(
         monkeypatch, tmp_path, "frozen-a", "normmaxmin")

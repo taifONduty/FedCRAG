@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "run_e0.sh"
 
@@ -222,6 +224,12 @@ def test_e0_launcher_is_syntax_clean_and_never_provisions_cloud():
     assert "E0_OUT" in source
 
 
+def test_launcher_control_artifact_guards_include_dangling_symlinks():
+    source = SCRIPT.read_text()
+    assert '[[ -e "$E0_COMPLETE" || -L "$E0_COMPLETE" ]]' in source
+    assert '[[ -e "$E0_MANIFEST" || -L "$E0_MANIFEST" ]]' in source
+
+
 def test_e0_launcher_timing_contract_uses_the_auditable_module():
     source = SCRIPT.read_text()
     assert "export PYTHONUNBUFFERED=1" in source
@@ -237,6 +245,13 @@ def test_e0_launcher_timing_contract_uses_the_auditable_module():
         assert scalar in source
     assert "fedcrag-e0-resources/1" not in source
     assert "PIPESTATUS[@]" in source
+    campaign = source.split("campaign() {", 1)[1].split("main() {", 1)[0]
+    acquire = campaign.index('acquire_row_lock "$run_id"')
+    precheck = campaign.index('require_row_artifacts_absent "$run_id"')
+    execute = campaign.index(
+        'execute_row "$run_id" "$coordinate" "$arm" "$max_steps"')
+    final_release = campaign.rindex("release_row_lock")
+    assert acquire < precheck < execute < final_release
 
 
 def test_failed_row_retry_refuses_every_surviving_artifact_until_removed(
@@ -254,7 +269,9 @@ def test_failed_row_retry_refuses_every_surviving_artifact_until_removed(
         logs / f"{run_id}.boundaries",
     ]
     artifacts[0].mkdir()
-    for artifact in artifacts[1:]:
+    dangling_target = tmp_path / "missing-failed-log"
+    artifacts[1].symlink_to(dangling_target)
+    for artifact in artifacts[2:]:
         artifact.write_text("preserved failed evidence\n")
     command = 'source "$1"; require_row_artifacts_absent "$2"'
     environment = dict(os.environ, E0_OUT=str(output), PYTHON=sys.executable)
@@ -266,7 +283,8 @@ def test_failed_row_retry_refuses_every_surviving_artifact_until_removed(
     assert rejected.returncode != 0
     for artifact in artifacts:
         assert str(artifact) in rejected.stderr
-        assert artifact.exists(), "failed evidence was deleted automatically"
+        assert artifact.exists() or artifact.is_symlink(), \
+            "failed evidence was deleted automatically"
     assert "remove every listed artifact before resume" in rejected.stderr
 
     for artifact in reversed(artifacts):
@@ -277,6 +295,93 @@ def test_failed_row_retry_refuses_every_surviving_artifact_until_removed(
     assert accepted.returncode == 0, accepted.stderr
     assert "\tFAILED\t" in status.read_text()
     assert 'require_row_artifacts_absent "$run_id"' in SCRIPT.read_text()
+
+
+def _row_lock_command():
+    return (
+        'source "$1"; acquire_row_lock "$2"; '
+        'printf "LOCK_READY\\n"; IFS= read -r _; release_row_lock'
+    )
+
+
+def test_concurrent_row_lock_acquisition_has_exactly_one_owner(tmp_path):
+    run_id = "e0-concurrent-row"
+    output = tmp_path / "out"
+    environment = dict(os.environ, E0_OUT=str(output), PYTHON=sys.executable)
+    argv = [
+        "bash", "-c", _row_lock_command(), "row-lock",
+        str(SCRIPT), run_id,
+    ]
+    owner = subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, env=environment, bufsize=1)
+    assert owner.stdout is not None
+    ready, _, _ = select.select([owner.stdout], [], [], 3)
+    assert ready, "first row-lock process never reported ownership"
+    assert owner.stdout.readline() == "LOCK_READY\n"
+
+    refused = subprocess.run(
+        argv, input="release\n", capture_output=True, text=True,
+        env=environment, timeout=5)
+
+    lock_path = output / "locks" / f"{run_id}.lock"
+    assert refused.returncode != 0
+    assert run_id in refused.stderr
+    assert str(lock_path) in refused.stderr
+    assert "explicitly remove" in refused.stderr
+    assert owner.stdin is not None
+    owner.stdin.write("release\n")
+    owner.stdin.flush()
+    stdout, stderr = owner.communicate(timeout=5)
+    assert owner.returncode == 0, (stdout, stderr)
+    assert not lock_path.exists() and not lock_path.is_symlink()
+
+
+@pytest.mark.parametrize("stale_kind", ["directory", "dangling-symlink"])
+def test_stale_or_symlink_row_lock_is_refused_without_overwrite(
+        tmp_path, stale_kind):
+    run_id = "e0-stale-row"
+    output = tmp_path / "out"
+    lock_root = output / "locks"
+    lock_root.mkdir(parents=True)
+    lock_path = lock_root / f"{run_id}.lock"
+    if stale_kind == "directory":
+        lock_path.mkdir()
+        (lock_path / "owner").write_text("stale-owner\n")
+    else:
+        lock_path.symlink_to(tmp_path / "missing-lock-target")
+    environment = dict(os.environ, E0_OUT=str(output), PYTHON=sys.executable)
+
+    completed = subprocess.run([
+        "bash", "-c", 'source "$1"; acquire_row_lock "$2"',
+        "row-lock", str(SCRIPT), run_id,
+    ], capture_output=True, text=True, env=environment, timeout=5)
+
+    assert completed.returncode != 0
+    assert run_id in completed.stderr
+    assert str(lock_path) in completed.stderr
+    assert "explicitly remove" in completed.stderr
+    assert lock_path.exists() or lock_path.is_symlink()
+
+
+def test_row_lock_exit_trap_releases_only_the_owned_lock(tmp_path):
+    run_id = "e0-trap-row"
+    output = tmp_path / "out"
+    lock_path = output / "locks" / f"{run_id}.lock"
+    logs = output / "logs"
+    logs.mkdir(parents=True)
+    scientific_artifact = logs / f"{run_id}.log"
+    scientific_artifact.write_text("preserve me\n")
+    environment = dict(os.environ, E0_OUT=str(output), PYTHON=sys.executable)
+
+    completed = subprocess.run([
+        "bash", "-c", 'source "$1"; acquire_row_lock "$2"; exit 7',
+        "row-lock", str(SCRIPT), run_id,
+    ], capture_output=True, text=True, env=environment, timeout=5)
+
+    assert completed.returncode == 7
+    assert not lock_path.exists() and not lock_path.is_symlink()
+    assert scientific_artifact.read_text() == "preserve me\n"
 
 
 def test_e0_launcher_timing_selftest_exercises_every_pipeline_stage():

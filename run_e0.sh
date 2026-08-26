@@ -30,6 +30,8 @@ E0_MANIFEST="$E0_OUT/manifest.json"
 E0_STATUS="$E0_OUT/status.tsv"
 E0_COMPLETE="$E0_OUT/COMPLETE.json"
 GPU_SAMPLE_SECONDS=5
+E0_ACTIVE_ROW_LOCK=""
+E0_ACTIVE_ROW_OWNER=""
 
 SEED=42
 MODEL=contriever
@@ -287,7 +289,7 @@ require_row_artifacts_absent() {
       "$E0_OUT/logs/$run_id.log" \
       "$E0_OUT/logs/$run_id.gpu" \
       "$E0_OUT/logs/$run_id.boundaries"; do
-    if [[ -e "$artifact" ]]; then
+    if [[ -e "$artifact" || -L "$artifact" ]]; then
       blockers+=("$artifact")
     fi
   done
@@ -300,6 +302,84 @@ require_row_artifacts_absent() {
     printf '  %s\n' "$artifact" >&2
   done
   return 2
+}
+
+release_row_lock() {
+  local lock_path=${E0_ACTIVE_ROW_LOCK:-}
+  local owner_token=${E0_ACTIVE_ROW_OWNER:-}
+  local owner_path recorded_owner unexpected
+  if [[ -z "$lock_path" ]]; then
+    return 0
+  fi
+  owner_path="$lock_path/owner"
+  if [[ -L "$lock_path" || ! -d "$lock_path" || \
+        -L "$owner_path" || ! -f "$owner_path" ]]; then
+    printf 'refusing to release row lock with changed identity: %s\n' \
+      "$lock_path" >&2
+    return 1
+  fi
+  IFS= read -r recorded_owner < "$owner_path" || recorded_owner=""
+  if [[ "$recorded_owner" != "$owner_token" ]]; then
+    printf 'refusing to release row lock owned by %s instead of %s: %s\n' \
+      "$recorded_owner" "$owner_token" "$lock_path" >&2
+    return 1
+  fi
+  unexpected=$(find "$lock_path" -mindepth 1 -maxdepth 1 \
+    ! -name owner -print -quit)
+  if [[ -n "$unexpected" ]]; then
+    printf 'refusing to release row lock containing unexpected path %s: %s\n' \
+      "$unexpected" "$lock_path" >&2
+    return 1
+  fi
+  rm "$owner_path"
+  rmdir "$lock_path"
+  E0_ACTIVE_ROW_LOCK=""
+  E0_ACTIVE_ROW_OWNER=""
+  trap - EXIT
+}
+
+release_row_lock_on_exit() {
+  local status=$?
+  trap - EXIT
+  release_row_lock || true
+  return "$status"
+}
+
+acquire_row_lock() {
+  local run_id=$1
+  local lock_root="$E0_OUT/locks"
+  local lock_path="$lock_root/$run_id.lock"
+  local owner_token="$run_id:$$"
+  if [[ -n "${E0_ACTIVE_ROW_LOCK:-}" ]]; then
+    printf 'refusing row %s: this launcher already owns row lock %s\n' \
+      "$run_id" "$E0_ACTIVE_ROW_LOCK" >&2
+    return 2
+  fi
+  if [[ -L "$lock_root" ]]; then
+    printf 'refusing row %s: lock root is a symlink: %s\n' \
+      "$run_id" "$lock_root" >&2
+    return 2
+  fi
+  if ! mkdir -p "$lock_root"; then
+    printf 'refusing row %s: cannot create lock root %s\n' \
+      "$run_id" "$lock_root" >&2
+    return 2
+  fi
+  if ! mkdir "$lock_path" 2>/dev/null; then
+    printf 'refusing row %s: row lock exists at %s; another launcher may own '\
+'it or it is stale; explicitly remove that lock only after confirming no '\
+'owner is running\n' "$run_id" "$lock_path" >&2
+    return 2
+  fi
+  if ! (umask 077; printf '%s\n' "$owner_token" > "$lock_path/owner"); then
+    rmdir "$lock_path" 2>/dev/null || true
+    printf 'refusing row %s: cannot record ownership in %s\n' \
+      "$run_id" "$lock_path" >&2
+    return 2
+  fi
+  E0_ACTIVE_ROW_LOCK="$lock_path"
+  E0_ACTIVE_ROW_OWNER="$owner_token"
+  trap 'release_row_lock_on_exit' EXIT
 }
 
 validate_row() {
@@ -567,7 +647,7 @@ campaign() {
   local resuming=$1
   verify_all
   mkdir -p "$E0_OUT/logs"
-  if [[ -e "$E0_COMPLETE" ]]; then
+  if [[ -e "$E0_COMPLETE" || -L "$E0_COMPLETE" ]]; then
     printf 'E0 is already marked complete: %s\n' "$E0_COMPLETE" >&2
     exit 2
   fi
@@ -578,7 +658,7 @@ campaign() {
     fi
     require_manifest_unchanged
   else
-    if [[ -e "$E0_MANIFEST" ]]; then
+    if [[ -e "$E0_MANIFEST" || -L "$E0_MANIFEST" ]]; then
       printf 'E0 already started under %s; use "resume"\n' "$E0_MANIFEST" >&2
       exit 2
     fi
@@ -591,15 +671,18 @@ campaign() {
   for row in "${E0_ROWS[@]}"; do
     IFS="|" read -r run_id coordinate arm regime max_steps row_scale <<< "$row"
     run_out="$E0_OUT/$run_id"
+    acquire_row_lock "$run_id"
     if row_is_validated "$run_id"; then
       # Re-check rather than trusting the marker: a resumed campaign must
       # still be able to state that every row satisfies the contract now.
       validate_row "$run_id" >/dev/null
       printf 'SKIP %s (already validated)\n' "$run_id"
+      release_row_lock
       continue
     fi
     require_row_artifacts_absent "$run_id"
     execute_row "$run_id" "$coordinate" "$arm" "$max_steps"
+    release_row_lock
   done
   write_completion_marker
   printf 'E0 COMPLETE: all %d rows executed and contract-validated (%s).\n' \

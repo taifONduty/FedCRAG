@@ -1,11 +1,13 @@
 """Auditable, monotonic resource telemetry for the E0 launcher."""
 import copy
+import concurrent.futures
 import inspect
 import json
 import os
 import select
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -383,11 +385,19 @@ def test_boundary_writer_flushes_and_fsyncs_each_run_bound_event(
     wall_values = iter([10, 20])
     mono_values = iter([100, 200])
     fsynced = []
+    linked = []
     replaced = []
     monkeypatch.setattr(resources.time, "time_ns", lambda: next(wall_values))
     monkeypatch.setattr(
         resources.time, "monotonic_ns", lambda: next(mono_values))
     monkeypatch.setattr(resources.os, "fsync", lambda fd: fsynced.append(fd))
+    original_link = resources.os.link
+    monkeypatch.setattr(
+        resources.os, "link",
+        lambda source, destination: (
+            linked.append((Path(source), Path(destination))),
+            original_link(source, destination),
+        )[1])
     original_replace = resources.os.replace
     monkeypatch.setattr(
         resources.os, "replace",
@@ -398,11 +408,14 @@ def test_boundary_writer_flushes_and_fsyncs_each_run_bound_event(
 
     assert resources.record_boundary_evidence(path, RUN_ID, "start") == \
         (10, 100)
+    started_inode = path.stat().st_ino
     assert resources.record_boundary_evidence(path, RUN_ID, "finish") == \
         (20, 200)
 
-    assert len(fsynced) == 2
-    assert len(replaced) == 2
+    assert len(fsynced) == 3
+    assert len(linked) == 1
+    assert replaced == []
+    assert path.stat().st_ino == started_inode
     assert not list(tmp_path.glob(f".{path.name}.*.tmp"))
     assert resources.parse_boundary_evidence(path, RUN_ID) == {
         "started_wall_ns": 10,
@@ -468,6 +481,128 @@ def test_clock_cli_atomically_persists_run_bound_pairs_next_to_log(tmp_path):
         "finished_wall_ns": pairs[1][0],
         "finished_mono_ns": pairs[1][1],
     }
+
+
+def _race_boundary_calls(monkeypatch, path, event):
+    """Force the old unconditional-replace path to publish concurrently."""
+    start_barrier = threading.Barrier(2)
+    replace_barrier = threading.Barrier(2)
+    original_replace = resources.os.replace
+
+    def synchronized_replace(source, destination):
+        if Path(destination) == path:
+            replace_barrier.wait(timeout=5)
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(resources.os, "replace", synchronized_replace)
+
+    def attempt():
+        try:
+            start_barrier.wait(timeout=5)
+            return "success", resources.record_boundary_evidence(
+                path, RUN_ID, event)
+        except (OSError, resources.ResourceValidationError) as error:
+            return "error", error
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(attempt) for _ in range(2)]
+        return [future.result(timeout=10) for future in futures]
+
+
+def test_concurrent_boundary_starts_publish_exactly_one_returned_pair(
+        monkeypatch, tmp_path):
+    path = tmp_path / f"{RUN_ID}.boundaries"
+
+    outcomes = _race_boundary_calls(monkeypatch, path, "start")
+
+    successes = [value for status, value in outcomes if status == "success"]
+    assert len(successes) == 1
+    rows = resources._read_boundary_rows(path)
+    assert len(rows) == 1
+    assert rows[0][2:] == successes[0]
+    assert path.read_text() == (
+        f"E0_BOUNDARY\tstart\t{RUN_ID}\t{successes[0][0]}\t"
+        f"{successes[0][1]}\n")
+
+
+def test_concurrent_boundary_finishes_publish_exactly_one_returned_pair(
+        monkeypatch, tmp_path):
+    path = _write_boundaries(
+        tmp_path / f"{RUN_ID}.boundaries",
+        events=[("start", 10, 100)])
+
+    outcomes = _race_boundary_calls(monkeypatch, path, "finish")
+
+    successes = [value for status, value in outcomes if status == "success"]
+    assert len(successes) == 1
+    persisted = resources.parse_boundary_evidence(path, RUN_ID)
+    assert (persisted["finished_wall_ns"], persisted["finished_mono_ns"]) \
+        == successes[0]
+    assert path.read_text() == (
+        f"E0_BOUNDARY\tstart\t{RUN_ID}\t10\t100\n"
+        f"E0_BOUNDARY\tfinish\t{RUN_ID}\t{successes[0][0]}\t"
+        f"{successes[0][1]}\n")
+
+
+def test_boundary_start_never_replaces_a_dangling_symlink(tmp_path):
+    path = tmp_path / f"{RUN_ID}.boundaries"
+    missing_target = tmp_path / "missing-boundary-target"
+    path.symlink_to(missing_target)
+
+    completed = subprocess.run([
+        sys.executable, str(resources.__file__), "clock",
+        "--run-id", RUN_ID, "--log", str(tmp_path / f"{RUN_ID}.log"),
+        "--event", "start",
+    ], capture_output=True, text=True)
+
+    assert completed.returncode != 0
+    assert completed.stdout == ""
+    assert "already exists" in completed.stderr
+    assert path.is_symlink()
+    assert os.readlink(path) == str(missing_target)
+    assert not missing_target.exists()
+
+
+def test_boundary_reader_never_follows_a_symlink_swapped_after_metadata_check(
+        monkeypatch, tmp_path):
+    path = _write_boundaries(
+        tmp_path / f"{RUN_ID}.boundaries",
+        events=[("start", 10, 100), ("finish", 20, 200)])
+    replacement = _write_boundaries(
+        tmp_path / "replacement.boundaries",
+        events=[("start", 30, 300), ("finish", 40, 400)])
+    original_lstat = resources.os.lstat
+    original_open = resources.os.open
+    swapped = False
+
+    def swap_to_symlink():
+        nonlocal swapped
+        if swapped:
+            return
+        path.unlink()
+        path.symlink_to(replacement)
+        swapped = True
+
+    def swapping_lstat(candidate):
+        metadata = original_lstat(candidate)
+        if Path(candidate) == path:
+            swap_to_symlink()
+        return metadata
+
+    def swapping_open(candidate, flags, *args):
+        if Path(candidate) == path:
+            swap_to_symlink()
+        return original_open(candidate, flags, *args)
+
+    monkeypatch.setattr(resources.os, "lstat", swapping_lstat)
+    monkeypatch.setattr(resources.os, "open", swapping_open)
+
+    with pytest.raises(resources.ResourceValidationError,
+                       match="regular file|safely open"):
+        resources._read_boundary_rows(path)
+    assert path.is_symlink()
+    assert replacement.read_text().endswith(
+        f"E0_BOUNDARY\tfinish\t{RUN_ID}\t40\t400\n")
 
 
 @pytest.mark.parametrize(

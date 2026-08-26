@@ -8,12 +8,15 @@ timestamps can never support a per-round timing claim.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import math
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
@@ -92,10 +95,36 @@ def _utc_from_wall_ns(wall_ns):
         f".{nanoseconds:09d}Z"
 
 
+@contextlib.contextmanager
+def _open_regular_text(path, label):
+    """Open one stable regular-file descriptor without following symlinks."""
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    _require(no_follow is not None,
+             f"this platform cannot safely open {label}")
+    flags = os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+    descriptor = None
+    try:
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise ResourceValidationError(
+                f"cannot safely open {label} {path}: {exc}") from exc
+        _require(stat.S_ISREG(os.fstat(descriptor).st_mode),
+                 f"{label} must be a regular file, not a symlink or special "
+                 "file")
+        with os.fdopen(
+                descriptor, "r", encoding="utf-8", errors="strict") as handle:
+            descriptor = None
+            yield handle
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _read_boundary_rows(boundaries_path):
     rows = []
-    with Path(boundaries_path).open(
-            "r", encoding="utf-8", errors="strict") as handle:
+    path = Path(boundaries_path)
+    with _open_regular_text(path, "boundary evidence") as handle:
         for line_number, line in enumerate(handle, 1):
             fields = line.rstrip("\n").split("\t")
             _require(
@@ -148,7 +177,39 @@ def boundary_path_for_log(log_path, run_id):
     return Path(log_path).parent / f"{run_id}.boundaries"
 
 
-def _atomic_replace_text(path, content):
+def _fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@contextlib.contextmanager
+def _locked_boundary(path):
+    """Serialize one sidecar inode without ever unlinking its stable lock."""
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    _require(no_follow is not None,
+             "this platform cannot safely lock boundary evidence")
+    lock_path = path.with_name(f"{path.name}.lock")
+    try:
+        descriptor = os.open(
+            lock_path, os.O_RDWR | os.O_CREAT | no_follow, 0o600)
+    except OSError as exc:
+        raise ResourceValidationError(
+            f"cannot safely open boundary lock {lock_path}: {exc}") from exc
+    try:
+        _require(stat.S_ISREG(os.fstat(descriptor).st_mode),
+                 f"boundary lock must be a regular file: {lock_path}")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _publish_boundary_start(path, content):
+    """Fsync then atomically publish a new path without replacement."""
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -159,8 +220,12 @@ def _atomic_replace_text(path, content):
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        temporary = None
+        try:
+            os.link(temporary, path)
+        except FileExistsError as exc:
+            raise ResourceValidationError(
+                f"boundary evidence already exists: {path}") from exc
+        _fsync_directory(path.parent)
     finally:
         if temporary is not None:
             try:
@@ -169,28 +234,46 @@ def _atomic_replace_text(path, content):
                 pass
 
 
+def _append_boundary_finish(path, content):
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    _require(no_follow is not None,
+             "this platform cannot safely append boundary evidence")
+    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | no_follow)
+    try:
+        _require(stat.S_ISREG(os.fstat(descriptor).st_mode),
+                 "boundary evidence must be a regular file")
+        encoded = content.encode("utf-8")
+        written = 0
+        while written < len(encoded):
+            count = os.write(descriptor, encoded[written:])
+            _require(count > 0, "boundary finish write made no progress")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def record_boundary_evidence(boundaries_path, run_id, event):
     """Atomically persist and fsync one raw launcher boundary event."""
     validate_run_id(run_id)
     _require(event in ("start", "finish"),
              "boundary event must be 'start' or 'finish'")
     path = Path(boundaries_path)
-    if event == "start":
-        _require(not path.exists(),
-                 f"boundary evidence already exists: {path}")
-        previous = ""
-    else:
-        rows = _read_boundary_rows(path)
-        _require(len(rows) == 1 and rows[0][0] == "start"
-                 and rows[0][1] == run_id,
-                 "finish boundary requires exactly one matching start event")
-        previous = (
-            f"E0_BOUNDARY\tstart\t{run_id}\t{rows[0][2]}\t{rows[0][3]}\n")
-    wall_ns = time.time_ns()
-    mono_ns = time.monotonic_ns()
-    _atomic_replace_text(
-        path, previous
-        + f"E0_BOUNDARY\t{event}\t{run_id}\t{wall_ns}\t{mono_ns}\n")
+    with _locked_boundary(path):
+        if event == "finish":
+            rows = _read_boundary_rows(path)
+            _require(len(rows) == 1 and rows[0][0] == "start"
+                     and rows[0][1] == run_id,
+                     "finish boundary requires exactly one matching start "
+                     "event")
+        wall_ns = time.time_ns()
+        mono_ns = time.monotonic_ns()
+        content = (
+            f"E0_BOUNDARY\t{event}\t{run_id}\t{wall_ns}\t{mono_ns}\n")
+        if event == "start":
+            _publish_boundary_start(path, content)
+        else:
+            _append_boundary_finish(path, content)
     return wall_ns, mono_ns
 
 

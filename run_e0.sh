@@ -220,16 +220,10 @@ PY
 }
 
 write_resource_record() {
-  local run_id=$1 run_out=$2 log=$3 samples=$4
-  local started_wall_ns=$5 finished_wall_ns=$6
-  local started_mono_ns=$7 finished_mono_ns=$8
+  local run_id=$1 run_out=$2 log=$3 samples=$4 boundaries=$5
   "$PYTHON" e0_resources.py write \
     --run-id "$run_id" --run-dir "$run_out" --log "$log" \
-    --samples "$samples" \
-    --started-wall-ns "$started_wall_ns" \
-    --finished-wall-ns "$finished_wall_ns" \
-    --started-mono-ns "$started_mono_ns" \
-    --finished-mono-ns "$finished_mono_ns" --num-rounds "$ROUNDS"
+    --samples "$samples" --boundaries "$boundaries" --num-rounds "$ROUNDS"
 }
 
 timestamp_filter() {
@@ -289,6 +283,7 @@ execute_row() {
   local run_out="$E0_OUT/$run_id"
   local log="$E0_OUT/logs/$run_id.log"
   local samples="$E0_OUT/logs/$run_id.gpu"
+  local boundaries="$E0_OUT/logs/$run_id.boundaries"
   local started_wall_ns finished_wall_ns started_mono_ns finished_mono_ns
   local elapsed_seconds sampler_pid="" status=0
 
@@ -296,7 +291,8 @@ execute_row() {
   build_command "$run_id" "$coordinate" "$arm" "$max_steps" "$row_scale"
   printf 'START %s\n' "$run_id"
   read -r started_wall_ns started_mono_ns \
-    < <("$PYTHON" e0_resources.py clock)
+    < <("$PYTHON" e0_resources.py boundary --run-id "$run_id" \
+      --path "$boundaries" --event start)
   : > "$samples"
   if command -v nvidia-smi >/dev/null 2>&1; then
     (
@@ -320,7 +316,8 @@ execute_row() {
     wait "$sampler_pid" 2>/dev/null || true
   fi
   read -r finished_wall_ns finished_mono_ns \
-    < <("$PYTHON" e0_resources.py clock)
+    < <("$PYTHON" e0_resources.py boundary --run-id "$run_id" \
+      --path "$boundaries" --event finish)
   elapsed_seconds=$((
     (finished_mono_ns - started_mono_ns) / 1000000000
   ))
@@ -331,9 +328,8 @@ execute_row() {
     exit "$status"
   fi
 
-  if ! write_resource_record "$run_id" "$run_out" "$log" "$samples" \
-      "$started_wall_ns" "$finished_wall_ns" \
-      "$started_mono_ns" "$finished_mono_ns"; then
+  if ! write_resource_record \
+      "$run_id" "$run_out" "$log" "$samples" "$boundaries"; then
     append_status "$run_id" "UNAUDITABLE" "$elapsed_seconds"
     printf 'UNAUDITABLE %s: no resource record was written\n' "$run_id" >&2
     exit 1
@@ -351,7 +347,9 @@ execute_row() {
 timing_selftest_producer() {
   local run_id=$FEDCRAG_E0_RUN_ID
   printf 'E0_ROUND_START %s 1/2\n' "$run_id"
-  sleep 0.03
+  # Long enough for the hermetic Popen test to distinguish live streaming
+  # from a filter/tee that emits only after the producer exits.
+  sleep 1
   printf 'E0_ROUND_END %s 1/2\n' "$run_id"
   sleep 0.03
   printf 'E0_ROUND_START %s 2/2\n' "$run_id"
@@ -363,7 +361,7 @@ timing_selftest_producer() {
 }
 
 timing_selftest() {
-  local scratch run_id run_out log samples
+  local scratch run_id run_out log samples boundaries
   local started_wall_ns finished_wall_ns started_mono_ns finished_mono_ns
   local status stage expected_index index
   scratch=$(mktemp -d "${TMPDIR:-/tmp}/fedcrag-e0-timing.XXXXXX")
@@ -371,18 +369,21 @@ timing_selftest() {
   run_out="$scratch/$run_id"
   log="$scratch/$run_id.log"
   samples="$scratch/$run_id.gpu"
+  boundaries="$scratch/$run_id.boundaries"
   mkdir -p "$run_out"
   : > "$samples"
   export FEDCRAG_E0_RUN_ID="$run_id"
 
   read -r started_wall_ns started_mono_ns \
-    < <("$PYTHON" e0_resources.py clock)
+    < <("$PYTHON" e0_resources.py boundary --run-id "$run_id" \
+      --path "$boundaries" --event start)
   set +e
   run_timestamped_pipeline "$log" timing_selftest_producer
   status=$?
   set -e
   read -r finished_wall_ns finished_mono_ns \
-    < <("$PYTHON" e0_resources.py clock)
+    < <("$PYTHON" e0_resources.py boundary --run-id "$run_id" \
+      --path "$boundaries" --event finish)
   if [[ $status -ne 0 ]]; then
     printf 'timing self-test success pipeline failed\n' >&2
     rm -rf "$scratch"
@@ -390,10 +391,8 @@ timing_selftest() {
   fi
   if ! "$PYTHON" e0_resources.py write \
       --run-id "$run_id" --run-dir "$run_out" --log "$log" \
-      --samples "$samples" --started-wall-ns "$started_wall_ns" \
-      --finished-wall-ns "$finished_wall_ns" \
-      --started-mono-ns "$started_mono_ns" \
-      --finished-mono-ns "$finished_mono_ns" --num-rounds 2 >/dev/null; then
+      --samples "$samples" --boundaries "$boundaries" \
+      --num-rounds 2 >/dev/null; then
     rm -rf "$scratch"
     return 1
   fi

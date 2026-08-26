@@ -68,9 +68,88 @@ def _sha256(path):
 
 def _utc_from_wall_ns(wall_ns):
     seconds, nanoseconds = divmod(wall_ns, 1_000_000_000)
-    moment = dt.datetime.fromtimestamp(seconds, tz=dt.timezone.utc)
+    try:
+        moment = dt.datetime.fromtimestamp(seconds, tz=dt.timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ResourceValidationError(
+            f"wall nanoseconds are outside the supported UTC range: "
+            f"{wall_ns}") from exc
     return moment.strftime("%Y-%m-%dT%H:%M:%S") + \
         f".{nanoseconds:09d}Z"
+
+
+def _read_boundary_rows(boundaries_path):
+    rows = []
+    with Path(boundaries_path).open(
+            "r", encoding="utf-8", errors="strict") as handle:
+        for line_number, line in enumerate(handle, 1):
+            fields = line.rstrip("\n").split("\t")
+            _require(
+                len(fields) == 5 and fields[0] == "E0_BOUNDARY",
+                f"boundary evidence line {line_number} is malformed")
+            _, event, run_id, wall_text, mono_text = fields
+            _require(event in ("start", "finish"),
+                     f"boundary evidence line {line_number} has invalid "
+                     f"event {event!r}")
+            _require(_RUN_ID.fullmatch(run_id) is not None
+                     and len(run_id) <= 128,
+                     f"boundary evidence line {line_number} has malformed "
+                     "run identity")
+            _require(wall_text.isdigit() and mono_text.isdigit(),
+                     f"boundary evidence line {line_number} has a "
+                     "non-integer clock")
+            rows.append((event, run_id, int(wall_text), int(mono_text)))
+    return rows
+
+
+def parse_boundary_evidence(boundaries_path, expected_run_id):
+    """Read the exact raw start/finish clock pairs for one launcher row."""
+    validate_run_id(expected_run_id)
+    rows = _read_boundary_rows(boundaries_path)
+    _require(len(rows) == 2,
+             f"expected two boundary evidence events, found {len(rows)}")
+    for index, expected_event in enumerate(("start", "finish")):
+        event, run_id, _, _ = rows[index]
+        _require(event == expected_event,
+                 f"expected boundary event {expected_event!r} at position "
+                 f"{index + 1}, found {event!r}")
+        _require(run_id == expected_run_id,
+                 f"boundary run id {run_id!r} does not match "
+                 f"{expected_run_id!r}")
+    _require(rows[1][3] > rows[0][3],
+             "finish monotonic boundary must be greater than start")
+    return {
+        "started_wall_ns": rows[0][2],
+        "started_mono_ns": rows[0][3],
+        "finished_wall_ns": rows[1][2],
+        "finished_mono_ns": rows[1][3],
+    }
+
+
+def record_boundary_evidence(boundaries_path, run_id, event):
+    """Persist and fsync one raw launcher boundary event."""
+    validate_run_id(run_id)
+    _require(event in ("start", "finish"),
+             "boundary event must be 'start' or 'finish'")
+    path = Path(boundaries_path)
+    if event == "start":
+        _require(not path.exists(),
+                 f"boundary evidence already exists: {path}")
+        mode = "x"
+    else:
+        rows = _read_boundary_rows(path)
+        _require(len(rows) == 1 and rows[0][0] == "start"
+                 and rows[0][1] == run_id,
+                 "finish boundary requires exactly one matching start event")
+        mode = "a"
+    wall_ns = time.time_ns()
+    mono_ns = time.monotonic_ns()
+    with path.open(mode, encoding="utf-8") as handle:
+        handle.write(
+            f"E0_BOUNDARY\t{event}\t{run_id}\t{wall_ns}\t{mono_ns}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return wall_ns, mono_ns
 
 
 def parse_timestamped_rounds(log_path, expected_run_id, num_rounds,
@@ -208,33 +287,29 @@ def _determinism_metadata():
 
 
 def build_resource_record(run_id, log_path, samples_path, *,
-                          started_wall_ns, finished_wall_ns,
-                          started_mono_ns, finished_mono_ns, num_rounds):
+                          boundaries_path, num_rounds):
     """Construct schema v2 exclusively from launcher boundaries/raw evidence."""
     validate_run_id(run_id)
-    for name, value in (("started_wall_ns", started_wall_ns),
-                        ("finished_wall_ns", finished_wall_ns)):
-        _require(_is_int(value) and value >= 0,
-                 f"{name} must be a nonnegative integer")
+    boundaries = parse_boundary_evidence(boundaries_path, run_id)
     timing = parse_timestamped_rounds(
-        log_path, run_id, num_rounds, started_mono_ns, finished_mono_ns)
+        log_path, run_id, num_rounds, boundaries["started_mono_ns"],
+        boundaries["finished_mono_ns"])
     gpu = _gpu_summary(samples_path)
-    elapsed_ns = finished_mono_ns - started_mono_ns
+    elapsed_ns = (boundaries["finished_mono_ns"]
+                  - boundaries["started_mono_ns"])
     return {
         "schema": RESOURCE_SCHEMA_V2,
         "run_id": run_id,
-        "started_wall_ns": started_wall_ns,
-        "finished_wall_ns": finished_wall_ns,
-        "started_utc": _utc_from_wall_ns(started_wall_ns),
-        "finished_utc": _utc_from_wall_ns(finished_wall_ns),
-        "started_mono_ns": started_mono_ns,
-        "finished_mono_ns": finished_mono_ns,
+        **boundaries,
+        "started_utc": _utc_from_wall_ns(boundaries["started_wall_ns"]),
+        "finished_utc": _utc_from_wall_ns(boundaries["finished_wall_ns"]),
         "elapsed_seconds": elapsed_ns / 1_000_000_000,
         **timing,
         "round_elapsed_seconds": [
             value / 1_000_000_000 for value in timing["round_ns"]],
         "log_sha256": _sha256(log_path),
         "samples_sha256": _sha256(samples_path),
+        "boundaries_sha256": _sha256(boundaries_path),
         **gpu,
         **_determinism_metadata(),
     }
@@ -303,7 +378,7 @@ def _legacy_utc(value, field):
 
 
 def validate_resource_record(record, expected_run_id, num_rounds,
-                             log_path, samples_path):
+                             log_path, samples_path, boundaries_path=None):
     """Validate a legacy total or fully replay schema-v2 raw evidence."""
     _require(_is_int(num_rounds) and num_rounds > 0,
              "num_rounds must be a positive integer")
@@ -332,6 +407,13 @@ def validate_resource_record(record, expected_run_id, num_rounds,
         }
 
     validate_run_id(expected_run_id)
+    _require(boundaries_path is not None,
+             "schema v2 requires raw boundary evidence")
+    raw_boundaries = parse_boundary_evidence(
+        boundaries_path, expected_run_id)
+    for field, value in raw_boundaries.items():
+        _require(record.get(field) == value,
+                 f"schema v2 {field} does not match raw boundary evidence")
     integer_fields = (
         "started_wall_ns", "finished_wall_ns",
         "started_mono_ns", "finished_mono_ns", "pre_ns", "post_ns",
@@ -352,7 +434,8 @@ def validate_resource_record(record, expected_run_id, num_rounds,
 
     replay = parse_timestamped_rounds(
         log_path, expected_run_id, num_rounds,
-        record["started_mono_ns"], record["finished_mono_ns"])
+        raw_boundaries["started_mono_ns"],
+        raw_boundaries["finished_mono_ns"])
     for field in ("pre_ns", "round_ns", "between_round_ns", "post_ns"):
         _require(record.get(field) == replay[field],
                  f"schema v2 {field} does not match raw log replay")
@@ -381,7 +464,8 @@ def validate_resource_record(record, expected_run_id, num_rounds,
              "schema v2 round seconds do not match monotonic nanoseconds")
 
     for field, path in (("log_sha256", log_path),
-                        ("samples_sha256", samples_path)):
+                        ("samples_sha256", samples_path),
+                        ("boundaries_sha256", boundaries_path)):
         value = record.get(field)
         _require(isinstance(value, str) and _SHA256.fullmatch(value),
                  f"schema v2 has invalid {field}")
@@ -422,7 +506,8 @@ def write_resource_record(run_id, run_dir, log_path, samples_path, **kwargs):
         with temporary.open("r", encoding="utf-8") as handle:
             serialized = json.load(handle)
         validate_resource_record(
-            serialized, run_id, kwargs["num_rounds"], log_path, samples_path)
+            serialized, run_id, kwargs["num_rounds"], log_path, samples_path,
+            kwargs["boundaries_path"])
         os.replace(temporary, destination)
         temporary = None
     finally:
@@ -449,37 +534,41 @@ def _parser():
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("timestamp")
     subparsers.add_parser("clock")
+    boundary = subparsers.add_parser("boundary")
+    boundary.add_argument("--run-id", required=True)
+    boundary.add_argument("--path", required=True)
+    boundary.add_argument("--event", choices=("start", "finish"),
+                          required=True)
     write = subparsers.add_parser("write")
     write.add_argument("--run-id", required=True)
     write.add_argument("--run-dir", required=True)
     write.add_argument("--log", required=True)
     write.add_argument("--samples", required=True)
-    write.add_argument("--started-wall-ns", required=True, type=int)
-    write.add_argument("--finished-wall-ns", required=True, type=int)
-    write.add_argument("--started-mono-ns", required=True, type=int)
-    write.add_argument("--finished-mono-ns", required=True, type=int)
+    write.add_argument("--boundaries", required=True)
     write.add_argument("--num-rounds", required=True, type=int)
     return parser
 
 
 def main():
     args = _parser().parse_args()
-    if args.command == "timestamp":
-        _timestamp_filter()
-        return
-    if args.command == "clock":
-        _clock()
-        return
     try:
+        if args.command == "timestamp":
+            _timestamp_filter()
+            return
+        if args.command == "clock":
+            _clock()
+            return
+        if args.command == "boundary":
+            wall_ns, mono_ns = record_boundary_evidence(
+                args.path, args.run_id, args.event)
+            print(f"{wall_ns}\t{mono_ns}", flush=True)
+            return
         record = write_resource_record(
             args.run_id, args.run_dir, args.log, args.samples,
-            started_wall_ns=args.started_wall_ns,
-            finished_wall_ns=args.finished_wall_ns,
-            started_mono_ns=args.started_mono_ns,
-            finished_mono_ns=args.finished_mono_ns,
+            boundaries_path=args.boundaries,
             num_rounds=args.num_rounds)
     except (ResourceValidationError, OSError, UnicodeError,
-            json.JSONDecodeError) as exc:
+            json.JSONDecodeError, OverflowError, ValueError) as exc:
         print(f"e0_resources: {exc}", file=sys.stderr)
         raise SystemExit(1)
     print(

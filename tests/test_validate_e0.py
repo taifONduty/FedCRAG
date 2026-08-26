@@ -1642,6 +1642,16 @@ def write_resource_record(tmp_path, num_rounds=1):
         json.dump(record, handle)
 
 
+def write_boundary_sidecar(path, run_id, started_wall_ns, started_mono_ns,
+                           finished_wall_ns, finished_mono_ns):
+    path.write_text(
+        f"E0_BOUNDARY\tstart\t{run_id}\t{started_wall_ns}\t"
+        f"{started_mono_ns}\n"
+        f"E0_BOUNDARY\tfinish\t{run_id}\t{finished_wall_ns}\t"
+        f"{finished_mono_ns}\n")
+    return path
+
+
 def test_a_matching_manifest_row_validates(monkeypatch, tmp_path):
     build_run(monkeypatch, tmp_path, "frozen-a", "normmaxmin")
     write_resource_record(tmp_path)
@@ -2157,6 +2167,10 @@ def test_resource_schema_v2_is_replayed_from_raw_evidence(
         "800\t900\tE0_ROUND_END e0-test-row 2/2\n")
     samples = log_dir / "e0-test-row.gpu"
     samples.write_text("100\n250\n")
+    boundaries = write_boundary_sidecar(
+        log_dir / "e0-test-row.boundaries", "e0-test-row",
+        1_700_000_000_000_000_000, 100,
+        1_600_000_000_000_000_000, 1000)
     record = {
         "schema": "fedcrag-e0-resources/2",
         "run_id": "e0-test-row",
@@ -2174,6 +2188,8 @@ def test_resource_schema_v2_is_replayed_from_raw_evidence(
         "round_elapsed_seconds": [1.5e-7, 4e-7],
         "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
         "samples_sha256": hashlib.sha256(samples.read_bytes()).hexdigest(),
+        "boundaries_sha256": hashlib.sha256(
+            boundaries.read_bytes()).hexdigest(),
         "gpu_available": True,
         "peak_gpu_memory_mib": 250,
         "gpu_memory_samples": 2,
@@ -2200,11 +2216,81 @@ def test_resource_schema_v2_is_replayed_from_raw_evidence(
 @pytest.mark.parametrize(("target", "mutation"), [
     ("json", "timing"),
     ("json", "gpu"),
+    ("json", "boundaries"),
     ("log", "raw"),
     ("samples", "raw"),
+    ("boundaries", "raw"),
 ])
 def test_resource_schema_v2_refuses_mutated_claims_or_evidence(
         monkeypatch, tmp_path, target, mutation):
+    run_dir = tmp_path / "e0-test-row"
+    build_run(monkeypatch, run_dir, "frozen-a", "normmaxmin")
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log = log_dir / "e0-test-row.log"
+    log.write_text(
+        "1000\t200\tE0_ROUND_START e0-test-row 1/1\n"
+        "900\t900\tE0_ROUND_END e0-test-row 1/1\n")
+    samples = log_dir / "e0-test-row.gpu"
+    samples.write_text("250\n")
+    boundaries = write_boundary_sidecar(
+        log_dir / "e0-test-row.boundaries", "e0-test-row",
+        1000, 100, 900, 1000)
+    record = {
+        "schema": "fedcrag-e0-resources/2",
+        "run_id": "e0-test-row",
+        "started_wall_ns": 1000,
+        "finished_wall_ns": 900,
+        "started_utc": "1970-01-01T00:00:00.000001000Z",
+        "finished_utc": "1970-01-01T00:00:00.000000900Z",
+        "started_mono_ns": 100,
+        "finished_mono_ns": 1000,
+        "elapsed_seconds": 9e-7,
+        "pre_ns": 100,
+        "round_ns": [700],
+        "between_round_ns": [],
+        "post_ns": 100,
+        "round_elapsed_seconds": [7e-7],
+        "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
+        "samples_sha256": hashlib.sha256(samples.read_bytes()).hexdigest(),
+        "boundaries_sha256": hashlib.sha256(
+            boundaries.read_bytes()).hexdigest(),
+        "gpu_available": True,
+        "peak_gpu_memory_mib": 250,
+        "gpu_memory_samples": 1,
+        "deterministic_algorithms": False,
+        "cudnn_deterministic": False,
+        "cudnn_benchmark": False,
+        "cublas_workspace_config": None,
+        "python_hash_seed": None,
+        "torch_version": torch.__version__,
+    }
+    resource_path = run_dir / "e0_resources.json"
+    resource_path.write_text(json.dumps(record))
+    if target == "json":
+        if mutation == "timing":
+            record["round_ns"] = [699]
+        elif mutation == "boundaries":
+            record["started_mono_ns"] = 50
+            record["pre_ns"] = 150
+            record["elapsed_seconds"] = 9.5e-7
+        else:
+            record["peak_gpu_memory_mib"] = 999
+        resource_path.write_text(json.dumps(record))
+    elif target == "log":
+        log.write_text(log.read_text() + "mutation\n")
+    elif target == "samples":
+        samples.write_text("999\n")
+    else:
+        boundaries.write_text(boundaries.read_text() + "mutation\n")
+
+    with pytest.raises(E0ValidationError):
+        validate_run_directory(
+            run_dir, manifest_row=manifest_row(run_dir))
+
+
+def test_resource_schema_v2_requires_raw_boundary_sidecar(
+        monkeypatch, tmp_path):
     run_dir = tmp_path / "e0-test-row"
     build_run(monkeypatch, run_dir, "frozen-a", "normmaxmin")
     log_dir = tmp_path / "logs"
@@ -2235,6 +2321,7 @@ def test_resource_schema_v2_refuses_mutated_claims_or_evidence(
         "gpu_available": True,
         "peak_gpu_memory_mib": 250,
         "gpu_memory_samples": 1,
+        "determinism_probe": "separate interpreter, same environment",
         "deterministic_algorithms": False,
         "cudnn_deterministic": False,
         "cudnn_benchmark": False,
@@ -2242,20 +2329,9 @@ def test_resource_schema_v2_refuses_mutated_claims_or_evidence(
         "python_hash_seed": None,
         "torch_version": torch.__version__,
     }
-    resource_path = run_dir / "e0_resources.json"
-    resource_path.write_text(json.dumps(record))
-    if target == "json":
-        if mutation == "timing":
-            record["round_ns"] = [699]
-        else:
-            record["peak_gpu_memory_mib"] = 999
-        resource_path.write_text(json.dumps(record))
-    elif target == "log":
-        log.write_text(log.read_text() + "mutation\n")
-    else:
-        samples.write_text("999\n")
+    (run_dir / "e0_resources.json").write_text(json.dumps(record))
 
-    with pytest.raises(E0ValidationError):
+    with pytest.raises(E0ValidationError, match="boundar"):
         validate_run_directory(
             run_dir, manifest_row=manifest_row(run_dir))
 

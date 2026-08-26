@@ -5,6 +5,7 @@ launched, so ``verify`` — the subcommand ``run`` and ``resume`` both begin
 with — is exercised here for real, in a hermetic clean worktree.
 """
 import os
+import select
 import subprocess
 import sys
 from pathlib import Path
@@ -225,8 +226,11 @@ def test_e0_launcher_timing_contract_uses_the_auditable_module():
     source = SCRIPT.read_text()
     assert "export PYTHONUNBUFFERED=1" in source
     assert '"$PYTHON" -u e0_resources.py timestamp' in source
-    assert 'e0_resources.py clock' in source
+    assert 'e0_resources.py boundary' in source
     assert 'e0_resources.py write' in source
+    assert '--boundaries "$boundaries"' in source
+    assert "--started-wall-ns" not in source
+    assert "--started-mono-ns" not in source
     assert "fedcrag-e0-resources/1" not in source
     assert "PIPESTATUS[@]" in source
 
@@ -241,3 +245,23 @@ def test_e0_launcher_timing_selftest_exercises_every_pipeline_stage():
     assert "timing self-test passed" in completed.stdout
     for stage in ("producer", "filter", "tee"):
         assert f"refused {stage} failure" in completed.stdout
+
+
+def test_e0_launcher_timing_selftest_streams_before_process_completion():
+    environment = dict(os.environ, PYTHON=sys.executable)
+    process = subprocess.Popen(
+        ["bash", str(SCRIPT), "timing-selftest"], cwd=ROOT,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=environment, bufsize=1)
+    assert process.stdout is not None
+    # The producer sleeps for one second immediately after this first marker.
+    # A filter or tee that waits for producer EOF cannot satisfy this bound.
+    ready, _, _ = select.select([process.stdout], [], [], 0.6)
+    assert ready, "producer/filter/tee buffered the first marker"
+    first = process.stdout.readline()
+    assert "E0_ROUND_START e0-timing-selftest 1/2" in first
+    assert process.poll() is None, "output arrived only after process exit"
+
+    stdout, stderr = process.communicate(timeout=20)
+    assert process.returncode == 0, (first + stdout, stderr)
+    assert "timing self-test passed" in stdout

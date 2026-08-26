@@ -43,6 +43,7 @@ CLEANUP_ARMED=0
 CLEANUP_DONE=0
 VM_TOUCHED=0
 PUBLICATION_LOCK=
+PUBLICATION_LOCK_TOKEN=
 
 say() { printf '%s\n' "$*" >&2; }
 
@@ -112,6 +113,45 @@ if not os.path.isdir(os.path.join(root, "artifacts")) or not os.path.isdir(os.pa
 PY
 }
 
+acquire_publication_lock() {
+    local candidate token
+    candidate="${DEST}.publication-lock"
+    token="$$-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir "$candidate" || return 1
+    if ! (umask 077; printf '%s\n' "$token" > "$candidate/owner"); then
+        rmdir "$candidate" 2>/dev/null || :
+        return 1
+    fi
+    PUBLICATION_LOCK=$candidate
+    PUBLICATION_LOCK_TOKEN=$token
+}
+
+release_publication_lock() {
+    local owner
+    [ -n "$PUBLICATION_LOCK" ] || return 0
+    [ -f "$PUBLICATION_LOCK/owner" ] && [ ! -L "$PUBLICATION_LOCK/owner" ] || return 1
+    IFS= read -r owner < "$PUBLICATION_LOCK/owner" || return 1
+    [ "$owner" = "$PUBLICATION_LOCK_TOKEN" ] || return 1
+    rm "$PUBLICATION_LOCK/owner" && rmdir "$PUBLICATION_LOCK" || return 1
+    PUBLICATION_LOCK=
+    PUBLICATION_LOCK_TOKEN=
+}
+
+atomic_promote() {
+    "$PYTHON_BIN" - "$ATTEMPT" "$DEST" <<'PY'
+import ctypes, os, sys
+source, destination = [os.fsencode(value) for value in sys.argv[1:]]
+if os.path.exists(destination) or os.path.islink(destination):
+    raise SystemExit("destination already exists")
+libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+function = libc.renameatx_np
+function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+function.restype = ctypes.c_int
+if function(-2, source, -2, destination, 0x00000004):
+    raise OSError(ctypes.get_errno(), "renameatx_np RENAME_EXCL failed")
+PY
+}
+
 get_status() {
     local output status
     output=$(gcloud compute instances describe "$INSTANCE" --project "$E0_PROJECT" \
@@ -155,7 +195,7 @@ cleanup() {
     if [ "$original" -ne 0 ]; then
         preserve_attempt
     fi
-    [ -z "$PUBLICATION_LOCK" ] || rmdir "$PUBLICATION_LOCK" 2>/dev/null || :
+    release_publication_lock || :
     exit "$original"
 }
 
@@ -561,8 +601,7 @@ main() {
     trap on_signal INT TERM
     [ ! -e "$DEST" ] && [ ! -L "$DEST" ] || fail "canonical destination already exists" 5
     mkdir -p "$(dirname "$DEST")" || fail "cannot create preservation parent"
-    PUBLICATION_LOCK="${DEST}.publication-lock"
-    mkdir "$PUBLICATION_LOCK" || fail "cannot reserve sibling publication lock" 5
+    acquire_publication_lock || fail "cannot reserve sibling publication lock" 5
     create_attempt || fail "cannot create exclusive attempt"
     CLEANUP_ARMED=1
 
@@ -592,11 +631,10 @@ main() {
     package_and_verify || fail "package checksum gate failed"
     verify_manifest_digest || fail "exported manifest digest gate failed"
     [ ! -e "$DEST" ] && [ ! -L "$DEST" ] || fail "canonical destination appeared before promotion"
-    mv "$ATTEMPT" "$DEST" || fail "guarded publication rename failed"
+    atomic_promote || fail "atomic no-replace publication failed"
     ATTEMPT=
     verify_canonical_layout || fail "canonical layout verification failed"
-    rmdir "$PUBLICATION_LOCK" || fail "cannot release publication lock"
-    PUBLICATION_LOCK=
+    release_publication_lock || fail "cannot release publication lock"
 }
 
 if [ "${POST_E0_REMOTE_WORKER:-}" = 1 ]; then

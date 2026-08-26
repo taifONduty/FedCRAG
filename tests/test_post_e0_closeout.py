@@ -340,6 +340,14 @@ def test_existing_canonical_destination_is_refused_before_start(closeout_env):
     assert not any("instances start" in call for call in cloud_calls(closeout_env))
 
 
+def test_lock_loser_never_removes_held_sibling_lock(closeout_env):
+    lock = Path(str(closeout_env["destination"]) + ".publication-lock")
+    lock.mkdir(parents=True)
+    completed = run_driver(closeout_env)
+    assert completed.returncode == 5
+    assert lock.is_dir()
+
+
 def test_refuses_concurrent_destination_before_promotion_without_nesting(closeout_env):
     completed = run_driver(closeout_env, FAKE_CREATE_DEST_ON_STOP="1",
                            FAKE_STATUSES="RUNNING,TERMINATED")

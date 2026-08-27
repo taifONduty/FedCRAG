@@ -11,7 +11,7 @@ set -o pipefail
 readonly DEFAULT_INSTANCE=thesis-fedcrag
 readonly APPROVED_CLONE_INSTANCE=thesis-fedcrag-e0-closeout
 readonly APPROVED_CLONE_SNAPSHOT=fedcrag-e0-closeout-20260827
-readonly APPROVED_CLONE_ZONES="asia-southeast1-a asia-southeast1-b asia-southeast1-c asia-east1-a asia-east1-b asia-east1-c"
+readonly APPROVED_CLONE_ZONES="asia-southeast1-a asia-southeast1-b asia-southeast1-c asia-east1-a asia-east1-b asia-east1-c asia-northeast1-a asia-northeast1-b asia-northeast1-c asia-northeast3-a asia-northeast3-b"
 INSTANCE=${POST_E0_INSTANCE-$DEFAULT_INSTANCE}
 case "$INSTANCE" in
     ''|*[!a-z0-9-]*|-*|*-) printf '%s\n' "invalid POST_E0_INSTANCE" >&2; exit 2 ;;
@@ -231,7 +231,7 @@ ensure_terminated() {
 }
 
 is_approved_clone_zone() {
-    case "$1" in asia-southeast1-a|asia-southeast1-b|asia-southeast1-c|asia-east1-a|asia-east1-b|asia-east1-c) return 0 ;; esac
+    case "$1" in asia-southeast1-a|asia-southeast1-b|asia-southeast1-c|asia-east1-a|asia-east1-b|asia-east1-c|asia-northeast1-a|asia-northeast1-b|asia-northeast1-c|asia-northeast3-a|asia-northeast3-b) return 0 ;; esac
     return 1
 }
 
@@ -379,7 +379,7 @@ def basename(value):
 
 if data.get("name") != instance or basename(data.get("zone")) != zone:
     raise SystemExit("target instance name or zone does not match discovery")
-if instance == "thesis-fedcrag-e0-closeout" and zone not in {"asia-southeast1-a", "asia-southeast1-b", "asia-southeast1-c", "asia-east1-a", "asia-east1-b", "asia-east1-c"}:
+if instance == "thesis-fedcrag-e0-closeout" and zone not in {"asia-southeast1-a", "asia-southeast1-b", "asia-southeast1-c", "asia-east1-a", "asia-east1-b", "asia-east1-c", "asia-northeast1-a", "asia-northeast1-b", "asia-northeast1-c", "asia-northeast3-a", "asia-northeast3-b"}:
     raise SystemExit("approved clone is not in an approved Singapore zone")
 if basename(data.get("machineType")) != "g2-standard-8":
     raise SystemExit("target instance machine type is not g2-standard-8")

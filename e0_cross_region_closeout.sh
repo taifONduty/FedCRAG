@@ -87,14 +87,14 @@ allocate_clone() {
         disk="$CLONE_INSTANCE-boot-${zone##*-}"; CLONE_ZONE=$zone
         cloud compute disks create "$disk" --project "$PROJECT" --zone "$zone" --size "${DISK_SIZE}GB" --type pd-balanced --source-snapshot "$SNAPSHOT" || return 1
         descriptor=$(disk_descriptor "$disk" "$zone") || return 1; validate_json disk "$descriptor" "$zone" "$disk" || return 1
-        if instance_error=$(cloud compute instances create "$CLONE_INSTANCE" --project "$PROJECT" --zone "$zone" --machine-type g2-standard-8 --disk "name=$disk,boot=yes,auto-delete=no,mode=rw" --network default --subnet default --network-tier PREMIUM --maintenance-policy TERMINATE --restart-on-failure --provisioning-model STANDARD --service-account 139678593638-compute@developer.gserviceaccount.com --scopes storage-ro,logging-write,monitoring-write,pubsub,service-management-ro,service-control,trace --shielded-vtpm --shielded-integrity-monitoring --no-shielded-secure-boot 2>&1); then
+        if instance_error=$(cloud compute instances create "$CLONE_INSTANCE" --project "$PROJECT" --zone "$zone" --machine-type g2-standard-8 --disk "name=$disk,boot=yes,auto-delete=no,mode=rw" --network default --subnet default --network-tier PREMIUM --maintenance-policy TERMINATE --restart-on-failure --provisioning-model STANDARD --service-account 139678593638-compute@developer.gserviceaccount.com --scopes https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/pubsub,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/trace.append --shielded-vtpm --shielded-integrity-monitoring --no-shielded-secure-boot 2>&1); then
             descriptor=$(instance_descriptor "$zone") || return 1; validate_json instance "$descriptor" "$zone" "$disk" || return 1; return 0
         fi
         clone_absent "$zone" || return 1; printf '%s' "$instance_error" | grep -F ZONE_RESOURCE_POOL_EXHAUSTED >/dev/null || return 1; recover_failed_candidate "$zone" "$disk" || return 1
     done
     return 20
 }
-run_closeout() { env -u POST_E0_TEST_MODE -u POST_E0_TEST_REMOTE_ROOT -u POST_E0_REMOTE_TMP -u POST_E0_VALIDATOR -u POST_E0_PYTHON -u POST_E0_TEST_EXECUTION_SOURCE_ROOT -u POST_E0_TEST_EXECUTION_INTERPRETER_PATH -u POST_E0_REMOTE_WORKER POST_E0_INSTANCE="$CLONE_INSTANCE" POST_E0_EXPECTED_SOURCE_SNAPSHOT="$SNAPSHOT" POST_E0_DEST="$DEST" /bin/bash "$CLOSEOUT_SCRIPT"; }
+run_closeout() { env -u POST_E0_TEST_MODE -u POST_E0_TEST_FAIL -u POST_E0_TEST_REMOTE_ROOT -u POST_E0_REMOTE_TMP -u POST_E0_VALIDATOR -u POST_E0_PYTHON -u POST_E0_TEST_EXECUTION_SOURCE_ROOT -u POST_E0_TEST_EXECUTION_INTERPRETER_PATH -u POST_E0_REMOTE_WORKER POST_E0_INSTANCE="$CLONE_INSTANCE" POST_E0_EXPECTED_SOURCE_SNAPSHOT="$SNAPSHOT" POST_E0_DEST="$DEST" /bin/bash "$CLOSEOUT_SCRIPT"; }
 main() {
     local allocation_status closeout_status
     configure_test_mode || { say 'test transport refused'; return 20; }; preflight || { say 'preflight refused'; return 20; }

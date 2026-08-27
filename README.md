@@ -4,13 +4,14 @@ A research codebase for studying **catastrophic forgetting in dense retrievers u
 temporally evolving / federated client knowledge**, and for building a continual
 adapter-based federated retriever that prevents it without sharing raw documents.
 
-> ## Status: implemented; E0 correctness campaign complete; strengthened validation pending
+> ## Status: implemented; E0 correctness campaign strengthened-validated
 >
-> **An external eleven-row E0 correctness campaign completed; strengthened post-hoc
-> validation is pending.** This is correctness/attribution evidence only: it supports
-> no paper-scale efficacy claim, and no E1–E5 run exists. The frozen-A, norm-consistent
-> `normmaxmin` (FedSpan) path is implemented with fail-closed diagnostics and covered by
-> CPU tests.
+> **The external eleven-row E0 correctness campaign completed and all eleven rows passed
+> strengthened post-hoc validation.** The audit binds the frozen launch manifest, dataset
+> fingerprints, runtime/source provenance, state continuity, aggregation replay, and
+> FedSpan direction certificates. This remains correctness/attribution evidence only: it
+> supports no paper-scale efficacy claim, and no E1–E5 run exists. See the
+> [strengthened E0 closeout](docs/2026-08-27-e0-strengthened-closeout.md).
 >
 > - Everything in `results/` is a **historical `bge-m3` trainable-A+B run**. `bge-m3`
 >   fails this repo's own headroom gate (below), so those files are not paper evidence.
@@ -307,6 +308,15 @@ buffered output did not preserve trustworthy round boundaries. The total row run
 remains usable from the row-level launcher timestamps. Future launcher artifacts use the
 strengthened timing evidence contract; this does not retroactively reconstruct legacy
 round timings.
+
+The strengthened closeout validated all eleven rows and published the canonical 3.3 GiB
+package locally under `post_e0_audit/2026-08-25/`. GCP stockouts prevented the original
+`g2-standard-8` and the first six Singapore/Taiwan zone attempts, so preservation used a
+fresh snapshot and a suitable `g2-standard-4` VM with the same single 24 GiB NVIDIA L4 in
+`asia-northeast1-c`. That host-shape change affects only post-hoc validation and artifact
+transfer; it did not rerun or alter E0. Both the original and clone were independently
+observed `TERMINATED` after publication. Full identities, digest, and limitations are in
+the [closeout record](docs/2026-08-27-e0-strengthened-closeout.md).
 
 **E0 numbers are not comparable to the paper's cells. Do not quote them as results.**
 

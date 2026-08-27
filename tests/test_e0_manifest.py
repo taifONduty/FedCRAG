@@ -216,7 +216,9 @@ def test_readme_reports_completed_eleven_row_correctness_campaign_only():
     status_prose = _prose(status)
     assert "eleven-row" in _prose(status + e0)
     assert "correctness campaign completed" in status_prose
-    assert "strengthened post-hoc validation is pending" in status_prose
+    assert "strengthened-validated" in status_prose
+    assert "all eleven rows passed strengthened post-hoc validation" in status_prose
+    assert "strengthened post-hoc validation is pending" not in status_prose
     assert "no paper-scale efficacy claim" in status_prose
     assert "ten-row" not in e0.lower()
     assert "exact ten commands" not in e0.lower()
@@ -263,7 +265,7 @@ def test_task_tracker_separates_completed_e0_from_method_validation():
     }
     assert row["status"] == "implemented-unvalidated"
     assert "external eleven-row e0 correctness campaign completed" in gate
-    assert "strengthened post-hoc validation is pending" in gate
+    assert "strengthened post-hoc validation passed all eleven rows" in gate
     assert "e1–e5 and paper-scale efficacy evidence remain absent" in gate
     assert "method-validation gate is unmet" in gate
     assert "not run" not in gate

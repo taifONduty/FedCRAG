@@ -67,6 +67,7 @@ E0_PROJECT=
 E0_ZONE=
 CLEANUP_ARMED=0
 CLONE_CLEANUP_ARMED=0
+CLONE_SWEEP_DONE=0
 CLEANUP_DONE=0
 VM_TOUCHED=0
 PUBLICATION_LOCK=
@@ -271,21 +272,24 @@ EOF
 }
 
 ensure_approved_clone_terminated() {
-    local zone result
+    local zone result failed
+    failed=0
     for zone in asia-southeast1-a asia-southeast1-b asia-southeast1-c; do
         approved_clone_exists_in_zone "$zone"
         result=$?
         [ "$result" -eq 1 ] && continue
-        [ "$result" -eq 0 ] || return 1
-        ensure_terminated_in_zone "$zone" || return 1
+        if [ "$result" -ne 0 ]; then failed=1; continue; fi
+        ensure_terminated_in_zone "$zone" || failed=1
     done
+    [ "$failed" -eq 0 ]
 }
 
 cleanup() {
     local original=$?
     trap - EXIT INT TERM
-    if [ "$CLONE_CLEANUP_ARMED" -eq 1 ] && [ "$CLEANUP_DONE" -eq 0 ]; then
+    if [ "$CLONE_CLEANUP_ARMED" -eq 1 ] && [ "$CLONE_SWEEP_DONE" -eq 0 ]; then
         if ensure_approved_clone_terminated; then
+            CLONE_SWEEP_DONE=1
             CLEANUP_DONE=1
         else
             say "CRITICAL: approved clone termination could not be verified"
@@ -815,11 +819,11 @@ main() {
     if [ "$INSTANCE" = "$APPROVED_CLONE_INSTANCE" ]; then
         trap cleanup EXIT
         trap on_signal INT TERM
+        CLONE_CLEANUP_ARMED=1
         [ ! -e "$DEST" ] && [ ! -L "$DEST" ] || fail "canonical destination already exists" 5
         mkdir -p "$(dirname "$DEST")" || fail "cannot create preservation parent"
         acquire_publication_lock || fail "cannot reserve sibling publication lock" 5
         create_attempt || fail "cannot create exclusive attempt"
-        CLONE_CLEANUP_ARMED=1
         discover_target
         discovery_code=$?
         [ "$discovery_code" -eq 0 ] || fail "project/zone discovery failed" "$discovery_code"
@@ -865,6 +869,10 @@ main() {
         # The bounded attempt has already happened; do not repeat it in EXIT.
         CLEANUP_DONE=1
         fail "explicit shutdown could not be verified" "$CRITICAL_SHUTDOWN"
+    fi
+    if [ "$INSTANCE" = "$APPROVED_CLONE_INSTANCE" ]; then
+        ensure_approved_clone_terminated || fail "approved clone sweep could not be verified" "$CRITICAL_SHUTDOWN"
+        CLONE_SWEEP_DONE=1
     fi
     printf 'final=TERMINATED\n' >> "$ATTEMPT/audit/vm_state.txt" || fail "cannot record final VM state"
     package_and_verify || fail "package checksum gate failed"

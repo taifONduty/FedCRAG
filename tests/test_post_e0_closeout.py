@@ -137,6 +137,7 @@ if [ \"$1\" = compute ] && [ \"$2\" = instances ] && [ \"$3\" = start ]; then
 fi
 if [ \"$1\" = compute ] && [ \"$2\" = instances ] && [ \"$3\" = stop ]; then
   if [ \"${FAKE_CREATE_DEST_ON_STOP:-0}\" = 1 ]; then mkdir -p \"$POST_E0_DEST\"; printf foreign > \"$POST_E0_DEST/marker\"; fi
+  case \" $* \" in *\" --zone ${FAKE_STOP_FAIL_ZONE:-never} \"*) exit 1 ;; esac
   [ \"${FAKE_STOP_FAIL:-0}\" = 0 ] || exit 1
   exit 0
 fi
@@ -390,6 +391,35 @@ def test_clone_discovery_failure_stops_every_authorized_exact_match(closeout_env
     assert completed.returncode == 3
     assert_not_published(closeout_env)
     assert_authorized_clone_stopped(closeout_env, "asia-southeast1-a", "asia-southeast1-c")
+
+
+def test_clone_existing_destination_still_sweeps_authorized_match(closeout_env):
+    closeout_env["destination"].mkdir(parents=True)
+    completed = run_driver(
+        closeout_env, **approved_clone_env(closeout_env, matches="asia-southeast1-b"),
+        FAKE_STATUSES="TERMINATED",
+    )
+    assert completed.returncode == 5
+    assert_authorized_clone_stopped(closeout_env, "asia-southeast1-b")
+
+
+def test_clone_success_sweeps_matches_beyond_discovered_zone(closeout_env):
+    completed = run_driver(
+        closeout_env, **approved_clone_env(closeout_env, matches="asia-southeast1-a,asia-southeast1-b"),
+        FAKE_ZONES="asia-southeast1-a", FAKE_STATUSES="RUNNING,TERMINATED,TERMINATED",
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert_authorized_clone_stopped(closeout_env, "asia-southeast1-a", "asia-southeast1-b")
+
+
+def test_clone_sweep_continues_after_earlier_zone_failure(closeout_env):
+    completed = run_driver(
+        closeout_env, **approved_clone_env(closeout_env, matches="asia-southeast1-a,asia-southeast1-c"),
+        FAKE_LIST_FAIL="1", FAKE_STOP_FAIL_ZONE="asia-southeast1-a",
+        FAKE_STATUSES="TERMINATED",
+    )
+    assert completed.returncode == 70
+    assert_authorized_clone_stopped(closeout_env, "asia-southeast1-c")
 
 
 @pytest.mark.parametrize("discovery_zone, descriptor_zone", [

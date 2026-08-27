@@ -72,11 +72,25 @@ if [ \"$1\" = config ]; then
 fi
 if [ \"$1\" = compute ] && [ \"$2\" = instances ] && [ \"$3\" = list ]; then
   [ \"${FAKE_LIST_FAIL:-0}\" = 0 ] || exit 1
-  printf '%s' \"${FAKE_ZONES-zone-e0}\" | tr ',' '\\n'
-  printf '\\n'
+  if [ -n \"${FAKE_DISCOVERY_ROWS:-}\" ]; then
+    printf '%s\\n' \"$FAKE_DISCOVERY_ROWS\"
+  else
+    printf '%s\\n' \"${FAKE_ZONES-zone-e0}\" | tr ',' '\\n' | while IFS= read -r zone; do
+      if [ -n \"$zone\" ]; then
+        printf '%s,%s\\n' \"${FAKE_DISCOVERY_NAME-thesis-fedcrag}\" \"$zone\"
+      fi
+    done
+  fi
   exit 0
 fi
 if [ \"$1\" = compute ] && [ \"$2\" = instances ] && [ \"$3\" = describe ]; then
+  case \" $* \" in
+    *\" --format=json \"*)
+      [ \"${FAKE_INSTANCE_DESCRIPTOR_FAIL:-0}\" = 0 ] || exit 1
+      printf '%s\\n' \"$FAKE_INSTANCE_DESCRIPTOR\"
+      exit 0
+      ;;
+  esac
   [ \"${FAKE_STATUS_FAIL:-0}\" = 0 ] || exit 1
   values=$(cat \"$FAKE_STATUS_FILE\")
   value=${values%%,*}
@@ -84,6 +98,16 @@ if [ \"$1\" = compute ] && [ \"$2\" = instances ] && [ \"$3\" = describe ]; then
     printf '%s' \"${values#*,}\" > \"$FAKE_STATUS_FILE\"
   fi
   printf '%s\\n' \"$value\"
+  exit 0
+fi
+if [ \"$1\" = compute ] && [ \"$2\" = disks ] && [ \"$3\" = describe ]; then
+  [ \"${FAKE_DISK_DESCRIPTOR_FAIL:-0}\" = 0 ] || exit 1
+  printf '%s\\n' \"$FAKE_DISK_DESCRIPTOR\"
+  exit 0
+fi
+if [ \"$1\" = compute ] && [ \"$2\" = snapshots ] && [ \"$3\" = describe ]; then
+  [ \"${FAKE_SNAPSHOT_DESCRIPTOR_FAIL:-0}\" = 0 ] || exit 1
+  printf '%s\\n' \"$FAKE_SNAPSHOT_DESCRIPTOR\"
   exit 0
 fi
 if [ \"$1\" = compute ] && [ \"$2\" = instances ] && [ \"$3\" = start ]; then
@@ -185,6 +209,29 @@ printf '{"manifest_verified": true, "dataset_content_verified": true, "runtime_p
         "EXPECTED_EXECUTION_INTERPRETER_PATH": "/shared/FedCRAG/.venv/bin/python",
         "POST_E0_VALIDATOR": str(validator),
         "POST_E0_RETRY_SLEEP": "0",
+        "FAKE_INSTANCE_DESCRIPTOR": json.dumps({
+            "name": "thesis-fedcrag",
+            "zone": "https://www.googleapis.com/compute/v1/projects/project-e0/zones/zone-e0",
+            "machineType": "https://www.googleapis.com/compute/v1/projects/project-e0/zones/zone-e0/machineTypes/g2-standard-8",
+            "guestAccelerators": [{
+                "acceleratorType": "https://www.googleapis.com/compute/v1/projects/project-e0/zones/zone-e0/acceleratorTypes/nvidia-l4",
+                "acceleratorCount": 1,
+            }],
+            "scheduling": {"provisioningModel": "STANDARD"},
+            "disks": [{
+                "boot": True, "type": "PERSISTENT",
+                "source": "https://www.googleapis.com/compute/v1/projects/project-e0/zones/zone-e0/disks/thesis-fedcrag-restored",
+            }],
+        }),
+        "FAKE_DISK_DESCRIPTOR": json.dumps({
+            "name": "thesis-fedcrag-restored", "status": "READY", "sizeGb": "200",
+            "type": "https://www.googleapis.com/compute/v1/projects/project-e0/zones/zone-e0/diskTypes/pd-balanced",
+            "sourceSnapshot": "https://www.googleapis.com/compute/v1/projects/project-e0/global/snapshots/fedcrag-e0-closeout-20260827",
+        }),
+        "FAKE_SNAPSHOT_DESCRIPTOR": json.dumps({
+            "name": "fedcrag-e0-closeout-20260827", "status": "READY", "diskSizeGb": "200",
+            "sourceDisk": "https://www.googleapis.com/compute/v1/projects/project-e0/zones/asia-south1-c/disks/thesis-fedcrag-restored",
+        }),
     })
     return {"env": env, "destination": destination, "log": gcloud_log,
             "source": source, "remote_tmp": remote_tmp,
@@ -217,6 +264,127 @@ def failed_attempts(closeout_env):
 def assert_not_published(closeout_env):
     assert not closeout_env["destination"].exists()
     assert failed_attempts(closeout_env), "failure must retain a unique attempt"
+
+
+def target_descriptor_env(closeout_env, mutation):
+    """Return one malformed descriptor set for the target-binding gate."""
+    instance = json.loads(closeout_env["env"]["FAKE_INSTANCE_DESCRIPTOR"])
+    disk = json.loads(closeout_env["env"]["FAKE_DISK_DESCRIPTOR"])
+    snapshot = json.loads(closeout_env["env"]["FAKE_SNAPSHOT_DESCRIPTOR"])
+    if mutation == "wrong-name":
+        instance["name"] = "not-the-clone"
+    elif mutation == "machine-type":
+        instance["machineType"] = instance["machineType"].replace("g2-standard-8", "n1-standard-8")
+    elif mutation == "l4-type":
+        instance["guestAccelerators"][0]["acceleratorType"] = "https://example/acceleratorTypes/nvidia-tesla-t4"
+    elif mutation == "l4-count":
+        instance["guestAccelerators"][0]["acceleratorCount"] = 2
+    elif mutation == "provisioning":
+        instance["scheduling"]["provisioningModel"] = "SPOT"
+    elif mutation == "boot-disk":
+        instance["disks"][0]["boot"] = False
+    elif mutation == "disk-size":
+        disk["sizeGb"] = "199"
+    elif mutation == "disk-type":
+        disk["type"] = disk["type"].replace("pd-balanced", "pd-standard")
+    elif mutation == "disk-status":
+        disk["status"] = "CREATING"
+    elif mutation == "source-snapshot":
+        disk["sourceSnapshot"] = disk["sourceSnapshot"].replace("20260827", "wrong")
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+    return {"FAKE_INSTANCE_DESCRIPTOR": json.dumps(instance),
+            "FAKE_DISK_DESCRIPTOR": json.dumps(disk),
+            "FAKE_SNAPSHOT_DESCRIPTOR": json.dumps(snapshot)}
+
+
+def assert_target_refusal_preserves_and_stops(closeout_env, completed):
+    assert completed.returncode == 20
+    assert_not_published(closeout_env)
+    assert any("instances stop thesis-fedcrag-e0-closeout" in call
+               for call in cloud_calls(closeout_env))
+
+
+def test_nondefault_instance_is_used_for_every_cloud_operation(closeout_env):
+    completed = run_driver(
+        closeout_env,
+        POST_E0_INSTANCE="thesis-fedcrag-e0-closeout",
+        POST_E0_EXPECTED_SOURCE_SNAPSHOT="fedcrag-e0-closeout-20260827",
+        FAKE_DISCOVERY_NAME="thesis-fedcrag-e0-closeout",
+        FAKE_INSTANCE_DESCRIPTOR=json.dumps({
+            **json.loads(closeout_env["env"]["FAKE_INSTANCE_DESCRIPTOR"]),
+            "name": "thesis-fedcrag-e0-closeout",
+        }),
+        FAKE_STATUSES="RUNNING,TERMINATED",
+    )
+    assert completed.returncode == 0, completed.stderr
+    calls = cloud_calls(closeout_env)
+    target_calls = [line for line in calls if any(token in line for token in (
+        "instances describe", "instances start", "instances stop",
+        "compute ssh", "compute scp"))]
+    assert target_calls
+    assert all("thesis-fedcrag-e0-closeout" in line for line in target_calls)
+    for name in ("target_instance.json", "target_disk.json", "target_snapshot.json"):
+        assert (closeout_env["destination"] / "audit" / name).is_file()
+
+
+@pytest.mark.parametrize("value", ["", "Bad_Name", "-leading", "trailing-", "a" * 64])
+def test_invalid_instance_override_is_refused_before_cloud(closeout_env, value):
+    completed = run_driver(closeout_env, POST_E0_INSTANCE=value)
+    assert completed.returncode == 2
+    assert cloud_calls(closeout_env) == []
+
+
+def test_nondefault_instance_requires_expected_snapshot(closeout_env):
+    completed = run_driver(closeout_env, POST_E0_INSTANCE="thesis-fedcrag-e0-closeout")
+    assert completed.returncode == 2
+    assert cloud_calls(closeout_env) == []
+
+
+@pytest.mark.parametrize("mutation", [
+    "wrong-name", "machine-type", "l4-type", "l4-count", "provisioning", "boot-disk",
+    "disk-size", "disk-type", "disk-status", "source-snapshot",
+])
+def test_target_configuration_descriptor_mutations_refuse_and_stop(closeout_env, mutation):
+    completed = run_driver(
+        closeout_env,
+        POST_E0_INSTANCE="thesis-fedcrag-e0-closeout",
+        POST_E0_EXPECTED_SOURCE_SNAPSHOT="fedcrag-e0-closeout-20260827",
+        FAKE_DISCOVERY_NAME="thesis-fedcrag-e0-closeout",
+        FAKE_STATUSES="RUNNING,TERMINATED",
+        **target_descriptor_env(closeout_env, mutation),
+    )
+    assert_target_refusal_preserves_and_stops(closeout_env, completed)
+
+
+@pytest.mark.parametrize("failure", [
+    {"FAKE_INSTANCE_DESCRIPTOR_FAIL": "1"},
+    {"FAKE_DISK_DESCRIPTOR_FAIL": "1"},
+    {"FAKE_SNAPSHOT_DESCRIPTOR_FAIL": "1"},
+])
+def test_target_configuration_failed_descriptor_refuses_and_stops(closeout_env, failure):
+    completed = run_driver(
+        closeout_env,
+        POST_E0_INSTANCE="thesis-fedcrag-e0-closeout",
+        POST_E0_EXPECTED_SOURCE_SNAPSHOT="fedcrag-e0-closeout-20260827",
+        FAKE_DISCOVERY_NAME="thesis-fedcrag-e0-closeout",
+        FAKE_STATUSES="RUNNING,TERMINATED",
+        **failure,
+    )
+    assert_target_refusal_preserves_and_stops(closeout_env, completed)
+
+
+def test_target_configuration_ambiguous_exact_name_discovery_refuses_before_vm_activity(closeout_env):
+    completed = run_driver(
+        closeout_env,
+        POST_E0_INSTANCE="thesis-fedcrag-e0-closeout",
+        POST_E0_EXPECTED_SOURCE_SNAPSHOT="fedcrag-e0-closeout-20260827",
+        FAKE_DISCOVERY_ROWS="thesis-fedcrag-e0-closeout,zone-e0\nthesis-fedcrag-e0-closeout,zone-e1",
+    )
+    assert completed.returncode == 4
+    assert_not_published(closeout_env)
+    assert not any("instances start" in call or "instances stop" in call
+                   for call in cloud_calls(closeout_env))
 
 
 def test_records_workspace_bash_and_requires_bash_32_syntax(closeout_env):
@@ -482,7 +650,8 @@ def test_bounded_shutdown_retries_never_publish_when_termination_not_observed(cl
     assert completed.returncode == 70
     assert_not_published(closeout_env)
     calls = cloud_calls(closeout_env)
-    assert sum("instances describe" in call for call in calls) <= 4
+    assert sum("instances describe" in call and "--format=value(status)" in call
+               for call in calls) <= 4
     assert sum("instances stop" in call for call in calls) <= 3
 
 

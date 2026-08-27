@@ -8,7 +8,22 @@
 set -u
 set -o pipefail
 
-readonly INSTANCE=thesis-fedcrag
+readonly DEFAULT_INSTANCE=thesis-fedcrag
+INSTANCE=${POST_E0_INSTANCE-$DEFAULT_INSTANCE}
+case "$INSTANCE" in
+    ''|*[!a-z0-9-]*|-*|*-) printf '%s\n' "invalid POST_E0_INSTANCE" >&2; exit 2 ;;
+esac
+case "$INSTANCE" in
+    [a-z]*) ;;
+    *) printf '%s\n' "invalid POST_E0_INSTANCE" >&2; exit 2 ;;
+esac
+[ "${#INSTANCE}" -le 63 ] || { printf '%s\n' "invalid POST_E0_INSTANCE" >&2; exit 2; }
+readonly INSTANCE
+EXPECTED_SOURCE_SNAPSHOT=${POST_E0_EXPECTED_SOURCE_SNAPSHOT:-}
+if [ "$INSTANCE" != "$DEFAULT_INSTANCE" ] && [ -z "$EXPECTED_SOURCE_SNAPSHOT" ]; then
+    printf '%s\n' "non-default instance requires POST_E0_EXPECTED_SOURCE_SNAPSHOT" >&2
+    exit 2
+fi
 REMOTE_ARTIFACT_ROOT=/home/turjo/FedCRAG_E0_RESULTS
 readonly EXECUTION_COMMIT=7325bf56381c24c6a4af013688bdd417c95d7d7d
 readonly EXECUTION_COMMIT_SHORT=7325bf56381c
@@ -243,7 +258,7 @@ require_clean_worktree() {
 }
 
 discover_target() {
-    local discovery_status project_status zone
+    local discovery_status project_status name zone
     E0_PROJECT="$(gcloud config get-value project)"
     project_status=$?
     [ "$project_status" -eq 0 ] || return 3
@@ -251,18 +266,94 @@ discover_target() {
 
     # Deliberately capture the command status before interpreting stdout.
     E0_ZONE_OUTPUT="$(gcloud compute instances list --project "$E0_PROJECT" \
-        --filter='name=thesis-fedcrag' --format='value(zone.basename())')"
+        --filter="name=$INSTANCE" --format='csv[no-heading](name,zone.basename())')"
     discovery_status=$?
     [ "$discovery_status" -eq 0 ] || return 3
     E0_ZONES=()
-    while IFS= read -r zone; do
-        [ -n "$zone" ] && E0_ZONES[${#E0_ZONES[@]}]="$zone"
+    while IFS=, read -r name zone; do
+        [ "$name" = "$INSTANCE" ] && [ -n "$zone" ] && \
+            E0_ZONES[${#E0_ZONES[@]}]="$zone"
     done <<EOF
 $E0_ZONE_OUTPUT
 EOF
     [ "${#E0_ZONES[@]}" -eq 1 ] || return 4
     E0_ZONE=${E0_ZONES[0]}
     return 0
+}
+
+capture_and_verify_target() {
+    local disk snapshot
+    gcloud compute instances describe "$INSTANCE" --project "$E0_PROJECT" \
+        --zone "$E0_ZONE" --format=json > "$ATTEMPT/audit/target_instance.json" || return 1
+    disk=$("$PYTHON_BIN" - "$ATTEMPT/audit/target_instance.json" "$INSTANCE" "$E0_ZONE" <<'PY'
+import json, sys
+
+path, instance, zone = sys.argv[1:]
+data = json.load(open(path, encoding="utf-8"))
+
+def basename(value):
+    if not isinstance(value, str) or not value:
+        raise SystemExit("target descriptor has invalid resource name")
+    return value.rstrip("/").rsplit("/", 1)[-1]
+
+if data.get("name") != instance or basename(data.get("zone")) != zone:
+    raise SystemExit("target instance name or zone does not match discovery")
+if basename(data.get("machineType")) != "g2-standard-8":
+    raise SystemExit("target instance machine type is not g2-standard-8")
+accelerators = data.get("guestAccelerators")
+if not isinstance(accelerators, list) or len(accelerators) != 1:
+    raise SystemExit("target instance does not have one L4 accelerator")
+accelerator = accelerators[0]
+if not isinstance(accelerator, dict) or basename(accelerator.get("acceleratorType")) != "nvidia-l4" or accelerator.get("acceleratorCount") != 1:
+    raise SystemExit("target instance does not have one nvidia-l4")
+if data.get("scheduling", {}).get("provisioningModel") != "STANDARD":
+    raise SystemExit("target instance provisioning model is not STANDARD")
+disks = data.get("disks")
+boot_disks = [item for item in disks if isinstance(item, dict) and item.get("boot") is True and item.get("type") == "PERSISTENT"] if isinstance(disks, list) else []
+if len(boot_disks) != 1:
+    raise SystemExit("target instance does not have one persistent boot disk")
+print(basename(boot_disks[0].get("source")))
+PY
+) || return 1
+    [ -n "$disk" ] || return 1
+    gcloud compute disks describe "$disk" --project "$E0_PROJECT" --zone "$E0_ZONE" \
+        --format=json > "$ATTEMPT/audit/target_disk.json" || return 1
+    snapshot=$("$PYTHON_BIN" - "$ATTEMPT/audit/target_disk.json" "$EXPECTED_SOURCE_SNAPSHOT" <<'PY'
+import json, sys
+
+path, expected_snapshot = sys.argv[1:]
+data = json.load(open(path, encoding="utf-8"))
+
+def basename(value):
+    if not isinstance(value, str) or not value:
+        raise SystemExit("target descriptor has invalid resource name")
+    return value.rstrip("/").rsplit("/", 1)[-1]
+
+if data.get("status") != "READY" or str(data.get("sizeGb")) != "200" or basename(data.get("type")) != "pd-balanced":
+    raise SystemExit("target boot disk is not READY 200GB pd-balanced")
+if expected_snapshot:
+    source_snapshot = basename(data.get("sourceSnapshot"))
+    if source_snapshot != expected_snapshot:
+        raise SystemExit("target boot disk source snapshot does not match expected clone snapshot")
+    print(source_snapshot)
+PY
+) || return 1
+    if [ -n "$EXPECTED_SOURCE_SNAPSHOT" ]; then
+        [ -n "$snapshot" ] || return 1
+        gcloud compute snapshots describe "$snapshot" --project "$E0_PROJECT" \
+            --format=json > "$ATTEMPT/audit/target_snapshot.json" || return 1
+        "$PYTHON_BIN" - "$ATTEMPT/audit/target_snapshot.json" "$snapshot" <<'PY' || return 1
+import json, sys
+
+path, expected_snapshot = sys.argv[1:]
+data = json.load(open(path, encoding="utf-8"))
+if data.get("name") != expected_snapshot or data.get("status") != "READY" or str(data.get("diskSizeGb")) != "200":
+    raise SystemExit("target source snapshot is not the expected READY 200GB snapshot")
+source_disk = data.get("sourceDisk")
+if not isinstance(source_disk, str) or not source_disk.endswith("/zones/asia-south1-c/disks/thesis-fedcrag-restored"):
+    raise SystemExit("target source snapshot does not originate from thesis-fedcrag-restored")
+PY
+    fi
 }
 
 assert_regular_tree() {
@@ -649,6 +740,7 @@ main() {
     acquire_publication_lock || fail "cannot reserve sibling publication lock" 5
     create_attempt || fail "cannot create exclusive attempt"
     CLEANUP_ARMED=1
+    capture_and_verify_target || fail "target configuration descriptor gate failed"
 
     before=$(get_status) || fail "initial VM status query was malformed or failed"
     printf 'before=%s\n' "$before" > "$ATTEMPT/audit/vm_state.txt" || fail "cannot record initial VM state"

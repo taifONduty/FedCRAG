@@ -71,6 +71,18 @@ if [ \"$1\" = config ]; then
   exit 0
 fi
 if [ \"$1\" = compute ] && [ \"$2\" = instances ] && [ \"$3\" = list ]; then
+  zone=
+  previous=
+  for item in \"$@\"; do
+    if [ \"$previous\" = --zones ]; then zone=$item; break; fi
+    previous=$item
+  done
+  if [ -n \"$zone\" ]; then
+    case \",${FAKE_CLONE_MATCH_ZONES:-},\" in
+      *\",$zone,\"*) printf '%s,%s\\n' thesis-fedcrag-e0-closeout \"$zone\" ;;
+    esac
+    exit 0
+  fi
   [ \"${FAKE_LIST_FAIL:-0}\" = 0 ] || exit 1
   if [ -n \"${FAKE_DISCOVERY_ROWS:-}\" ]; then
     printf '%s\\n' \"$FAKE_DISCOVERY_ROWS\"
@@ -91,6 +103,15 @@ if [ \"$1\" = compute ] && [ \"$2\" = instances ] && [ \"$3\" = describe ]; then
       exit 0
       ;;
   esac
+  if [ \"$4\" = thesis-fedcrag-e0-closeout ] && [ -n \"${FAKE_CLONE_MATCH_ZONES:-}\" ]; then
+    zone=
+    previous=
+    for item in \"$@\"; do
+      if [ \"$previous\" = --zone ]; then zone=$item; break; fi
+      previous=$item
+    done
+    case \",$FAKE_CLONE_MATCH_ZONES,\" in *\",$zone,\"*) ;; *) exit 1 ;; esac
+  fi
   [ \"${FAKE_STATUS_FAIL:-0}\" = 0 ] || exit 1
   values=$(cat \"$FAKE_STATUS_FILE\")
   value=${values%%,*}
@@ -220,6 +241,7 @@ printf '{"manifest_verified": true, "dataset_content_verified": true, "runtime_p
             "scheduling": {"provisioningModel": "STANDARD"},
             "disks": [{
                 "boot": True, "type": "PERSISTENT",
+                "autoDelete": False,
                 "source": "https://www.googleapis.com/compute/v1/projects/project-e0/zones/zone-e0/disks/thesis-fedcrag-restored",
             }],
         }),
@@ -271,6 +293,8 @@ def target_descriptor_env(closeout_env, mutation):
     instance = json.loads(closeout_env["env"]["FAKE_INSTANCE_DESCRIPTOR"])
     disk = json.loads(closeout_env["env"]["FAKE_DISK_DESCRIPTOR"])
     snapshot = json.loads(closeout_env["env"]["FAKE_SNAPSHOT_DESCRIPTOR"])
+    instance["name"] = "thesis-fedcrag-e0-closeout"
+    instance["zone"] = instance["zone"].rsplit("/", 1)[0] + "/asia-southeast1-a"
     if mutation == "wrong-name":
         instance["name"] = "not-the-clone"
     elif mutation == "machine-type":
@@ -283,6 +307,8 @@ def target_descriptor_env(closeout_env, mutation):
         instance["scheduling"]["provisioningModel"] = "SPOT"
     elif mutation == "boot-disk":
         instance["disks"][0]["boot"] = False
+    elif mutation == "boot-autodelete":
+        instance["disks"][0]["autoDelete"] = True
     elif mutation == "disk-size":
         disk["sizeGb"] = "199"
     elif mutation == "disk-type":
@@ -295,7 +321,9 @@ def target_descriptor_env(closeout_env, mutation):
         raise AssertionError(f"unknown mutation: {mutation}")
     return {"FAKE_INSTANCE_DESCRIPTOR": json.dumps(instance),
             "FAKE_DISK_DESCRIPTOR": json.dumps(disk),
-            "FAKE_SNAPSHOT_DESCRIPTOR": json.dumps(snapshot)}
+            "FAKE_SNAPSHOT_DESCRIPTOR": json.dumps(snapshot),
+            "FAKE_ZONES": "asia-southeast1-a",
+            "FAKE_CLONE_MATCH_ZONES": "asia-southeast1-a"}
 
 
 def assert_target_refusal_preserves_and_stops(closeout_env, completed):
@@ -305,16 +333,86 @@ def assert_target_refusal_preserves_and_stops(closeout_env, completed):
                for call in cloud_calls(closeout_env))
 
 
+def approved_clone_env(closeout_env, *, zone="asia-southeast1-a", matches=None):
+    instance = json.loads(closeout_env["env"]["FAKE_INSTANCE_DESCRIPTOR"])
+    instance["name"] = "thesis-fedcrag-e0-closeout"
+    instance["zone"] = instance["zone"].rsplit("/", 1)[0] + "/" + zone
+    env = {
+        "POST_E0_INSTANCE": "thesis-fedcrag-e0-closeout",
+        "POST_E0_EXPECTED_SOURCE_SNAPSHOT": "fedcrag-e0-closeout-20260827",
+        "FAKE_DISCOVERY_NAME": "thesis-fedcrag-e0-closeout",
+        "FAKE_INSTANCE_DESCRIPTOR": json.dumps(instance),
+    }
+    if matches is not None:
+        env["FAKE_CLONE_MATCH_ZONES"] = matches
+    return env
+
+
+def assert_authorized_clone_stopped(closeout_env, *zones):
+    calls = cloud_calls(closeout_env)
+    for zone in zones:
+        assert any("instances stop thesis-fedcrag-e0-closeout" in call and f"--zone {zone}" in call
+                   for call in calls)
+        assert any("instances describe thesis-fedcrag-e0-closeout" in call
+                   and f"--zone {zone}" in call and "--format=value(status)" in call
+                   for call in calls)
+
+
+@pytest.mark.parametrize("extra", [
+    {"POST_E0_INSTANCE": "another-clone", "POST_E0_EXPECTED_SOURCE_SNAPSHOT": "fedcrag-e0-closeout-20260827"},
+    {"POST_E0_INSTANCE": "thesis-fedcrag-e0-closeout", "POST_E0_EXPECTED_SOURCE_SNAPSHOT": "fedcrag-w1-paused"},
+])
+def test_only_the_approved_clone_identity_is_accepted_before_cloud(closeout_env, extra):
+    completed = run_driver(closeout_env, **extra)
+    assert completed.returncode == 2
+    assert cloud_calls(closeout_env) == []
+
+
+def test_clone_ambiguous_discovery_stops_every_authorized_exact_match(closeout_env):
+    completed = run_driver(
+        closeout_env,
+        **approved_clone_env(closeout_env, matches="asia-southeast1-a,asia-southeast1-b"),
+        FAKE_DISCOVERY_ROWS=("thesis-fedcrag-e0-closeout,asia-southeast1-a\n"
+                             "thesis-fedcrag-e0-closeout,asia-southeast1-b"),
+        FAKE_STATUSES="TERMINATED,TERMINATED",
+    )
+    assert completed.returncode == 4
+    assert_not_published(closeout_env)
+    assert_authorized_clone_stopped(closeout_env, "asia-southeast1-a", "asia-southeast1-b")
+
+
+def test_clone_discovery_failure_stops_every_authorized_exact_match(closeout_env):
+    completed = run_driver(
+        closeout_env,
+        **approved_clone_env(closeout_env, matches="asia-southeast1-a,asia-southeast1-c"),
+        FAKE_LIST_FAIL="1", FAKE_STATUSES="TERMINATED,TERMINATED",
+    )
+    assert completed.returncode == 3
+    assert_not_published(closeout_env)
+    assert_authorized_clone_stopped(closeout_env, "asia-southeast1-a", "asia-southeast1-c")
+
+
+@pytest.mark.parametrize("discovery_zone, descriptor_zone", [
+    ("us-central1-a", "asia-southeast1-a"),
+    ("asia-southeast1-a", "us-central1-a"),
+])
+def test_clone_rejects_unapproved_discovery_or_descriptor_zone_and_stops(closeout_env, discovery_zone, descriptor_zone):
+    completed = run_driver(
+        closeout_env,
+        **approved_clone_env(closeout_env, zone=descriptor_zone, matches="asia-southeast1-a"),
+        FAKE_ZONES=discovery_zone,
+        FAKE_STATUSES="TERMINATED",
+    )
+    assert completed.returncode in (4, 20)
+    assert_not_published(closeout_env)
+    assert_authorized_clone_stopped(closeout_env, "asia-southeast1-a")
+
+
 def test_nondefault_instance_is_used_for_every_cloud_operation(closeout_env):
     completed = run_driver(
         closeout_env,
-        POST_E0_INSTANCE="thesis-fedcrag-e0-closeout",
-        POST_E0_EXPECTED_SOURCE_SNAPSHOT="fedcrag-e0-closeout-20260827",
-        FAKE_DISCOVERY_NAME="thesis-fedcrag-e0-closeout",
-        FAKE_INSTANCE_DESCRIPTOR=json.dumps({
-            **json.loads(closeout_env["env"]["FAKE_INSTANCE_DESCRIPTOR"]),
-            "name": "thesis-fedcrag-e0-closeout",
-        }),
+        **approved_clone_env(closeout_env, matches="asia-southeast1-a"),
+        FAKE_ZONES="asia-southeast1-a",
         FAKE_STATUSES="RUNNING,TERMINATED",
     )
     assert completed.returncode == 0, completed.stderr
@@ -343,7 +441,7 @@ def test_nondefault_instance_requires_expected_snapshot(closeout_env):
 
 @pytest.mark.parametrize("mutation", [
     "wrong-name", "machine-type", "l4-type", "l4-count", "provisioning", "boot-disk",
-    "disk-size", "disk-type", "disk-status", "source-snapshot",
+    "boot-autodelete", "disk-size", "disk-type", "disk-status", "source-snapshot",
 ])
 def test_target_configuration_descriptor_mutations_refuse_and_stop(closeout_env, mutation):
     completed = run_driver(
@@ -368,6 +466,8 @@ def test_target_configuration_failed_descriptor_refuses_and_stops(closeout_env, 
         POST_E0_INSTANCE="thesis-fedcrag-e0-closeout",
         POST_E0_EXPECTED_SOURCE_SNAPSHOT="fedcrag-e0-closeout-20260827",
         FAKE_DISCOVERY_NAME="thesis-fedcrag-e0-closeout",
+        FAKE_ZONES="asia-southeast1-a",
+        FAKE_CLONE_MATCH_ZONES="asia-southeast1-a",
         FAKE_STATUSES="RUNNING,TERMINATED",
         **failure,
     )
@@ -377,14 +477,14 @@ def test_target_configuration_failed_descriptor_refuses_and_stops(closeout_env, 
 def test_target_configuration_ambiguous_exact_name_discovery_refuses_before_vm_activity(closeout_env):
     completed = run_driver(
         closeout_env,
-        POST_E0_INSTANCE="thesis-fedcrag-e0-closeout",
-        POST_E0_EXPECTED_SOURCE_SNAPSHOT="fedcrag-e0-closeout-20260827",
-        FAKE_DISCOVERY_ROWS="thesis-fedcrag-e0-closeout,zone-e0\nthesis-fedcrag-e0-closeout,zone-e1",
+        **approved_clone_env(closeout_env, matches="asia-southeast1-a,asia-southeast1-b"),
+        FAKE_DISCOVERY_ROWS="thesis-fedcrag-e0-closeout,asia-southeast1-a\nthesis-fedcrag-e0-closeout,asia-southeast1-b",
+        FAKE_STATUSES="TERMINATED,TERMINATED",
     )
     assert completed.returncode == 4
     assert_not_published(closeout_env)
-    assert not any("instances start" in call or "instances stop" in call
-                   for call in cloud_calls(closeout_env))
+    assert not any("instances start" in call for call in cloud_calls(closeout_env))
+    assert_authorized_clone_stopped(closeout_env, "asia-southeast1-a", "asia-southeast1-b")
 
 
 def test_records_workspace_bash_and_requires_bash_32_syntax(closeout_env):

@@ -9,6 +9,8 @@ set -u
 set -o pipefail
 
 readonly DEFAULT_INSTANCE=thesis-fedcrag
+readonly APPROVED_CLONE_INSTANCE=thesis-fedcrag-e0-closeout
+readonly APPROVED_CLONE_SNAPSHOT=fedcrag-e0-closeout-20260827
 INSTANCE=${POST_E0_INSTANCE-$DEFAULT_INSTANCE}
 case "$INSTANCE" in
     ''|*[!a-z0-9-]*|-*|*-) printf '%s\n' "invalid POST_E0_INSTANCE" >&2; exit 2 ;;
@@ -22,6 +24,11 @@ readonly INSTANCE
 EXPECTED_SOURCE_SNAPSHOT=${POST_E0_EXPECTED_SOURCE_SNAPSHOT:-}
 if [ "$INSTANCE" != "$DEFAULT_INSTANCE" ] && [ -z "$EXPECTED_SOURCE_SNAPSHOT" ]; then
     printf '%s\n' "non-default instance requires POST_E0_EXPECTED_SOURCE_SNAPSHOT" >&2
+    exit 2
+fi
+if [ "$INSTANCE" != "$DEFAULT_INSTANCE" ] && \
+    { [ "$INSTANCE" != "$APPROVED_CLONE_INSTANCE" ] || [ "$EXPECTED_SOURCE_SNAPSHOT" != "$APPROVED_CLONE_SNAPSHOT" ]; }; then
+    printf '%s\n' "POST_E0_INSTANCE and POST_E0_EXPECTED_SOURCE_SNAPSHOT are not an approved clone identity" >&2
     exit 2
 fi
 REMOTE_ARTIFACT_ROOT=/home/turjo/FedCRAG_E0_RESULTS
@@ -59,6 +66,7 @@ ATTEMPT=
 E0_PROJECT=
 E0_ZONE=
 CLEANUP_ARMED=0
+CLONE_CLEANUP_ARMED=0
 CLEANUP_DONE=0
 VM_TOUCHED=0
 PUBLICATION_LOCK=
@@ -220,10 +228,71 @@ ensure_terminated() {
     return 1
 }
 
+is_approved_clone_zone() {
+    case "$1" in asia-southeast1-a|asia-southeast1-b|asia-southeast1-c) return 0 ;; esac
+    return 1
+}
+
+get_status_in_zone() {
+    local zone=$1 output status
+    output=$(gcloud compute instances describe "$APPROVED_CLONE_INSTANCE" --project "$E0_PROJECT" \
+        --zone "$zone" --format='value(status)')
+    status=$?
+    [ "$status" -eq 0 ] || return 1
+    case "$output" in RUNNING|TERMINATED) printf '%s\n' "$output" ;; *) return 1 ;; esac
+}
+
+ensure_terminated_in_zone() {
+    local zone=$1 attempt status
+    attempt=1
+    while [ "$attempt" -le "$RETRY_LIMIT" ]; do
+        gcloud compute instances stop "$APPROVED_CLONE_INSTANCE" --project "$E0_PROJECT" \
+            --zone "$zone" --quiet >/dev/null 2>&1 || return 1
+        status=$(get_status_in_zone "$zone") || return 1
+        [ "$status" = TERMINATED ] && return 0
+        attempt=$((attempt + 1))
+        [ "$attempt" -le "$RETRY_LIMIT" ] && sleep "$RETRY_SLEEP"
+    done
+    return 1
+}
+
+approved_clone_exists_in_zone() {
+    local zone=$1 output status name found_zone
+    output=$(gcloud compute instances list --project "$E0_PROJECT" --zones "$zone" \
+        --filter="name=$APPROVED_CLONE_INSTANCE" --format='csv[no-heading](name,zone.basename())')
+    status=$?
+    [ "$status" -eq 0 ] || return 2
+    while IFS=, read -r name found_zone; do
+        [ "$name" = "$APPROVED_CLONE_INSTANCE" ] && [ "$found_zone" = "$zone" ] && return 0
+    done <<EOF
+$output
+EOF
+    return 1
+}
+
+ensure_approved_clone_terminated() {
+    local zone result
+    for zone in asia-southeast1-a asia-southeast1-b asia-southeast1-c; do
+        approved_clone_exists_in_zone "$zone"
+        result=$?
+        [ "$result" -eq 1 ] && continue
+        [ "$result" -eq 0 ] || return 1
+        ensure_terminated_in_zone "$zone" || return 1
+    done
+}
+
 cleanup() {
     local original=$?
     trap - EXIT INT TERM
-    if [ "$CLEANUP_ARMED" -eq 1 ] && [ "$CLEANUP_DONE" -eq 0 ]; then
+    if [ "$CLONE_CLEANUP_ARMED" -eq 1 ] && [ "$CLEANUP_DONE" -eq 0 ]; then
+        if ensure_approved_clone_terminated; then
+            CLEANUP_DONE=1
+        else
+            say "CRITICAL: approved clone termination could not be verified"
+            preserve_attempt
+            exit "$CRITICAL_SHUTDOWN"
+        fi
+    elif [ "$CLEANUP_ARMED" -eq 1 ] && [ "$CLEANUP_DONE" -eq 0 ]; then
         if ensure_terminated; then
             CLEANUP_DONE=1
         else
@@ -257,12 +326,16 @@ require_clean_worktree() {
         fail "worktree is not clean" 2
 }
 
-discover_target() {
-    local discovery_status project_status name zone
+discover_project() {
+    local project_status
     E0_PROJECT="$(gcloud config get-value project)"
     project_status=$?
     [ "$project_status" -eq 0 ] || return 3
     [ -n "$E0_PROJECT" ] && [ "$E0_PROJECT" != "(unset)" ] || return 4
+}
+
+discover_target() {
+    local discovery_status name zone
 
     # Deliberately capture the command status before interpreting stdout.
     E0_ZONE_OUTPUT="$(gcloud compute instances list --project "$E0_PROJECT" \
@@ -271,8 +344,11 @@ discover_target() {
     [ "$discovery_status" -eq 0 ] || return 3
     E0_ZONES=()
     while IFS=, read -r name zone; do
-        [ "$name" = "$INSTANCE" ] && [ -n "$zone" ] && \
-            E0_ZONES[${#E0_ZONES[@]}]="$zone"
+        [ "$name" = "$INSTANCE" ] && [ -n "$zone" ] || continue
+        if [ "$INSTANCE" = "$APPROVED_CLONE_INSTANCE" ] && ! is_approved_clone_zone "$zone"; then
+            return 4
+        fi
+        E0_ZONES[${#E0_ZONES[@]}]="$zone"
     done <<EOF
 $E0_ZONE_OUTPUT
 EOF
@@ -298,6 +374,8 @@ def basename(value):
 
 if data.get("name") != instance or basename(data.get("zone")) != zone:
     raise SystemExit("target instance name or zone does not match discovery")
+if instance == "thesis-fedcrag-e0-closeout" and zone not in {"asia-southeast1-a", "asia-southeast1-b", "asia-southeast1-c"}:
+    raise SystemExit("approved clone is not in an approved Singapore zone")
 if basename(data.get("machineType")) != "g2-standard-8":
     raise SystemExit("target instance machine type is not g2-standard-8")
 accelerators = data.get("guestAccelerators")
@@ -310,7 +388,7 @@ if data.get("scheduling", {}).get("provisioningModel") != "STANDARD":
     raise SystemExit("target instance provisioning model is not STANDARD")
 disks = data.get("disks")
 boot_disks = [item for item in disks if isinstance(item, dict) and item.get("boot") is True and item.get("type") == "PERSISTENT"] if isinstance(disks, list) else []
-if len(boot_disks) != 1:
+if len(boot_disks) != 1 or boot_disks[0].get("autoDelete") is not False:
     raise SystemExit("target instance does not have one persistent boot disk")
 print(basename(boot_disks[0].get("source")))
 PY
@@ -727,6 +805,26 @@ PY
 main() {
     local discovery_code before after
     require_clean_worktree
+    discover_project
+    discovery_code=$?
+    if [ "$discovery_code" -ne 0 ]; then
+        preserve_preflight_failure "project discovery failed"
+        exit "$discovery_code"
+    fi
+
+    if [ "$INSTANCE" = "$APPROVED_CLONE_INSTANCE" ]; then
+        trap cleanup EXIT
+        trap on_signal INT TERM
+        [ ! -e "$DEST" ] && [ ! -L "$DEST" ] || fail "canonical destination already exists" 5
+        mkdir -p "$(dirname "$DEST")" || fail "cannot create preservation parent"
+        acquire_publication_lock || fail "cannot reserve sibling publication lock" 5
+        create_attempt || fail "cannot create exclusive attempt"
+        CLONE_CLEANUP_ARMED=1
+        discover_target
+        discovery_code=$?
+        [ "$discovery_code" -eq 0 ] || fail "project/zone discovery failed" "$discovery_code"
+        CLEANUP_ARMED=1
+    else
     discover_target
     discovery_code=$?
     if [ "$discovery_code" -ne 0 ]; then
@@ -740,6 +838,7 @@ main() {
     acquire_publication_lock || fail "cannot reserve sibling publication lock" 5
     create_attempt || fail "cannot create exclusive attempt"
     CLEANUP_ARMED=1
+    fi
     capture_and_verify_target || fail "target configuration descriptor gate failed"
 
     before=$(get_status) || fail "initial VM status query was malformed or failed"

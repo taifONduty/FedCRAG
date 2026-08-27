@@ -2611,9 +2611,13 @@ def validate_run_directory(run_directory, manifest_row=None,
         installed_torch = runtime["installed_packages"].get("torch")
         _require(isinstance(installed_torch, str) and bool(installed_torch),
                  "runtime provenance has no installed torch package version")
-        _require(resources.get("torch_version") == installed_torch,
+        resource_torch = resources.get("torch_version")
+        _require(isinstance(resource_torch, str) and bool(resource_torch),
+                 "resource record has no torch_version")
+        _require(resource_torch.split("+", 1)[0]
+                 == installed_torch.split("+", 1)[0],
                  "resource torch_version differs from runtime provenance "
-                 "installed torch package")
+                 "installed torch package (ignoring a PEP 440 local build tag)")
     elif result["lora_mode"] == "frozen-a":
         provenance = result.get("provenance") or {}
         recorded_fingerprints = provenance.get("data_sha256")

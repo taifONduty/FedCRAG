@@ -2318,6 +2318,21 @@ def test_resource_torch_version_binds_to_runtime_package(
         validate_run_directory(tmp_path, manifest_row=manifest_row(tmp_path))
 
 
+def test_resource_torch_version_accepts_cuda_local_build_tag(
+        monkeypatch, tmp_path):
+    _, result_path = build_run(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin")
+    write_resource_record(tmp_path)
+    result = json.loads(result_path.read_text())
+    installed = result["provenance"]["installed_packages"]["torch"]
+    resource = tmp_path / "e0_resources.json"
+    record = json.loads(resource.read_text())
+    record["torch_version"] = installed.split("+", 1)[0] + "+cu130"
+    resource.write_text(json.dumps(record))
+
+    validate_run_directory(tmp_path, manifest_row=manifest_row(tmp_path))
+
+
 @pytest.mark.parametrize(
     "field_path",
     ["python", "platform", "model.requested_name", "model.resolved_path"],

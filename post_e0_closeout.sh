@@ -380,9 +380,9 @@ def basename(value):
 if data.get("name") != instance or basename(data.get("zone")) != zone:
     raise SystemExit("target instance name or zone does not match discovery")
 if instance == "thesis-fedcrag-e0-closeout" and zone not in {"asia-southeast1-a", "asia-southeast1-b", "asia-southeast1-c", "asia-east1-a", "asia-east1-b", "asia-east1-c", "asia-northeast1-a", "asia-northeast1-b", "asia-northeast1-c", "asia-northeast3-a", "asia-northeast3-b"}:
-    raise SystemExit("approved clone is not in an approved Singapore zone")
-if basename(data.get("machineType")) != "g2-standard-8":
-    raise SystemExit("target instance machine type is not g2-standard-8")
+    raise SystemExit("approved clone is not in an approved L4 zone")
+if basename(data.get("machineType")) not in {"g2-standard-4", "g2-standard-8", "g2-standard-12"}:
+    raise SystemExit("target instance is not an approved single-L4 G2 shape")
 accelerators = data.get("guestAccelerators")
 if not isinstance(accelerators, list) or len(accelerators) != 1:
     raise SystemExit("target instance does not have one L4 accelerator")

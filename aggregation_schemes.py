@@ -803,6 +803,108 @@ def _effective_vector_sha256(blocks):
     return digest.hexdigest()
 
 
+def minnorm_exact_weights(cosine, feasibility_tol=1e-9):
+    """Exact minimiser of w^T C w over the simplex, by face enumeration.
+
+    At deployment scale (K <= 10) the 2^K - 1 faces are cheap to enumerate, so
+    the direction can be solved exactly and no iterative-convergence caveat
+    survives. On each face S the stationarity and normalisation conditions are
+    solved together as the augmented KKT system
+
+        [ 2 C_S  -1 ] [ w_S ]   [ 0 ]
+        [   1^T   0 ] [  mu ] = [ 1 ]
+
+    in a least-squares sense, which stays correct when C_S is singular. The
+    common ``C_S w = 1`` shortcut is deliberately avoided: it silently drops
+    faces whose restricted Gram has a zero eigenvalue, exactly the clone and
+    near-cancellation geometries this project cares about.
+
+    Returns ``(w, value)`` with ``value = sqrt(min_w w^T C w)`` — the attainable
+    worst-case cosine of the normalised mixture (Theorem: min-norm duality).
+    """
+    C = np.asarray(cosine, dtype=np.float64)
+    K = C.shape[0]
+    best_w, best_val = None, math.inf
+    for mask in range(1, 1 << K):
+        support = [i for i in range(K) if (mask >> i) & 1]
+        m = len(support)
+        Cs = C[np.ix_(support, support)]
+        system = np.zeros((m + 1, m + 1), dtype=np.float64)
+        system[:m, :m] = 2.0 * Cs
+        system[:m, m] = -1.0
+        system[m, :m] = 1.0
+        rhs = np.zeros(m + 1, dtype=np.float64)
+        rhs[m] = 1.0
+        solution, *_ = np.linalg.lstsq(system, rhs, rcond=None)
+        if not np.all(np.isfinite(solution)):
+            continue
+        if np.linalg.norm(system @ solution - rhs) > feasibility_tol:
+            continue                      # no stationary point on this face
+        w_s = solution[:m]
+        if w_s.min() < -feasibility_tol:
+            continue                      # leaves the simplex; a sub-face wins
+        w_s = np.clip(w_s, 0.0, None)
+        total = w_s.sum()
+        if total <= 0:
+            continue
+        w_s = w_s / total
+        value = float(w_s @ Cs @ w_s)
+        if value < best_val:
+            candidate = np.zeros(K, dtype=np.float64)
+            candidate[support] = w_s
+            best_val, best_w = value, candidate
+    if best_w is None:                    # unreachable for a PSD Gram
+        best_w = np.ones(K, dtype=np.float64) / K
+        best_val = float(best_w @ C @ best_w)
+    return best_w, float(math.sqrt(max(best_val, 0.0)))
+
+
+def wolfe_certificate(cosine, weights):
+    """Max violation of the optimality condition (C w)_j >= w^T C w.
+
+    Zero (to numerical tolerance) certifies that ``weights`` minimises
+    w^T C w over the simplex, independently of which solver produced it.
+    Behaviour-neutral: intended to be logged alongside any solved round.
+    """
+    C = np.asarray(cosine, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64)
+    value = float(w @ C @ w)
+    return float(max(0.0, np.max(value - C @ w)))
+
+
+def craft_delta_coefficients(cosine, targets, reference=None):
+    """CRAFT-style equality projection (arXiv:2605.21317), in coefficient space.
+
+    Baseline arm, not this project's method. CRAFT prescribes the alignment
+    profile and projects a reference direction onto the equality constraints:
+
+        min ||g - g_hat||^2  s.t.  U g = rho        (their Eq. 4.3)
+        g = g_hat + U^+ (rho - U g_hat)             (their Eq. 4.5)
+
+    Writing g = sum_k v_k u_k and g_hat = sum_k a_k u_k, both U g = C v and
+    U^+ act in coefficient space through the pseudo-inverse of the Gram, so
+    the closed form becomes v = a + C^+ (rho - C a).
+
+    DEVIATION, recorded deliberately: their reference (Eq. 4.6) is the previous
+    round's normalised global update, which is not expressible in the current
+    round's client span; we use the uniform mixture of the current directions
+    unless a reference coefficient vector is supplied. The differentiator this
+    arm exists to measure — a prescribed data-proportional profile versus an
+    endogenously maximised one — does not depend on that choice.
+    """
+    C = np.asarray(cosine, dtype=np.float64)
+    K = C.shape[0]
+    rho = np.asarray(targets, dtype=np.float64)
+    if rho.shape != (K,):
+        raise ValueError("targets must supply one alignment per client")
+    a = (np.ones(K, dtype=np.float64) / K if reference is None
+         else np.asarray(reference, dtype=np.float64))
+    if a.shape != (K,):
+        raise ValueError("reference must supply one coefficient per client")
+    correction = np.linalg.pinv(C) @ (rho - C @ a)
+    return a + correction
+
+
 def fedspan_delta_weights(client_states, broadcast_state, module_scales,
                           step_norm=None, step_policy="fixed",
                           direction_policy=None,

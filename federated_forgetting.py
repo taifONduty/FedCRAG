@@ -16,6 +16,7 @@ from peft import (LoraConfig, TaskType,
 from fedcrag_common import (load_slice_with_train, doc_text, resolve_local,
                             evaluate_metrics, check_lora_targets, LORA_TARGETS,
                             amp_enabled, get_git_commit)
+import e3_shard
 
 
 def get_adapter_state(model):
@@ -207,6 +208,40 @@ def _runtime_provenance(commit, requested_model, model_path, model,
     }
 
 
+def assert_unique_slices(slices):
+    """Every client must name a distinct dataset slice.
+
+    ``data`` is a dict keyed by slice name while the round loop iterates the
+    ``--slices`` list, so a repeated name silently builds one client per list
+    entry from one loaded payload: more clients than datasets, several holding
+    bit-identical data, and one provenance fingerprint per distinct name
+    instead of per client. That is a different experiment, and nothing in the
+    output would say so.
+    """
+    seen = set()
+    repeated = []
+    for name in slices:
+        if name in seen and name not in repeated:
+            repeated.append(name)
+        seen.add(name)
+    if repeated:
+        raise ValueError(
+            "--slices names must be distinct; repeated: "
+            + ", ".join(sorted(repeated)))
+
+
+def assert_data_matches_slices(data, slices):
+    """One loaded payload per requested client, checked before training."""
+    if len(data) != len(slices):
+        raise ValueError(
+            f"expected one payload per slice ({len(slices)}), loaded "
+            f"{len(data)}")
+    missing = [name for name in slices if name not in data]
+    if missing:
+        raise ValueError(
+            "slices without a loaded payload: " + ", ".join(missing))
+
+
 def _frozen_run_configuration_sha256(args, data_sha256=None, row_scale=None):
     """Hash every result-affecting option for collision-safe frozen-A runs.
 
@@ -243,6 +278,24 @@ def _frozen_run_configuration_sha256(args, data_sha256=None, row_scale=None):
             args, "allow_dirty_provenance", False),
         "data_sha256": data_sha256,
     }
+    if getattr(args, "shard_spec", None):
+        # Added only for a sharded run, so an unsharded configuration keeps
+        # the hash, and therefore the output filename, it already has. The
+        # split itself is already in data_sha256; these bind the cap vector,
+        # the seed and the sharder's own code identity.
+        fields["shard_spec"] = list(args.shard_spec)
+        fields["shard_seed"] = args.shard_seed
+        fields["conserve_shard_steps"] = bool(args.conserve_shard_steps)
+        fields["shard_manifest_sha256"] = getattr(
+            args, "shard_manifest_sha256", None)
+    fixed_weights = getattr(args, "fedspan_fixed_weights", None)
+    if fixed_weights is not None:
+        # Added only when supplied, so runs that cannot use fixed weights keep
+        # the hash — and therefore the output filename — they already have.
+        # Two fixed-weight arms differ in nothing else, so without this they
+        # would overwrite each other.
+        fields["fedspan_fixed_weights"] = [float(value)
+                                           for value in fixed_weights]
     encoded = json.dumps(
         fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -437,15 +490,37 @@ def main():
                     help="explicit true effective-B step policy required for "
                          "--weight_by normmaxmin")
     ap.add_argument("--fedspan_direction_policy",
-                    choices=["minnorm", "maxmin-lp"], default=None,
+                    choices=["minnorm", "maxmin-lp", "exact", "fixed"],
+                    default=None,
                     help="explicit direction solver required for --weight_by "
                          "normmaxmin. 'minnorm' maximizes the worst-case "
                          "cosine of the direction actually applied (the "
                          "normalized mixture) and equals FedMGDA+ "
-                         "(arXiv:2006.11489) at epsilon=1 on the cosine Gram; "
-                         "'maxmin-lp' is the historical LP, whose objective is "
-                         "not the applied quantity, retained as a recorded "
-                         "ablation. Both values are measured every round")
+                         "(arXiv:2006.11489) at epsilon=1 on the cosine Gram, "
+                         "solved by away-step Frank-Wolfe; 'exact' solves the "
+                         "same problem by face enumeration with a declared "
+                         "minimum-norm tie-break, so no convergence caveat "
+                         "survives and the weight vector does not depend on "
+                         "the iterate path; 'maxmin-lp' is the historical LP, "
+                         "whose objective is not the applied quantity, "
+                         "retained as a recorded ablation; 'fixed' skips the "
+                         "solve and applies --fedspan_fixed_weights through "
+                         "the identical coefficient rule, step policy and "
+                         "gates. The attainable optimum and the Wolfe "
+                         "optimality certificate are measured every round for "
+                         "every policy")
+    ap.add_argument("--fedspan_fixed_weights", nargs="+", type=float,
+                    default=None,
+                    help="one nonnegative direction weight per slice, in "
+                         "--slices order, required by and legal only with "
+                         "--fedspan_direction_policy fixed. They are "
+                         "restricted to the active clients and renormalized, "
+                         "then applied through the same c_k = s w_k / (r_k "
+                         "||w||_C) rule as a solved arm, so a fixed arm is "
+                         "step- and norm-matched to FedSpan and differs from "
+                         "it only in w. Norm-equalised uniform is 1/K per "
+                         "client; a two-distribution oracle over three clones "
+                         "and one singleton is 1/6 1/6 1/6 1/2")
     ap.add_argument("--fedspan_step_norm", type=float, default=None,
                     help="positive finite true effective-B step norm s, "
                          "required only with --fedspan_step_policy fixed")
@@ -472,12 +547,65 @@ def main():
     ap.add_argument("--max_steps_per_round", type=int, default=0,
                     help="cap on local optimization steps per client per round "
                          "(0 = full epoch, the May-pilot convention)")
+    ap.add_argument("--shard_spec", nargs="+", default=None,
+                    metavar="PARENT:N",
+                    help="split a named --slices client into N sub-silos "
+                         "drawn from its own distribution, e.g. 'nfcorpus:3'. "
+                         "Training and evaluation queries are partitioned "
+                         "independently at query granularity, balanced on the "
+                         "training-pair count; the retrieval corpus is shared "
+                         "by all of a parent's sub-silos, so each one is "
+                         "scored on its own queries over the index its parent "
+                         "served. --slices keeps naming parents; the expanded "
+                         "client list is PARENT-s0..PARENT-s{N-1}")
+    ap.add_argument("--shard_seed", type=int, default=None,
+                    help="seed for the sub-silo partition, legal only with "
+                         "--shard_spec (default 42). It enters through the "
+                         "assignment tie-break, so distinct seeds give "
+                         "essentially independent partitions of the same "
+                         "parent")
+    ap.add_argument("--conserve_shard_steps", action="store_true",
+                    help="derive each sub-silo's step cap from its parent's, "
+                         "so the caps sum to the parent cap and splitting a "
+                         "client does not multiply its per-round optimization "
+                         "work. Required whenever --shard_spec is combined "
+                         "with --max_steps_per_round")
+    ap.add_argument("--shard_manifest_out", default=None,
+                    help="where to write the sharding manifest, legal only "
+                         "with --shard_spec (default: <out>/shard_manifest_"
+                         "<12 hex>.json). Written and fsynced before the "
+                         "first gradient step")
     ap.add_argument("--no_grad_ckpt", action="store_true",
                     help="disable gradient checkpointing (faster when VRAM "
                          "allows; no effect on results)")
     ap.add_argument("--data_root", default="./beir_data")
     ap.add_argument("--out", default="./results")
     args = ap.parse_args()
+
+    shard_spec = {}
+    if args.shard_spec:
+        try:
+            shard_spec = e3_shard.parse_shard_spec(args.shard_spec,
+                                                   args.slices)
+        except e3_shard.ShardingError as exc:
+            ap.error(str(exc))
+        if args.max_steps_per_round > 0 and not args.conserve_shard_steps:
+            ap.error(
+                "--shard_spec with --max_steps_per_round requires "
+                "--conserve_shard_steps: otherwise every sub-silo runs its "
+                "parent's own cap and that distribution's per-round "
+                "optimization work is multiplied by the number of sub-silos, "
+                "confounding aggregation mass with local work")
+    else:
+        for option, value in (("--shard_seed", args.shard_seed),
+                              ("--conserve_shard_steps",
+                               args.conserve_shard_steps or None),
+                              ("--shard_manifest_out",
+                               args.shard_manifest_out)):
+            if value is not None:
+                ap.error(f"{option} is legal only with --shard_spec")
+    shard_seed = 42 if args.shard_seed is None else args.shard_seed
+    n_clients = len(args.slices) - len(shard_spec) + sum(shard_spec.values())
 
     canonical_weight_by = ("rawmaxmin" if args.weight_by == "maxmin"
                            else args.weight_by)
@@ -498,6 +626,26 @@ def main():
         if args.fedspan_direction_policy is None:
             ap.error("--weight_by normmaxmin requires "
                      "--fedspan_direction_policy")
+        if args.fedspan_direction_policy == "fixed":
+            if args.fedspan_fixed_weights is None:
+                ap.error("--fedspan_direction_policy fixed requires "
+                         "--fedspan_fixed_weights")
+            if len(args.fedspan_fixed_weights) != n_clients:
+                # Post-sharding client count: --slices names parents, and a
+                # direction weight is per client.
+                ap.error("--fedspan_fixed_weights must supply one weight per "
+                         f"slice ({n_clients}), got "
+                         f"{len(args.fedspan_fixed_weights)}")
+            if not all(np.isfinite(value)
+                       for value in args.fedspan_fixed_weights):
+                ap.error("--fedspan_fixed_weights must be finite")
+            if any(value < 0 for value in args.fedspan_fixed_weights):
+                ap.error("--fedspan_fixed_weights must be nonnegative")
+            if sum(args.fedspan_fixed_weights) <= 0:
+                ap.error("--fedspan_fixed_weights must carry positive mass")
+        elif args.fedspan_fixed_weights is not None:
+            ap.error("--fedspan_fixed_weights is legal only with "
+                     "--fedspan_direction_policy fixed")
         if args.fedspan_step_policy == "fixed":
             if (args.fedspan_step_norm is None
                     or not np.isfinite(args.fedspan_step_norm)
@@ -525,6 +673,13 @@ def main():
     elif args.fedspan_direction_policy is not None:
         ap.error("--fedspan_direction_policy is legal only with "
                  "--weight_by normmaxmin")
+    elif args.fedspan_fixed_weights is not None:
+        ap.error("--fedspan_fixed_weights is legal only with "
+                 "--fedspan_direction_policy fixed")
+    try:
+        assert_unique_slices(args.slices)
+    except ValueError as exc:
+        ap.error(str(exc))
     if args.frozen_a_row_scale is not None and args.lora_mode != "frozen-a":
         ap.error("--frozen_a_row_scale is legal only with "
                  "--lora_mode frozen-a")
@@ -549,6 +704,41 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     data = {s: load_slice_with_train(s, args.data_root) for s in args.slices}
+    assert_data_matches_slices(data, args.slices)
+    # Sharding is applied here, between the load and the fingerprint, so the
+    # data fingerprints and therefore the collision-safe configuration hash in
+    # the output filename describe the sharded federation rather than its
+    # parents. Everything downstream reads the expanded client list.
+    shard_manifest = None
+    shard_manifest_path = None
+    step_caps = {s: args.max_steps_per_round for s in args.slices}
+    if shard_spec:
+        try:
+            federation = e3_shard.build_sharded_federation(
+                data, args.slices, shard_spec, shard_seed=shard_seed,
+                batch_size=args.batch_size,
+                parent_max_steps_per_round=args.max_steps_per_round,
+                conserve_shard_steps=args.conserve_shard_steps,
+                fingerprint=lambda payload: _data_fingerprints(
+                    {"payload": payload})["payload"])
+        except e3_shard.ShardingError as exc:
+            ap.error(str(exc))
+        data = federation.data
+        step_caps = federation.step_caps
+        shard_manifest = federation.manifest
+        args = argparse.Namespace(**{
+            **vars(args),
+            "slices": list(federation.slices),
+            "shard_seed": shard_seed,
+            "shard_manifest_sha256": shard_manifest["manifest_sha256"]})
+        assert_data_matches_slices(data, args.slices)
+        shard_manifest_path = args.shard_manifest_out or os.path.join(
+            args.out,
+            f"shard_manifest_{shard_manifest['manifest_sha256'][:12]}.json")
+        e3_shard.write_manifest(shard_manifest, shard_manifest_path)
+        print(f"  sharded federation: {federation.slices} "
+              f"caps={[step_caps[s] for s in federation.slices]} -> "
+              f"{shard_manifest_path}")
     data_sha256 = _data_fingerprints(data)
     model_path, q_prefix, d_prefix, fp16 = resolve_local(args.model)
 
@@ -573,6 +763,12 @@ def main():
         else:
             step_tag = "median-active"
         basis += f"-s{step_tag}-dir{args.fedspan_direction_policy}"
+    if shard_manifest is not None:
+        # Historical filenames never carry this: only a sharded run has a
+        # manifest. Without it a sharded trainable-A+B run and its unsharded
+        # counterpart write the same path, and the second silently replaces
+        # a different experiment's results.
+        basis += f"-shard{shard_manifest['manifest_sha256'][:12]}"
     frozen_config_sha256 = None
     if args.lora_mode == "frozen-a":
         frozen_config_sha256 = _frozen_run_configuration_sha256(
@@ -609,6 +805,7 @@ def main():
                "fedspan_step_policy": args.fedspan_step_policy,
                "fedspan_step_norm": args.fedspan_step_norm,
                "fedspan_direction_policy": args.fedspan_direction_policy,
+               "fedspan_fixed_weights": args.fedspan_fixed_weights,
                "dirty_provenance_override": args.allow_dirty_provenance,
                "initial_adapter_state_sha256": state_dict_sha256(global_state),
                "frozen_a_diagnostics": (
@@ -620,6 +817,9 @@ def main():
                commit, args.model, model_path, model, module_scales,
                args.data_root, data_sha256),
            "args": vars(args), "clients": {}, "R_matrix": {}, "BWT": None}
+    if shard_manifest is not None:
+        out["shard_manifest"] = shard_manifest
+        out["shard_manifest_path"] = shard_manifest_path
     R = out["R_matrix"]
 
     R["frozen"] = eval_global(model, global_state, data, args.slices,
@@ -654,7 +854,7 @@ def main():
                                              q_prefix, d_prefix,
                                              args.local_epochs,
                                              args.batch_size, args.lr, name=s,
-                                             max_steps=args.max_steps_per_round)
+                                             max_steps=step_caps[s])
             states.append(st)
             n_examples.append(n_ex)
             client_stats[s] = {"num_examples": n_ex, "num_steps": n_steps}
@@ -701,6 +901,7 @@ def main():
                 step_norm=args.fedspan_step_norm,
                 step_policy=args.fedspan_step_policy,
                 direction_policy=args.fedspan_direction_policy,
+                fixed_weights=args.fedspan_fixed_weights,
                 active_abs_tol=args.fedspan_active_abs_tol,
                 active_rel_tol=args.fedspan_active_rel_tol,
                 mixture_norm_tol=args.fedspan_mixture_norm_tol,
@@ -720,7 +921,9 @@ def main():
             print(f"  normmaxmin direction={fedspan['direction_policy']} "
                   f"achieved={fedspan['achieved_min_direction_cosine']} "
                   f"optimal={fedspan['min_norm_value']} "
-                  f"shortfall={fedspan['direction_solver_shortfall']}")
+                  f"({fedspan['min_norm_value_source']}) "
+                  f"shortfall={fedspan['direction_solver_shortfall']} "
+                  f"wolfe={fedspan['wolfe_certificate']}")
             if fedspan["fallback"] is not None:
                 # Symmetric with every other arm's fallback notice: an arm
                 # that no-ops for a whole run otherwise reports the frozen

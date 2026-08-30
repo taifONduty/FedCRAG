@@ -21,6 +21,7 @@ import driver_harness  # noqa: E402
 from aggregation_schemes import state_dict_sha256  # noqa: E402
 from validate_e0 import (  # noqa: E402
     E0ValidationError,
+    _validate_direction_policy,
     validate_run_directory,
 )
 
@@ -623,3 +624,64 @@ def test_a_healthy_fedspan_run_reports_its_fallback_count(
 
     assert report["fedspan_fallback_rounds"] == 0
     assert report["fedspan_applied_rounds"] == 2
+
+
+# --- Regression from the pre-E3 verification pass (2026-08-31) --------------
+
+@pytest.mark.parametrize("policy,extra", [
+    ("minnorm", ()),
+    ("maxmin-lp", ()),
+    ("exact", ()),
+    ("fixed", ("--fedspan_fixed_weights", "0.2", "0.3", "0.5")),
+])
+def test_validator_accepts_every_shipped_direction_policy(
+        monkeypatch, tmp_path, policy, extra):
+    """run_e0.sh gates EVERY run on this validator, so a policy it does not
+    know is a policy that cannot be run. The three arms added for E3 were
+    invisible to it, which would have failed every E3 run after the GPU spend.
+    """
+    driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "normmaxmin",
+        direction_policy=policy, extra=extra, row_scale="peft-init")
+    assert validate_run_directory(tmp_path)["rounds_validated"] == 1
+
+
+def test_validator_accepts_the_exact_arm_when_frank_wolfe_stalls():
+    """The exact arm must be judged on its own proof, not on the reference.
+
+    E3's federations are near-duplicate clients, so their Gram is singular by
+    construction and away-step Frank-Wolfe stalls on them BY DESIGN. Gating
+    the exact arm on the reference solver's convergence would have rejected
+    every E3 clone round while the direction it applied carried a
+    solver-independent certificate of optimality.
+    """
+    stalled = {
+        "direction_policy_specified": True,
+        "direction_policy": "exact",
+        "achieved_min_direction_cosine": 0.6498,
+        "min_norm_value": 0.6498,
+        "direction_solver_shortfall": 0.0,
+        "min_norm_value_source": "exact-face-enumeration",
+        "min_norm_solver": {"converged": False, "gap": 1.92e-05,
+                            "iterations": 20000},
+        "exact_solver": {
+            "algorithm": "face-enumeration-least-norm-argmin/v1",
+            "value": 0.6498, "wolfe_certificate": 0.0, "rejected_faces": 0},
+    }
+    _validate_direction_policy(stalled, "round 1")     # must not raise
+
+    # ...but an exact arm WITHOUT its proof is still refused.
+    unproved = dict(stalled)
+    unproved["exact_solver"] = dict(stalled["exact_solver"],
+                                    wolfe_certificate=1e-3)
+    with pytest.raises(E0ValidationError, match="not certified optimal"):
+        _validate_direction_policy(unproved, "round 1")
+
+    missing = dict(stalled); missing["exact_solver"] = None
+    with pytest.raises(E0ValidationError, match="no exact_solver diagnostics"):
+        _validate_direction_policy(missing, "round 1")
+
+    # A stalled reference still sinks the arms that actually depend on it.
+    iterative = dict(stalled, direction_policy="minnorm")
+    with pytest.raises(E0ValidationError, match="did not converge"):
+        _validate_direction_policy(iterative, "round 1")

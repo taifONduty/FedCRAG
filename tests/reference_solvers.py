@@ -116,3 +116,83 @@ def achieved_worst_case_cosine(gram, weights):
     if mixture_norm <= 0.0:
         return None
     return float(np.min(C @ w)) / mixture_norm
+
+
+def clone_block_argmin(rho, cross, n_clone=3):
+    """Analytic ``(value, w)`` for the clone-block + singleton Gram family.
+
+    The Gram is ``n_clone`` mutually-``rho`` clients plus one singleton at
+    cosine ``cross`` to each of them. ``w^T C w`` is convex and the Gram is
+    invariant under permuting the clone block, so averaging any optimum over
+    that permutation group yields another optimum with strictly smaller norm
+    unless it is already symmetric: the minimum-norm optimum therefore splits
+    its clone mass ``m`` evenly. Substituting ``w = (m/n, ..., m/n, 1 - m)``
+    leaves a one-dimensional quadratic in ``m`` whose stationary point is
+
+        m = (1 - cross) / ((1 + (n - 1) rho) / n - 2 cross + 1),
+
+    which is the returned optimum whenever it lies strictly inside (0, 1).
+    """
+    n = int(n_clone)
+    denominator = (1.0 + (n - 1) * rho) / n - 2.0 * cross + 1.0
+    mass = (1.0 - cross) / denominator
+    if not 0.0 < mass < 1.0:
+        raise AssertionError("clone-block oracle requires an interior optimum")
+    w = np.full(n + 1, mass / n, dtype=np.float64)
+    w[n] = 1.0 - mass
+    C = np.full((n + 1, n + 1), cross, dtype=np.float64)
+    C[:n, :n] = rho
+    np.fill_diagonal(C, 1.0)
+    return float(np.sqrt(max(float(w @ C @ w), 0.0))), w
+
+
+def min_norm_argmin_scipy(gram, value_restarts=12, epsilon=1e-11):
+    """``min ||w||_2`` over the optima of ``min_w w^T C w`` on the simplex.
+
+    Two SLSQP stages, sharing no code with the production face enumeration:
+    stage one finds the optimal value from many starts, stage two minimises
+    the squared Euclidean norm over the convex sublevel set
+    ``{w in simplex : w^T C w <= value + epsilon}``. The optimal set of a
+    convex program is convex, so the second stage has a unique solution.
+    """
+    from scipy.optimize import minimize
+
+    C = np.asarray(gram, dtype=np.float64)
+    size = C.shape[0]
+    simplex = [{"type": "eq", "fun": lambda w: w.sum() - 1.0,
+                "jac": lambda w: np.ones_like(w)}]
+    bounds = [(0.0, 1.0)] * size
+    best = np.inf
+    for start in range(value_restarts):
+        w0 = (np.ones(size) / size if start == 0
+              else np.random.default_rng(start).dirichlet(np.ones(size)))
+        solved = minimize(lambda w: w @ C @ w, w0, jac=lambda w: 2 * C @ w,
+                          bounds=bounds, constraints=simplex, method="SLSQP",
+                          options={"maxiter": 1000, "ftol": 1e-16})
+        if solved.success:
+            best = min(best, float(solved.fun))
+    if not np.isfinite(best):
+        raise AssertionError("scipy could not solve the min-norm value")
+    optimal = simplex + [{
+        "type": "ineq",
+        "fun": lambda w: best + epsilon - float(w @ C @ w),
+        "jac": lambda w: -2 * C @ w,
+    }]
+    champion = None
+    for start in range(value_restarts):
+        w0 = (np.ones(size) / size if start == 0
+              else np.random.default_rng(100 + start).dirichlet(np.ones(size)))
+        solved = minimize(lambda w: float(w @ w), w0, jac=lambda w: 2 * w,
+                          bounds=bounds, constraints=optimal, method="SLSQP",
+                          options={"maxiter": 1000, "ftol": 1e-16})
+        if not solved.success:
+            continue
+        w = np.clip(np.asarray(solved.x, dtype=np.float64), 0.0, None)
+        w = w / w.sum()
+        if float(w @ C @ w) > best + 1e-8:
+            continue
+        if champion is None or float(w @ w) < float(champion @ champion):
+            champion = w
+    if champion is None:
+        raise AssertionError("scipy could not solve the min-norm argmin")
+    return float(np.sqrt(max(best, 0.0))), champion

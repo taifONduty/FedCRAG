@@ -5,15 +5,19 @@ the 2^K-1 faces with an augmented-KKT solve is exact, so no iterative
 convergence caveat survives. The C_S w = 1 shortcut is deliberately NOT used:
 it misses faces whose restricted Gram is singular.
 
-CRAFT (arXiv:2605.21317) is a baseline arm, not our method: it PRESCRIBES the
-alignment profile (rho proportional to data) and projects a reference onto the
-equality constraints, where we choose the profile endogenously.
+CRAFT (arXiv:2605.21317) is an unwired reference implementation, not a runnable
+arm and not one of the pre-registered baselines: it PRESCRIBES the alignment
+profile (rho proportional to data) and projects a reference onto the equality
+constraints, where we choose the profile endogenously. Its equality constraint
+is unsatisfiable whenever duplicated clients are given different targets, which
+is why it now refuses rather than relaxing.
 """
 import numpy as np
 import pytest
 from scipy.optimize import minimize
 
-from aggregation_schemes import (craft_delta_coefficients,
+from aggregation_schemes import (CraftInfeasibleError,
+                                 craft_delta_coefficients,
                                  minnorm_exact_weights, wolfe_certificate)
 
 
@@ -127,7 +131,14 @@ def test_craft_uniform_targets_recover_equal_alignments():
 
 
 def test_craft_data_proportional_targets_starve_the_minority():
-    """CRAFT's default profile is prescribed, so extreme skew is inherited."""
+    """CRAFT's default profile is prescribed, so extreme skew is inherited.
+
+    Both quantities are worst-case cosines of the NORMALISED direction each
+    rule applies: ``min_j (C v)_j / sqrt(v^T C v)`` for CRAFT's coefficient
+    vector, ``sqrt(min_w w^T C w)`` for the min-norm point. Comparing CRAFT's
+    raw ``min_j (C v)_j`` against the latter would mix units, since ``v`` is
+    not a unit direction and is not a simplex point.
+    """
     rng = np.random.default_rng(5)
     U = unit_rows(rng, 4, 12, spread=0.7,
                   anchor=np.array([1.0] + [0.0] * 11))
@@ -135,10 +146,63 @@ def test_craft_data_proportional_targets_starve_the_minority():
     counts = np.array([110000.0, 14000.0, 900.0, 700.0])
     rho = counts / counts.sum()
     v_craft = craft_delta_coefficients(C, rho)
-    worst_craft = float(np.min(C @ v_craft))
+    craft_norm = float(np.sqrt(max(float(v_craft @ C @ v_craft), 0.0)))
+    worst_craft = float(np.min(C @ v_craft)) / craft_norm
     _, gamma = minnorm_exact_weights(C)
     assert worst_craft >= -1e-9              # positivity is guaranteed
     assert worst_craft < gamma               # but magnitude is not
+    assert worst_craft < 0.05 * gamma        # measured on this fixture: 0.9 %
+
+
+def test_craft_is_marked_unwired():
+    """It has no command line and is not one of the pre-registered arms."""
+    doc = craft_delta_coefficients.__doc__
+    assert "UNWIRED" in doc
+    assert "not a runnable arm" in doc
+
+
+def test_craft_raises_when_its_equality_constraint_is_infeasible():
+    """Exact clones force equal alignments, so an unequal profile is not met.
+
+    With ``u1 = u2 = u3`` the constraint ``(C v)_1 = (C v)_2 = (C v)_3`` holds
+    identically, so a target that asks the three sub-silos for different
+    alignments is outside ``range(C)`` and the closed form silently returns a
+    least-squares relaxation of a program it claims to solve exactly.
+    """
+    rows = np.array([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    C = rows @ rows.T
+    counts = np.array([0.9, 0.09, 0.01, 0.0])
+    rho = np.append(counts[:3], 0.2)
+    with pytest.raises(CraftInfeasibleError, match="range"):
+        craft_delta_coefficients(C, rho)
+
+
+def test_craft_accepts_a_feasible_profile_on_the_same_clone_gram():
+    """Equal targets for the clones are in range(C), so the solve stands."""
+    rows = np.array([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    C = rows @ rows.T
+    rho = np.array([0.3, 0.3, 0.3, 0.1])
+    v = craft_delta_coefficients(C, rho)
+    assert np.allclose(C @ v, rho, atol=1e-8)
+
+
+def test_craft_pseudoinverse_cutoff_is_an_explicit_argument():
+    """The cutoff moves the answer by orders of magnitude."""
+    epsilon = 1e-5
+    rows = np.array([[1.0, 0.0, 0.0],
+                     [1.0, epsilon, 0.0],
+                     [1.0, 0.0, epsilon],
+                     [0.0, 0.0, 1.0]])
+    rows = rows / np.linalg.norm(rows, axis=1, keepdims=True)
+    C = rows @ rows.T
+    rho = np.array([0.34, 0.33, 0.33, 0.05])
+    permissive = craft_delta_coefficients(C, rho, rcond=1e-15,
+                                          feasibility_tol=None)
+    truncating = craft_delta_coefficients(C, rho, rcond=1e-8,
+                                          feasibility_tol=None)
+    assert np.linalg.norm(permissive) > 100.0 * np.linalg.norm(truncating)
+    default = craft_delta_coefficients(C, rho, feasibility_tol=None)
+    assert np.allclose(default, permissive)
 
 
 def test_craft_satisfies_its_equality_constraints():

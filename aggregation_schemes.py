@@ -743,7 +743,12 @@ def _zero_fedspan_result(status, client_norms, active_mask,
                          direction_policy=None,
                          direction_policy_specified=None,
                          min_norm_value=None, min_norm_solver=None,
-                         achieved_min_direction_cosine=None):
+                         min_norm_value_source=None, exact_solver=None,
+                         fixed_weights=None, wolfe_certificate_value=None,
+                         achieved_min_direction_cosine=None,
+                         frank_wolfe_value=None, frank_wolfe_converged=None,
+                         exact_measurement_note=None,
+                         applied_direction_solver=None):
     K = len(client_norms)
     shortfall = (None if (min_norm_value is None
                           or achieved_min_direction_cosine is None)
@@ -753,8 +758,13 @@ def _zero_fedspan_result(status, client_norms, active_mask,
         "fallback": fallback,
         "direction_policy": direction_policy,
         "direction_policy_specified": direction_policy_specified,
+        "fixed_weights": fixed_weights,
         "solver_status": solver_status,
         "solver_message": solver_message,
+        "applied_direction_solver": applied_direction_solver,
+        "frank_wolfe_value": frank_wolfe_value,
+        "frank_wolfe_converged": frank_wolfe_converged,
+        "exact_measurement_note": exact_measurement_note,
         "solver_objective_gamma": solver_objective_gamma,
         "solver_simplex_residual": solver_simplex_residual,
         "solver_constraint_violation": solver_constraint_violation,
@@ -779,7 +789,10 @@ def _zero_fedspan_result(status, client_norms, active_mask,
         "mixture_norm": mixture_norm,
         "achieved_min_direction_cosine": achieved_min_direction_cosine,
         "min_norm_value": min_norm_value,
+        "min_norm_value_source": min_norm_value_source,
         "min_norm_solver": min_norm_solver,
+        "exact_solver": exact_solver,
+        "wolfe_certificate": wolfe_certificate_value,
         "direction_solver_shortfall": shortfall,
         # Deprecated alias for achieved_min_direction_cosine; the value was
         # never a certificate of optimality, only of what was applied.
@@ -803,60 +816,234 @@ def _effective_vector_sha256(blocks):
     return digest.hexdigest()
 
 
-def minnorm_exact_weights(cosine, feasibility_tol=1e-9):
-    """Exact minimiser of w^T C w over the simplex, by face enumeration.
+# Ill-conditioned faces discarded by the most recent exact enumeration, so a
+# round can record how much of the face lattice was numerically unusable
+# rather than presenting a silently reduced search as a clean one.
+_LAST_EXACT_REJECTED_FACES = []
 
-    At deployment scale (K <= 10) the 2^K - 1 faces are cheap to enumerate, so
-    the direction can be solved exactly and no iterative-convergence caveat
-    survives. On each face S the stationarity and normalisation conditions are
-    solved together as the augmented KKT system
+
+# Above this active-client count the 2^K - 1 face enumeration stops being
+# free. Every federation in this project is far below it (K = 4 in E0/E1,
+# K = 4..5 in E3); the cap exists so a future large-K run degrades to the
+# iterative value with a recorded note rather than hanging.
+_EXACT_MEASUREMENT_MAX_CLIENTS = 12
+
+
+class DirectionSolverError(RuntimeError):
+    """The exact direction solver could not certify its own answer.
+
+    Raised instead of returning an uncertified direction, so a caller either
+    gets a solution that passed every stated invariant or fails closed.
+    """
+
+
+def _face_stationary_point(C, support, feasibility_tol, rejected=None):
+    """Stationary point of ``w^T C w`` on one face, or ``None``.
+
+    The stationarity and normalisation conditions are solved together as the
+    augmented KKT system
 
         [ 2 C_S  -1 ] [ w_S ]   [ 0 ]
         [   1^T   0 ] [  mu ] = [ 1 ]
 
-    in a least-squares sense, which stays correct when C_S is singular. The
-    common ``C_S w = 1`` shortcut is deliberately avoided: it silently drops
-    faces whose restricted Gram has a zero eigenvalue, exactly the clone and
-    near-cancellation geometries this project cares about.
+    in a least-squares sense, which stays correct when ``C_S`` is singular.
+    The common ``C_S w = 1`` shortcut is deliberately avoided: it silently
+    drops faces whose restricted Gram has a zero eigenvalue, exactly the clone
+    and near-cancellation geometries this project cares about.
 
-    Returns ``(w, value)`` with ``value = sqrt(min_w w^T C w)`` — the attainable
-    worst-case cosine of the normalised mixture (Theorem: min-norm duality).
+    Two identities of that system are enforced rather than assumed. Taking the
+    inner product of the stationarity rows with ``w_S`` gives
+    ``mu = 2 w_S^T C_S w_S``, and the last row gives ``1^T w_S = 1``; a
+    solution that violates either is not a solution of the system this
+    function documents, so it fails closed.
     """
-    C = np.asarray(cosine, dtype=np.float64)
+    size = len(support)
+    Cs = C[np.ix_(support, support)]
+    system = np.zeros((size + 1, size + 1), dtype=np.float64)
+    system[:size, :size] = 2.0 * Cs
+    system[:size, size] = -1.0
+    system[size, :size] = 1.0
+    rhs = np.zeros(size + 1, dtype=np.float64)
+    rhs[size] = 1.0
+    solution, *_ = np.linalg.lstsq(system, rhs, rcond=None)
+    if not np.all(np.isfinite(solution)):
+        return None
+    residual = float(np.linalg.norm(system @ solution - rhs))
+    if residual > feasibility_tol:
+        return None                       # no stationary point on this face
+    w_s = solution[:size]
+    multiplier = float(solution[size])
+    stationary_value = float(w_s @ Cs @ w_s)
+    # mu = 2 w^T C_S w follows from the stationarity rows only up to
+    # |w| * residual, since the identity is obtained by taking the inner
+    # product of those rows with w. A degenerate face can return a
+    # large-norm least-squares solution whose residual is inside tolerance
+    # while |w| * residual is not, so the bound is scaled by |w| rather
+    # than held at an unscaled constant.
+    identity_slack = max(1e-6 * max(1.0, abs(multiplier)),
+                         4.0 * residual * float(np.linalg.norm(w_s)))
+    if abs(multiplier - 2.0 * stationary_value) > identity_slack:
+        # Reject THIS FACE, do not abort the enumeration. Discarding a face
+        # can only make the returned answer worse, never wrong-and-unnoticed:
+        # whatever survives is checked against the global, solver-independent
+        # Wolfe certificate below, which raises if the winner is not in fact
+        # the simplex minimiser. Raising here instead lost globally solvable
+        # problems to a single ill-conditioned sub-face (measured on ~7% of
+        # random well-formed unit-diagonal Grams).
+        if rejected is not None:
+            rejected.append(
+                f"support={support}: KKT multiplier {multiplier} contradicts "
+                f"2 w^T C w = {2.0 * stationary_value} "
+                f"(residual {residual:.3e}, |w| {np.linalg.norm(w_s):.3e})")
+        return None
+    if w_s.min() < -feasibility_tol:
+        return None                       # leaves the simplex; a sub-face wins
+    w_s = np.clip(w_s, 0.0, None)
+    total = float(w_s.sum())
+    if total <= 0.0:
+        return None
+    if abs(total - 1.0) > max(2.0, size) * feasibility_tol:
+        raise DirectionSolverError(
+            f"stationary point carries simplex mass {total}")
+    w_s = w_s / total
+    if abs(float(w_s.sum()) - 1.0) > 1e-12:
+        raise DirectionSolverError(
+            f"normalised face weights sum to {float(w_s.sum())}")
+    return w_s, float(w_s @ Cs @ w_s)
+
+
+def _least_norm_optimum(C, target, optimal_value, feasibility_tol,
+                        argmin_rcond):
+    """Least-Euclidean-norm point of ``{w in simplex : C w = target}``.
+
+    ``C`` is positive semidefinite, so two simplex points share a value and a
+    gradient exactly when ``C(w - w') = 0``: the optimal set of
+    ``min_w w^T C w`` is the affine slice of the simplex through any one
+    optimum with ``C w`` held fixed. Minimising ``||w||_2`` over that convex
+    set has a unique solution, and it is attained on the face equal to its own
+    support, where the nonnegativity constraints are inactive and the
+    least-norm least-squares solve is therefore the constrained minimiser.
+    Enumerating supports and keeping the nonnegative solves is exact.
+    """
     K = C.shape[0]
-    best_w, best_val = None, math.inf
+    scale = max(1.0, float(np.linalg.norm(target)))
+    value_slack = 1e-9 * max(1.0, abs(optimal_value))
+    best_w, best_norm = None, math.inf
+    rhs = np.concatenate([np.asarray(target, dtype=np.float64), [1.0]])
     for mask in range(1, 1 << K):
-        support = [i for i in range(K) if (mask >> i) & 1]
-        m = len(support)
-        Cs = C[np.ix_(support, support)]
-        system = np.zeros((m + 1, m + 1), dtype=np.float64)
-        system[:m, :m] = 2.0 * Cs
-        system[:m, m] = -1.0
-        system[m, :m] = 1.0
-        rhs = np.zeros(m + 1, dtype=np.float64)
-        rhs[m] = 1.0
-        solution, *_ = np.linalg.lstsq(system, rhs, rcond=None)
-        if not np.all(np.isfinite(solution)):
+        support = [index for index in range(K) if (mask >> index) & 1]
+        block = np.vstack([C[:, support],
+                           np.ones((1, len(support)), dtype=np.float64)])
+        w_s, *_ = np.linalg.lstsq(block, rhs, rcond=argmin_rcond)
+        if not np.all(np.isfinite(w_s)):
             continue
-        if np.linalg.norm(system @ solution - rhs) > feasibility_tol:
-            continue                      # no stationary point on this face
-        w_s = solution[:m]
+        if np.linalg.norm(block @ w_s - rhs) > feasibility_tol * scale:
+            continue
         if w_s.min() < -feasibility_tol:
-            continue                      # leaves the simplex; a sub-face wins
+            continue
         w_s = np.clip(w_s, 0.0, None)
-        total = w_s.sum()
-        if total <= 0:
+        total = float(w_s.sum())
+        if total <= 0.0:
             continue
         w_s = w_s / total
-        value = float(w_s @ Cs @ w_s)
+        candidate = np.zeros(K, dtype=np.float64)
+        candidate[support] = w_s
+        if float(candidate @ C @ candidate) > optimal_value + value_slack:
+            continue
+        norm2 = float(candidate @ candidate)
+        if norm2 < best_norm:
+            best_norm, best_w = norm2, candidate
+    if best_w is None:
+        raise DirectionSolverError(
+            "no simplex point reproduces the optimal alignment profile")
+    return best_w
+
+
+def minnorm_exact_weights(cosine, feasibility_tol=1e-9, argmin_rcond=1e-10):
+    """Exact minimiser of w^T C w over the simplex, by face enumeration.
+
+    At deployment scale (K <= 10) the 2^K - 1 faces are cheap to enumerate, so
+    the direction can be solved exactly and no iterative-convergence caveat
+    survives. Each face is solved through the augmented KKT system described
+    in ``_face_stationary_point``.
+
+    TIE-BREAK, part of the contract. When the Gram is singular -- three
+    near-duplicate clients make it so -- the minimiser is not unique, and the
+    whole optimal set gives the same value. This function returns the optimum
+    of least Euclidean norm, which is unique because the optimal set is convex
+    and the norm is strictly convex. Concretely, for exactly duplicated
+    clients the shared mass is split evenly between them, so the returned
+    weight vector is a property of the problem rather than of the linear
+    algebra backend: without the rule, the tie-break falls to the backend's
+    minimum-norm least-squares solution of the augmented system, which
+    minimises the joint norm of ``(w, mu)`` including the Lagrange multiplier.
+    The multiplier is recovered after the fact and is not part of the choice.
+
+    ``argmin_rcond`` is the explicit singular-value cutoff, relative to the
+    largest singular value, at which the tie-break treats two client
+    directions as the same direction. It is named and defaulted rather than
+    left to the backend because the tie-break is otherwise discontinuous: a
+    Gram a few units in the last place away from exactly singular has a unique
+    minimiser that no float64 solve can locate, and the cutoff is what makes a
+    clone block at cosine 1 - 1e-14 give the same answer as one at cosine 1.
+
+    SCOPE OF THAT LAST GUARANTEE, measured. It holds for a Gram whose clone
+    off-diagonals are exactly equal -- which is what an EXACT clone federation
+    produces, E3's construction. It does NOT hold entrywise for a Gram formed
+    from perturbed vectors, where the clone off-diagonals differ from each
+    other in the last places: there the optimal set is genuinely a single
+    point rather than a face, individual weights inside the clone block can
+    move at the 1e-7 level between representations, and the cutoff cannot
+    restore a symmetry the problem no longer has. The block TOTAL and the
+    optimal value are stable in both regimes; E3's headline statistic is the
+    block total, so it is inside the guaranteed regime, but a per-client
+    weight read off a near-clone Gram is not.
+    It only takes effect on singular values between machine precision and the
+    cutoff; it never changes the optimal value, which is checked afterwards.
+
+    Returns ``(w, value)`` with ``value = sqrt(min_w w^T C w)`` -- the
+    attainable worst-case cosine of the normalised mixture (min-norm duality).
+    Raises ``DirectionSolverError`` rather than returning an uncertified
+    answer.
+    """
+    C = np.asarray(cosine, dtype=np.float64)
+    if C.ndim != 2 or C.shape[0] != C.shape[1]:
+        raise ValueError("cosine must be a square matrix")
+    K = C.shape[0]
+    rejected_faces = []
+    witness, best_val = None, math.inf
+    for mask in range(1, 1 << K):
+        support = [index for index in range(K) if (mask >> index) & 1]
+        solved = _face_stationary_point(C, support, feasibility_tol,
+                                        rejected=rejected_faces)
+        if solved is None:
+            continue
+        w_s, value = solved
         if value < best_val:
             candidate = np.zeros(K, dtype=np.float64)
             candidate[support] = w_s
-            best_val, best_w = value, candidate
-    if best_w is None:                    # unreachable for a PSD Gram
-        best_w = np.ones(K, dtype=np.float64) / K
-        best_val = float(best_w @ C @ best_w)
-    return best_w, float(math.sqrt(max(best_val, 0.0)))
+            best_val, witness = value, candidate
+    if witness is None:
+        raise DirectionSolverError(
+            "no face of the simplex carried a stationary point; the Gram is "
+            "not a well-scaled positive semidefinite matrix"
+            + (f" ({len(rejected_faces)} faces rejected: "
+               f"{rejected_faces[0]})" if rejected_faces else ""))
+    w = _least_norm_optimum(C, C @ witness, best_val, feasibility_tol,
+                            argmin_rcond)
+    value = float(w @ C @ w)
+    if abs(value - best_val) > 1e-9 * max(1.0, abs(best_val)):
+        raise DirectionSolverError(
+            f"least-norm optimum has value {value}, not {best_val}")
+    if wolfe_certificate(C, w) > 1e-9 * max(1.0, abs(best_val)):
+        raise DirectionSolverError(
+            "least-norm optimum fails its own optimality certificate"
+            + (f"; {len(rejected_faces)} ill-conditioned faces were rejected "
+               f"during enumeration, first: {rejected_faces[0]}"
+               if rejected_faces else ""))
+    _LAST_EXACT_REJECTED_FACES.clear()
+    _LAST_EXACT_REJECTED_FACES.extend(rejected_faces)
+    return w, float(math.sqrt(max(best_val, 0.0)))
 
 
 def wolfe_certificate(cosine, weights):
@@ -864,7 +1051,9 @@ def wolfe_certificate(cosine, weights):
 
     Zero (to numerical tolerance) certifies that ``weights`` minimises
     w^T C w over the simplex, independently of which solver produced it.
-    Behaviour-neutral: intended to be logged alongside any solved round.
+    Behaviour-neutral, and recorded by ``fedspan_delta_weights`` for every
+    round and every direction policy, so an iterative or fixed-weight round
+    carries a measured optimality gap rather than an assumed one.
     """
     C = np.asarray(cosine, dtype=np.float64)
     w = np.asarray(weights, dtype=np.float64)
@@ -872,11 +1061,24 @@ def wolfe_certificate(cosine, weights):
     return float(max(0.0, np.max(value - C @ w)))
 
 
-def craft_delta_coefficients(cosine, targets, reference=None):
+class CraftInfeasibleError(ValueError):
+    """A CRAFT alignment profile that lies outside ``range(C)``."""
+
+
+def craft_delta_coefficients(cosine, targets, reference=None,
+                             rcond=1e-15, feasibility_tol=1e-8):
     """CRAFT-style equality projection (arXiv:2605.21317), in coefficient space.
 
-    Baseline arm, not this project's method. CRAFT prescribes the alignment
-    profile and projects a reference direction onto the equality constraints:
+    UNWIRED, EXPERIMENTAL. This is not a runnable arm: it has no command-line
+    value, no call site in the driver, and is not one of the pre-registered
+    baselines. It also returns a raw coefficient vector, not a simplex point —
+    on real Grams its entries sum to well under one and individual entries can
+    be negative — so wiring it would additionally require a normalisation and
+    sign convention that is not defined anywhere in this project. Read it as a
+    reference implementation of the closed form, nothing more.
+
+    CRAFT prescribes the alignment profile and projects a reference direction
+    onto the equality constraints:
 
         min ||g - g_hat||^2  s.t.  U g = rho        (their Eq. 4.3)
         g = g_hat + U^+ (rho - U g_hat)             (their Eq. 4.5)
@@ -891,6 +1093,21 @@ def craft_delta_coefficients(cosine, targets, reference=None):
     unless a reference coefficient vector is supplied. The differentiator this
     arm exists to measure — a prescribed data-proportional profile versus an
     endogenously maximised one — does not depend on that choice.
+
+    ``C v = rho`` is solvable only when ``rho`` lies in ``range(C)``, because
+    ``C C^+`` is the projector onto that range. Duplicated clients force
+    ``(C v)_i = (C v)_j``, so any profile assigning them different targets is
+    unsatisfiable by construction and the closed form quietly returns the
+    least-squares relaxation instead. ``feasibility_tol`` is measured against
+    ``||C v - rho|| / max(1, ||rho||)`` and a violation raises
+    ``CraftInfeasibleError``; pass ``None`` to accept the relaxation
+    deliberately.
+
+    ``rcond`` is the pseudo-inverse's singular-value cutoff, relative to the
+    largest singular value. It is a named argument because it is not a
+    detail: on a near-clone Gram the returned coefficients scale by orders of
+    magnitude across the plausible range of cutoffs. The default reproduces
+    NumPy's own ``pinv`` default.
     """
     C = np.asarray(cosine, dtype=np.float64)
     K = C.shape[0]
@@ -901,13 +1118,55 @@ def craft_delta_coefficients(cosine, targets, reference=None):
          else np.asarray(reference, dtype=np.float64))
     if a.shape != (K,):
         raise ValueError("reference must supply one coefficient per client")
-    correction = np.linalg.pinv(C) @ (rho - C @ a)
-    return a + correction
+    correction = np.linalg.pinv(C, rcond=rcond) @ (rho - C @ a)
+    v = a + correction
+    if feasibility_tol is not None:
+        scale = max(1.0, float(np.linalg.norm(rho)))
+        residual = float(np.linalg.norm(C @ v - rho)) / scale
+        if residual > float(feasibility_tol):
+            raise CraftInfeasibleError(
+                f"alignment profile is not in range(C): relative residual "
+                f"{residual:.3e} exceeds {float(feasibility_tol):.3e}; the "
+                "closed form would return a least-squares relaxation of the "
+                "equality-constrained program")
+    return v
+
+
+DIRECTION_POLICIES = ("minnorm", "maxmin-lp", "exact", "fixed")
+
+
+def _validate_fixed_weights(fixed_weights, direction_policy, client_count):
+    """Normalise and check caller-supplied simplex weights, or ``None``.
+
+    Supplied weights are a declared experimental arm, so a malformed vector is
+    a specification error and raises rather than degrading to something the
+    run would then report under the arm's name.
+    """
+    if direction_policy != "fixed":
+        if fixed_weights is not None:
+            raise ValueError(
+                "fixed_weights is legal only with direction_policy 'fixed'")
+        return None
+    if fixed_weights is None:
+        raise ValueError(
+            "direction_policy 'fixed' requires fixed_weights")
+    values = [float(value) for value in fixed_weights]
+    if len(values) != client_count:
+        raise ValueError(
+            f"fixed_weights must supply one weight per client "
+            f"({client_count}), got {len(values)}")
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("fixed_weights must be finite")
+    if any(value < 0.0 for value in values):
+        raise ValueError("fixed_weights must be nonnegative")
+    if sum(values) <= 0.0:
+        raise ValueError("fixed_weights must carry positive mass")
+    return values
 
 
 def fedspan_delta_weights(client_states, broadcast_state, module_scales,
                           step_norm=None, step_policy="fixed",
-                          direction_policy=None,
+                          direction_policy=None, fixed_weights=None,
                           active_abs_tol=1e-12,
                           active_rel_tol=1e-8, mixture_norm_tol=1e-6,
                           max_abs_delta_weight=None):
@@ -920,7 +1179,7 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
 
       c_k = resolved_step_norm * w_k / (r_k * sqrt(w.T @ H @ w)),
 
-    which is degree-0 homogeneous in ``w``, so both direction policies flow
+    which is degree-0 homogeneous in ``w``, so every direction policy flows
     through identical downstream machinery.
 
     ``direction_policy``:
@@ -931,9 +1190,25 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
       * ``"maxmin-lp"`` — maximize ``min_i (C w)_i`` over the simplex. The
         applied direction is normalized, so this LP optimizes a quantity that
         is not the one applied; it is retained as a recorded ablation.
-    Both are always measured: ``min_norm_value`` is the attainable optimum
-    (exact when ``min_norm_solver["converged"]``, an upper bound otherwise)
-    and ``direction_solver_shortfall`` is what the chosen policy gave up.
+      * ``"exact"`` — the same objective as ``"minnorm"``, solved by face
+        enumeration with a declared minimum-norm tie-break instead of
+        iteratively. It carries no convergence caveat and, unlike Frank-Wolfe,
+        returns a weight vector that is a property of the Gram rather than of
+        the iterate path, which matters when the Gram is degenerate.
+      * ``"fixed"`` — skip the direction solve and use the caller's
+        ``fixed_weights``, restricted to the active clients and renormalized.
+        Every downstream stage is shared with the solved policies: the same
+        ``1/r_k`` coefficient rule, the same step policy, the same fail-closed
+        gates. A fixed arm is therefore step-matched and norm-matched to a
+        solved arm and differs from it only in ``w``, which is what makes a
+        contrast between them attribute an effect to the weight vector alone.
+    ``min_norm_value`` is the attainable optimum, measured every round
+    regardless of policy (exact when ``min_norm_value_source`` is the face
+    enumeration or when ``min_norm_solver["converged"]``, an upper bound
+    otherwise), ``direction_solver_shortfall`` is what the chosen policy gave
+    up against it, and ``wolfe_certificate`` is the largest violation of
+    ``(C w)_j >= w^T C w`` by the weights actually applied — zero exactly when
+    they minimize ``w^T C w``, whatever produced them.
 
     Solver errors, invalid solutions, near cancellation, and an optional
     coefficient-limit violation fail closed to a zero server update. Contract
@@ -943,9 +1218,12 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
     direction_policy_specified = direction_policy is not None
     if not direction_policy_specified:
         direction_policy = "maxmin-lp"
-    if direction_policy not in ("minnorm", "maxmin-lp"):
+    if direction_policy not in DIRECTION_POLICIES:
         raise ValueError(
-            "direction_policy must be 'minnorm' or 'maxmin-lp'")
+            "direction_policy must be one of "
+            + ", ".join(repr(name) for name in DIRECTION_POLICIES))
+    fixed_weights = _validate_fixed_weights(
+        fixed_weights, direction_policy, len(client_states))
     if step_policy not in ("fixed", "median-active"):
         raise ValueError(
             "step_policy must be 'fixed' or 'median-active'")
@@ -1044,13 +1322,133 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
     np.fill_diagonal(cosine, 1.0)
     cosine_list = cosine.tolist()
 
-    # The attainable optimum is measured for BOTH policies every round, so the
+    # The attainable optimum is measured for EVERY policy every round, so the
     # shortfall of whichever policy is applied is always on the record.
     min_norm_w, min_norm_info = _min_norm_simplex_weights(cosine)
     min_norm_value = math.sqrt(max(
         float(min_norm_w @ cosine @ min_norm_w), 0.0))
+    exact_solver_info = None
+    min_norm_value_source = "away-step-frank-wolfe"
 
-    if M == 1:
+    # The attainable optimum is what EVERY arm's shortfall is measured
+    # against, so it must not itself come from a solver that stalled. At
+    # deployment scale the exact enumeration costs 2^K - 1 tiny linear solves
+    # (15 at K=4) against a full round of GPU training, so it is measured
+    # every round for every policy -- including the arms that do not apply it.
+    # Without this, a fixed arm's recorded distance from optimal on a clone
+    # federation was its distance from a STALLED Frank-Wolfe iterate, and
+    # E3's clone Grams are singular by construction, i.e. exactly where the
+    # iterative solver stalls. The applied direction is untouched: this
+    # changes what is recorded, never what is sent.
+    measured_optimum = None
+    if M <= _EXACT_MEASUREMENT_MAX_CLIENTS:
+        try:
+            measured_w, measured_optimum = minnorm_exact_weights(cosine)
+        except (DirectionSolverError, np.linalg.LinAlgError) as exc:
+            measured_optimum = None
+            exact_measurement_note = f"exact measurement unavailable: {exc}"
+        else:
+            exact_measurement_note = None
+            min_norm_value = float(measured_optimum)
+            min_norm_value_source = "exact-face-enumeration"
+    else:
+        exact_measurement_note = (
+            f"exact measurement skipped: {M} clients exceeds the "
+            f"{_EXACT_MEASUREMENT_MAX_CLIENTS}-client enumeration cap")
+
+    if direction_policy == "exact":
+        try:
+            exact_w, exact_value = minnorm_exact_weights(cosine)
+        except (DirectionSolverError, np.linalg.LinAlgError) as exc:
+            return _zero_fedspan_result(
+                "solver_error", client_norms, active_mask, inactive_reasons,
+                step_norm, threshold, solver_status="exact",
+                step_policy=step_policy,
+                direction_policy=direction_policy,
+                direction_policy_specified=direction_policy_specified,
+                declared_step_norm=declared_step_norm,
+                solver_message=f"{type(exc).__name__}: {exc}",
+                active_indices=active, cosine_gram_active=cosine_list,
+                module_scales=scales, min_norm_value=min_norm_value,
+                min_norm_solver=min_norm_info,
+                min_norm_value_source=min_norm_value_source,
+                fixed_weights=fixed_weights,
+                delta_weight_limit=max_abs_delta_weight)
+        exact_solver_info = {
+            "algorithm": "face-enumeration-least-norm-argmin/v1",
+            "value": float(exact_value),
+            "weights": [float(value) for value in exact_w],
+            "wolfe_certificate": float(wolfe_certificate(cosine, exact_w)),
+            # How much of the 2^K - 1 face lattice was numerically unusable
+            # this round. The answer is still certified optimal by the Wolfe
+            # gap above; this records that the search was reduced, so a run
+            # cannot present a shrunken enumeration as a full one.
+            "rejected_faces": len(_LAST_EXACT_REJECTED_FACES),
+            "first_rejected_face": (_LAST_EXACT_REJECTED_FACES[0]
+                                    if _LAST_EXACT_REJECTED_FACES else None),
+        }
+        # The face enumeration is exact, so it, not the iterative solver,
+        # defines the attainable optimum whenever it has been run.
+        min_norm_value = float(exact_value)
+        min_norm_value_source = "exact-face-enumeration"
+    direction_telemetry = {
+        "min_norm_value": min_norm_value,
+        "min_norm_solver": min_norm_info,
+        "min_norm_value_source": min_norm_value_source,
+        "exact_solver": exact_solver_info,
+        "fixed_weights": fixed_weights,
+        # The iterative solver's own record is kept alongside the exact
+        # measurement rather than replaced by it, so a round says both what
+        # the optimum is and whether Frank-Wolfe found it. E1 ran before this
+        # measurement existed and its files record the Frank-Wolfe value.
+        "frank_wolfe_value": float(math.sqrt(max(
+            float(np.asarray(min_norm_w) @ cosine @ np.asarray(min_norm_w)),
+            0.0))),
+        "frank_wolfe_converged": bool(min_norm_info.get("converged")),
+        "exact_measurement_note": exact_measurement_note,
+        # WHICH SOLVER PRODUCED THE WEIGHTS THAT WERE ACTUALLY SENT. Kept
+        # distinct from min_norm_value_source, which describes only where the
+        # recorded attainable optimum came from. The two answer different
+        # questions, and reading one as the other is precisely how a solver
+        # that was implemented but unreachable got reported as deployed
+        # (supervisor correction, 2026-08-28). Carried on every return path,
+        # including every fail-closed one.
+        "applied_direction_solver": {
+            "exact": "face-enumeration-least-norm-argmin/v1",
+            "minnorm": "away-step-frank-wolfe",
+            "maxmin-lp": "scipy-linprog",
+            "fixed": "declared-weights-no-solve",
+        }[direction_policy],
+    }
+
+    if direction_policy == "fixed":
+        active_w = np.asarray([fixed_weights[index] for index in active],
+                              dtype=np.float64)
+        supplied_mass = float(active_w.sum())
+        if supplied_mass <= 0.0:
+            return _zero_fedspan_result(
+                "fixed_weights_inactive", client_norms, active_mask,
+                inactive_reasons, step_norm, threshold,
+                solver_status="fixed", step_policy=step_policy,
+                direction_policy=direction_policy,
+                direction_policy_specified=direction_policy_specified,
+                declared_step_norm=declared_step_norm,
+                solver_message=(
+                    "supplied fixed weights put no mass on any active client"),
+                active_indices=active, cosine_gram_active=cosine_list,
+                module_scales=scales, **direction_telemetry,
+                delta_weight_limit=max_abs_delta_weight)
+        active_w = active_w / supplied_mass
+        solver_status = 0
+        solver_message = (
+            f"caller-supplied direction weights, {supplied_mass:.12g} of the "
+            f"declared mass on the {M} active clients")
+        solver_objective_gamma = float(np.min(cosine @ active_w))
+        solver_simplex_residual = float(abs(active_w.sum() - 1.0))
+        solver_constraint_violation = float(max(
+            0.0, np.max(solver_objective_gamma - cosine @ active_w)))
+        status = "fixed"
+    elif M == 1:
         active_w = np.ones(1, dtype=np.float64)
         solver_status = 0
         solver_message = "singleton active set; no direction solve required"
@@ -1058,6 +1456,18 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
         solver_objective_gamma = 1.0
         solver_simplex_residual = 0.0
         solver_constraint_violation = 0.0
+    elif direction_policy == "exact":
+        active_w = np.asarray(exact_solver_info["weights"], dtype=np.float64)
+        solver_status = 0
+        solver_message = (
+            f"exact face enumeration over {2 ** M - 1} faces, least-norm "
+            f"tie-break, Wolfe violation "
+            f"{exact_solver_info['wolfe_certificate']:.3e}")
+        solver_objective_gamma = float(np.min(cosine @ active_w))
+        solver_simplex_residual = float(abs(active_w.sum() - 1.0))
+        solver_constraint_violation = float(max(
+            0.0, np.max(solver_objective_gamma - cosine @ active_w)))
+        status = "optimal"
     elif direction_policy == "minnorm":
         active_w = np.asarray(min_norm_w, dtype=np.float64)
         if (not np.all(np.isfinite(active_w)) or active_w.min() < -1e-9
@@ -1072,8 +1482,7 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
                 solver_message=(
                     "min-norm Frank-Wolfe returned a nonsimplex point"),
                 active_indices=active, cosine_gram_active=cosine_list,
-                module_scales=scales, min_norm_value=min_norm_value,
-                min_norm_solver=min_norm_info,
+                module_scales=scales, **direction_telemetry,
                 delta_weight_limit=max_abs_delta_weight)
         active_w = np.clip(active_w, 0.0, 1.0)
         active_w = active_w / active_w.sum()
@@ -1087,7 +1496,13 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
         solver_simplex_residual = float(abs(active_w.sum() - 1.0))
         solver_constraint_violation = float(max(
             0.0, np.max(solver_objective_gamma - cosine @ active_w)))
-        status = "optimal"
+        # "optimal" is a claim about the APPLIED weights. On this arm they are
+        # the Frank-Wolfe iterate, so the claim is only as good as that
+        # solver's convergence -- and a near-clone Gram, which is what E3 is
+        # built from, is exactly where away-step FW stalls. Labelling a
+        # stalled iterate "optimal" would put an unearned word next to a
+        # measured 1.6e-06 shortfall.
+        status = ("optimal" if min_norm_info.get("converged") else "stalled")
     else:
         from scipy.optimize import linprog
         objective = np.zeros(M + 1, dtype=np.float64)
@@ -1109,8 +1524,7 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
                 declared_step_norm=declared_step_norm,
                 solver_message=f"{type(exc).__name__}: {exc}",
                 active_indices=active, cosine_gram_active=cosine_list,
-                min_norm_value=min_norm_value,
-                min_norm_solver=min_norm_info,
+                **direction_telemetry,
                 module_scales=scales,
                 delta_weight_limit=max_abs_delta_weight)
         if not solved.success:
@@ -1123,8 +1537,7 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
                 declared_step_norm=declared_step_norm,
                 solver_message=str(solved.message), active_indices=active,
                 cosine_gram_active=cosine_list, module_scales=scales,
-                min_norm_value=min_norm_value,
-                min_norm_solver=min_norm_info,
+                **direction_telemetry,
                 delta_weight_limit=max_abs_delta_weight)
         raw_w = np.asarray(solved.x[:M], dtype=np.float64)
         raw_gamma = float(solved.x[-1])
@@ -1141,8 +1554,7 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
                 declared_step_norm=declared_step_norm,
                 solver_message="LP returned an infeasible/nonfinite simplex point",
                 active_indices=active, cosine_gram_active=cosine_list,
-                min_norm_value=min_norm_value,
-                min_norm_solver=min_norm_info,
+                **direction_telemetry,
                 module_scales=scales,
                 delta_weight_limit=max_abs_delta_weight)
         solver_objective_gamma = raw_gamma
@@ -1154,6 +1566,12 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
         solver_status = int(solved.status)
         solver_message = str(solved.message)
         status = "optimal"
+
+    # Measured for every policy: zero certifies that the weights actually
+    # applied minimize w^T C w, whatever produced them, so a Frank-Wolfe or
+    # fixed round carries a measured optimality gap rather than an assumption.
+    applied_certificate = float(wolfe_certificate(cosine, active_w))
+    direction_telemetry["wolfe_certificate_value"] = applied_certificate
 
     payoffs = cosine @ active_w
     gamma = float(np.min(payoffs))
@@ -1174,8 +1592,7 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
             declared_step_norm=declared_step_norm,
             solver_message=solver_message, active_indices=active,
             cosine_gram_active=cosine_list, simplex_weights=simplex,
-            min_norm_value=min_norm_value,
-            min_norm_solver=min_norm_info,
+            **direction_telemetry,
             gamma=gamma, mixture_norm=mixture_norm, module_scales=scales,
             solver_objective_gamma=solver_objective_gamma,
             solver_simplex_residual=solver_simplex_residual,
@@ -1199,8 +1616,7 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
             declared_step_norm=declared_step_norm,
             solver_message=solver_message, active_indices=active,
             cosine_gram_active=cosine_list, simplex_weights=simplex,
-            min_norm_value=min_norm_value,
-            min_norm_solver=min_norm_info,
+            **direction_telemetry,
             gamma=gamma, mixture_norm=mixture_norm, module_scales=scales,
             solver_objective_gamma=solver_objective_gamma,
             solver_simplex_residual=solver_simplex_residual,
@@ -1230,8 +1646,7 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
                 f"coefficient reconstruction produced norm {solved_norm} "
                 f"instead of {step_norm}"),
             active_indices=active, cosine_gram_active=cosine_list,
-            min_norm_value=min_norm_value,
-            min_norm_solver=min_norm_info,
+            **direction_telemetry,
             simplex_weights=simplex, gamma=gamma,
             mixture_norm=mixture_norm, module_scales=scales,
             solver_objective_gamma=solver_objective_gamma,
@@ -1269,8 +1684,11 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
         "gamma": gamma,
         "mixture_norm": mixture_norm,
         "achieved_min_direction_cosine": achieved_cosine,
-        "min_norm_value": min_norm_value,
-        "min_norm_solver": min_norm_info,
+        # Spread rather than re-listed: this dict and every fail-closed
+        # return must carry the SAME direction telemetry, and hand-copying the
+        # keys into both is how they drifted apart in the first place.
+        **direction_telemetry,
+        "wolfe_certificate": applied_certificate,
         "direction_solver_shortfall": (
             None if achieved_cosine is None
             else float(min_norm_value - achieved_cosine)),

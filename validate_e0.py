@@ -28,7 +28,7 @@ _LORA_KEY = re.compile(r"(.*)\.lora_(A|B)\.weight$")
 _AGGREGATE_RTOL = 1e-5
 
 _SUPPORTED_ARMS = (None, "rawmaxmin", "normmaxmin")
-_DIRECTION_POLICIES = ("minnorm", "maxmin-lp")
+_DIRECTION_POLICIES = ("minnorm", "maxmin-lp", "exact", "fixed")
 
 # The applied step norm and the median active client norm reach the same
 # quantity by different routes: one through the float64 geometry scale
@@ -314,7 +314,52 @@ def _validate_direction_policy(diagnostic, round_label):
                   "direction_solver_shortfall"):
         _require(_finite(diagnostic.get(field)),
                  f"{round_label}: invalid {field}")
+    policy = diagnostic.get("direction_policy")
     solver = diagnostic.get("min_norm_solver") or {}
+    exact = diagnostic.get("exact_solver")
+
+    if policy == "exact":
+        # The exact arm is NOT gated on the iterative reference solver. E3's
+        # federations are built from near-duplicate clients, so their Gram is
+        # singular by construction and away-step Frank-Wolfe stalls on them by
+        # design (measured Wolfe gaps 1.1e-06 and 4.8e-07 on a 3-clone
+        # federation). Gating the exact arm on that solver would have rejected
+        # every E3 clone run while the answer it applied carried a proof.
+        # What is required instead is that proof: the face enumeration's own
+        # solver-independent Wolfe certificate.
+        _require(isinstance(exact, dict),
+                 f"{round_label}: the exact arm recorded no exact_solver "
+                 "diagnostics, so the applied direction carries no proof")
+        _require(exact.get("algorithm") == "face-enumeration-least-norm-argmin/v1",
+                 f"{round_label}: unknown exact solver algorithm "
+                 f"'{exact.get('algorithm')}'")
+        _require(diagnostic.get("min_norm_value_source")
+                 == "exact-face-enumeration",
+                 f"{round_label}: the exact arm did not source its attainable "
+                 f"optimum from the face enumeration "
+                 f"(source '{diagnostic.get('min_norm_value_source')}')")
+        certificate = exact.get("wolfe_certificate")
+        _require(_finite(certificate) and abs(float(certificate)) <= 1e-8,
+                 f"{round_label}: the exact solver's optimality certificate "
+                 f"is {certificate!r}, not zero: the applied direction is not "
+                 "certified optimal")
+        return
+
+    if policy == "fixed":
+        # A fixed arm solves nothing, so neither solver's convergence is a
+        # property of the round. What must be on the record is the declared
+        # weight vector and the MEASURED distance from optimal, which is what
+        # makes the arm interpretable as a control rather than an attempt.
+        weights = diagnostic.get("fixed_weights")
+        _require(isinstance(weights, (list, tuple)) and len(weights) > 0
+                 and all(_finite(value) for value in weights),
+                 f"{round_label}: the fixed arm recorded no finite declared "
+                 f"weight vector (got {weights!r})")
+        _require(_finite(diagnostic.get("wolfe_certificate")),
+                 f"{round_label}: the fixed arm recorded no measured "
+                 "optimality gap")
+        return
+
     _require(solver.get("converged") is True,
              f"{round_label}: the min-norm reference solver did not converge "
              f"(gap {solver.get('gap')} after {solver.get('iterations')} "

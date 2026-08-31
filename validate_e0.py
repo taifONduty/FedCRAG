@@ -27,7 +27,7 @@ _LORA_KEY = re.compile(r"(.*)\.lora_(A|B)\.weight$")
 # exactly 0 on every frozen-A path. A global rescaled by 1.5x scores 5.0e+04.
 _AGGREGATE_RTOL = 1e-5
 
-_SUPPORTED_ARMS = (None, "rawmaxmin", "normmaxmin")
+_SUPPORTED_ARMS = (None, "rawmaxmin", "normmaxmin", "examples")
 _DIRECTION_POLICIES = ("minnorm", "maxmin-lp", "exact", "fixed")
 
 # The applied step norm and the median active client norm reach the same
@@ -213,6 +213,25 @@ def _round_coefficients(result, round_label, num_clients):
         _require(not result.get("weighted"),
                  f"{round_label}: weighted run records no weighting arm")
         return kind, [1.0 / num_clients] * num_clients
+
+    if arm == "examples":
+        # n_k weighting: w_k = num_examples_k / sum_j num_examples_j, derived
+        # from the PERSISTED per-round client stats so the recomputation
+        # checks the coefficients the run says it earned, not an assumption.
+        # Legal in either coordinate: FedAvg on factor states (trainable-ab)
+        # or the same simplex weights on raw-B deltas (frozen-a).
+        stats = (result.get("clients") or {}).get(round_label)
+        _require(isinstance(stats, dict),
+                 f"{round_label}: examples round has no per-client stats")
+        counts = []
+        for name in result["slices"]:
+            count = (stats.get(name) or {}).get("num_examples")
+            _require(isinstance(count, (int, float)) and count >= 0,
+                     f"{round_label}: no persisted num_examples for '{name}'")
+            counts.append(float(count))
+        total = sum(counts)
+        _require(total > 0, f"{round_label}: example counts sum to zero")
+        return kind, [value / total for value in counts]
 
     if arm == "normmaxmin":
         _require(frozen,

@@ -685,3 +685,45 @@ def test_validator_accepts_the_exact_arm_when_frank_wolfe_stalls():
     iterative = dict(stalled, direction_policy="minnorm")
     with pytest.raises(E0ValidationError, match="did not converge"):
         _validate_direction_policy(iterative, "round 1")
+
+
+# --- The examples (n_k) arm — registered program §9.2 needs it validated ----
+
+COUNTS = {"c0": 1000, "c1": 100, "c2": 10}
+
+
+@pytest.mark.parametrize("lora_mode,row_scale", [
+    ("trainable-ab", None), ("frozen-a", "peft-init"),
+])
+def test_examples_arm_validates_in_both_coordinates(
+        monkeypatch, tmp_path, lora_mode, row_scale):
+    """n_k weighting must pass the canonical validator in BOTH coordinates.
+
+    During E1 this gap was papered over with a patched validation-only tree on
+    the VM; the registered program's fail-fast chain validates every run with
+    the canonical validator, so the reference belongs here, tested. The counts
+    are distinct so examples-weighting is NOT numerically uniform: a validator
+    that quietly assumed 1/K would fail this test.
+    """
+    driver_harness.run_driver(
+        monkeypatch, tmp_path, lora_mode, "examples",
+        row_scale=row_scale, example_counts=COUNTS)
+    assert validate_run_directory(tmp_path)["rounds_validated"] == 1
+
+
+def test_examples_arm_recomputation_actually_uses_the_counts(
+        monkeypatch, tmp_path):
+    """Tampered num_examples must be REFUSED, not averaged over.
+
+    The recomputation derives w_k = n_k / sum(n) from the persisted counts and
+    recomputes the aggregate; if the counts can be edited without the
+    validator noticing, the reference validates nothing.
+    """
+    result, path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "frozen-a", "examples",
+        row_scale="peft-init", example_counts=COUNTS)
+    forged = json.loads(path.read_text())
+    forged["clients"]["round_1"]["c0"]["num_examples"] = 10
+    path.write_text(json.dumps(forged))
+    with pytest.raises(E0ValidationError):
+        validate_run_directory(tmp_path)

@@ -93,8 +93,9 @@ def cosine_gram(states, broadcast):
 
 
 def install_mocks(monkeypatch, commit=CLEAN_COMMIT, clients=None,
-                  row_scale_c=1.0):
+                  row_scale_c=1.0, example_counts=None):
     clients = clients or client_states(row_scale_c)
+    example_counts = example_counts or {}
     base = broadcast_state(row_scale_c)
 
     monkeypatch.setattr(driver, "get_git_commit", lambda: commit)
@@ -121,7 +122,7 @@ def install_mocks(monkeypatch, commit=CLEAN_COMMIT, clients=None,
         lambda model, global_state, data, q_prefix, d_prefix, epochs,
                batch_size, lr, name, max_steps=0:
             ({key: value.clone() for key, value in clients[name].items()},
-             10, 1))
+             example_counts.get(name, 10), 1))
     monkeypatch.setattr(
         driver, "eval_global",
         lambda model, state, data, slices, q_prefix, d_prefix, metrics,
@@ -155,10 +156,11 @@ def build_argv(out_directory, lora_mode, arm, num_rounds=1,
 
 def run_driver(monkeypatch, out_directory, lora_mode, arm, num_rounds=1,
                direction_policy="minnorm", commit=CLEAN_COMMIT, extra=(),
-               clients=None, row_scale_c=1.0, row_scale="unit"):
+               clients=None, row_scale_c=1.0, row_scale="unit",
+               example_counts=None):
     """Run one driver invocation; returns (result dict, result path)."""
     install_mocks(monkeypatch, commit=commit, clients=clients,
-                  row_scale_c=row_scale_c)
+                  row_scale_c=row_scale_c, example_counts=example_counts)
     monkeypatch.setattr(sys, "argv", build_argv(
         out_directory, lora_mode, arm, num_rounds=num_rounds,
         direction_policy=direction_policy, extra=extra,

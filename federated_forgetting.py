@@ -296,6 +296,9 @@ def _frozen_run_configuration_sha256(args, data_sha256=None, row_scale=None):
         # would overwrite each other.
         fields["fedspan_fixed_weights"] = [float(value)
                                            for value in fixed_weights]
+    weight_pow = getattr(args, "weight_pow", None)
+    if weight_pow is not None:
+        fields["weight_pow"] = float(weight_pow)
     shadow_sizes = getattr(args, "fedspan_shadow_sketch", None)
     if shadow_sizes is not None:
         # Same only-when-supplied rule as fixed weights: legacy runs keep
@@ -481,6 +484,14 @@ def main():
                          "(arXiv:1902.00146), 'mgda' = min-norm weights on the "
                          "raw update Gram (arXiv:1810.04650), 'fednova' = "
                          "tau-normalized averaging (arXiv:2007.07481)")
+    ap.add_argument("--weight_pow", type=float, default=None,
+                    help="q-dose-response exponent (registration SS9.3): "
+                         "with --weight_by examples, weights become "
+                         "n_k^q / sum_j n_j^q, interpolating uniform (q=0) "
+                         "to canonical FedAvg n_k (q=1). Only-when-supplied: "
+                         "omitting it preserves every historical filename "
+                         "and configuration hash; distinct q values get "
+                         "distinct filenames")
     ap.add_argument("--qffl_q", type=float, default=1.0,
                     help="q-FedAvg fairness exponent q (only with "
                          "--weight_by qffl)")
@@ -629,6 +640,12 @@ def main():
     if args.weight_by == "maxmin":
         print("  WARNING: --weight_by maxmin is the historical rawmaxmin "
               "alias, not norm-consistent FedSpan")
+    if args.weight_pow is not None:
+        if not args.weighted or args.weight_by != "examples":
+            ap.error("--weight_pow is legal only with --weight_by examples "
+                     "(the q axis reweights n_k)")
+        if not np.isfinite(args.weight_pow) or args.weight_pow < 0:
+            ap.error("--weight_pow must be a finite nonnegative float")
     if (args.fedspan_shadow_sketch is not None
             and canonical_weight_by != "normmaxmin"):
         ap.error("--fedspan_shadow_sketch is legal only with --weight_by "
@@ -786,6 +803,10 @@ def main():
     # canonical result-affecting configuration hash so capped/full and other
     # scientifically distinct settings cannot overwrite one another.
     basis = f"weighted-{args.weight_by}" if args.weighted else "unweighted"
+    if args.weight_pow is not None:
+        # Distinct q values are scientifically distinct runs; without this
+        # tag the whole q-sweep would collapse onto one output path.
+        basis += "-q" + format(args.weight_pow, ".8g").replace(".", "p")
     if canonical_weight_by == "normmaxmin":
         if args.fedspan_step_policy == "fixed":
             step_tag = format(args.fedspan_step_norm, ".8g").replace(".", "p")
@@ -999,6 +1020,12 @@ def main():
             weights = [len(data[s]["corpus"]) for s in args.slices]
         else:
             weights = n_examples
+            if args.weight_pow is not None:
+                # w_k oc n_k^q. Normalisation happens downstream; q=1 must
+                # reproduce the historical path bit-for-bit, so the exponent
+                # is applied only when explicitly supplied.
+                weights = [float(count) ** args.weight_pow
+                           for count in n_examples]
         if scheme_result is not None:
             # Symmetric with fedspan_diagnostics: a solver failure that
             # degrades an arm to uniform must stay detectable in the record

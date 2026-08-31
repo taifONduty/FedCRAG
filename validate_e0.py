@@ -229,6 +229,11 @@ def _round_coefficients(result, round_label, num_clients):
             _require(isinstance(count, (int, float)) and count >= 0,
                      f"{round_label}: no persisted num_examples for '{name}'")
             counts.append(float(count))
+        exponent = (result.get("args") or {}).get("weight_pow")
+        exponent = 1.0 if exponent is None else float(exponent)
+        _require(exponent >= 0 and exponent == exponent,
+                 f"{round_label}: invalid weight_pow {exponent!r}")
+        counts = [value ** exponent for value in counts]
         total = sum(counts)
         _require(total > 0, f"{round_label}: example counts sum to zero")
         return kind, [value / total for value in counts]

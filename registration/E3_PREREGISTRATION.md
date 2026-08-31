@@ -488,5 +488,4 @@ supervised session reply of 2026-08-31 ("Name: Turjo"), transcribed at the
 student's instruction. Predictions adopted-after-review per the §4 provenance
 note.
 
-Commit hash of this file at registration: recorded in `REGISTRATION_LOCK`
-by the follow-up lock commit (a commit cannot contain its own hash).
+Commit hash of this file at registration: 1b7d397a52a9102289723e1d34e2aa2242d7f070

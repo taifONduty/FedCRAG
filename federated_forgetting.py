@@ -296,6 +296,12 @@ def _frozen_run_configuration_sha256(args, data_sha256=None, row_scale=None):
         # would overwrite each other.
         fields["fedspan_fixed_weights"] = [float(value)
                                            for value in fixed_weights]
+    shadow_sizes = getattr(args, "fedspan_shadow_sketch", None)
+    if shadow_sizes is not None:
+        # Same only-when-supplied rule as fixed weights: legacy runs keep
+        # their hash and filename; a shadowed run is a distinct configuration.
+        fields["fedspan_shadow_sketch"] = [int(value)
+                                           for value in shadow_sizes]
     encoded = json.dumps(
         fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -521,6 +527,17 @@ def main():
                          "it only in w. Norm-equalised uniform is 1/K per "
                          "client; a two-distribution oracle over three clones "
                          "and one singleton is 1/6 1/6 1/6 1/2")
+    ap.add_argument("--fedspan_shadow_sketch", nargs="+", type=int,
+                    default=None, metavar="M",
+                    help="record, every round, what an M-dimensional shared "
+                         "Gaussian sketch of the client updates WOULD have "
+                         "done: sketched Gram, sketched-solve weights, and "
+                         "their worst-case alignment in the true geometry. "
+                         "Behavior-neutral -- the applied weights are "
+                         "bit-identical with and without it (under test). "
+                         "Feasibility telemetry for a secure-aggregation-"
+                         "compatible Gram (supervisor note 2026-08-31). "
+                         "Sizes ascend, e.g. 1024 4096")
     ap.add_argument("--fedspan_step_norm", type=float, default=None,
                     help="positive finite true effective-B step norm s, "
                          "required only with --fedspan_step_policy fixed")
@@ -612,6 +629,10 @@ def main():
     if args.weight_by == "maxmin":
         print("  WARNING: --weight_by maxmin is the historical rawmaxmin "
               "alias, not norm-consistent FedSpan")
+    if (args.fedspan_shadow_sketch is not None
+            and canonical_weight_by != "normmaxmin"):
+        ap.error("--fedspan_shadow_sketch is legal only with --weight_by "
+                 "normmaxmin: the sketch shadows the geometry pipeline")
     if canonical_weight_by == "normmaxmin":
         if not args.weighted:
             ap.error("--weight_by normmaxmin requires --weighted")
@@ -646,6 +667,14 @@ def main():
         elif args.fedspan_fixed_weights is not None:
             ap.error("--fedspan_fixed_weights is legal only with "
                      "--fedspan_direction_policy fixed")
+        if args.fedspan_shadow_sketch is not None:
+            sizes = args.fedspan_shadow_sketch
+            if any(m < 8 or m > (1 << 20) for m in sizes):
+                ap.error("--fedspan_shadow_sketch sizes must lie in "
+                         "[8, 1048576]")
+            if sorted(sizes) != sizes or len(set(sizes)) != len(sizes):
+                ap.error("--fedspan_shadow_sketch sizes must be strictly "
+                         "ascending")
         if args.fedspan_step_policy == "fixed":
             if (args.fedspan_step_norm is None
                     or not np.isfinite(args.fedspan_step_norm)
@@ -896,6 +925,17 @@ def main():
                 states, round_broadcast, module_scales=materialized_scales)
             scheme_result = weights
         elif args.weight_by == "normmaxmin":
+            shadow_request = None
+            if args.fedspan_shadow_sketch is not None:
+                # Deterministic, recorded, and distinct per round: the same
+                # run seed always reproduces the same sketch matrices.
+                digest = hashlib.sha256(
+                    f"{args.seed}|{rnd + 1}|shadow-sketch".encode(
+                        "utf-8")).hexdigest()
+                shadow_request = {
+                    "sizes": tuple(args.fedspan_shadow_sketch),
+                    "seed": int(digest[:8], 16),
+                }
             fedspan = fedspan_delta_weights(
                 states, round_broadcast, module_scales=module_scales,
                 step_norm=args.fedspan_step_norm,
@@ -905,7 +945,8 @@ def main():
                 active_abs_tol=args.fedspan_active_abs_tol,
                 active_rel_tol=args.fedspan_active_rel_tol,
                 mixture_norm_tol=args.fedspan_mixture_norm_tol,
-                max_abs_delta_weight=args.fedspan_max_abs_delta_weight)
+                max_abs_delta_weight=args.fedspan_max_abs_delta_weight,
+                shadow_sketch=shadow_request)
             precomputed_state, applied = apply_fedspan_update(
                 round_broadcast, states, fedspan,
                 module_scales=module_scales)

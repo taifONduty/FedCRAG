@@ -748,7 +748,8 @@ def _zero_fedspan_result(status, client_norms, active_mask,
                          achieved_min_direction_cosine=None,
                          frank_wolfe_value=None, frank_wolfe_converged=None,
                          exact_measurement_note=None,
-                         applied_direction_solver=None):
+                         applied_direction_solver=None,
+                         shadow_sketch=None):
     K = len(client_norms)
     shortfall = (None if (min_norm_value is None
                           or achieved_min_direction_cosine is None)
@@ -765,6 +766,8 @@ def _zero_fedspan_result(status, client_norms, active_mask,
         "frank_wolfe_value": frank_wolfe_value,
         "frank_wolfe_converged": frank_wolfe_converged,
         "exact_measurement_note": exact_measurement_note,
+        **({"shadow_sketch": shadow_sketch}
+           if shadow_sketch is not None else {}),
         "solver_objective_gamma": solver_objective_gamma,
         "solver_simplex_residual": solver_simplex_residual,
         "solver_constraint_violation": solver_constraint_violation,
@@ -1164,12 +1167,112 @@ def _validate_fixed_weights(fixed_weights, direction_policy, client_count):
     return values
 
 
+def _validate_shadow_sketch_config(shadow_sketch):
+    """Fail-fast config check; the caller contract, not runtime diagnostics."""
+    if not isinstance(shadow_sketch, dict) or "seed" not in shadow_sketch:
+        raise ValueError("shadow_sketch requires {'sizes': ..., 'seed': int}")
+    sizes = list(shadow_sketch.get("sizes") or [])
+    if not sizes or any((not isinstance(m, (int, np.integer)) or m < 8
+                         or m > (1 << 20)) for m in sizes):
+        raise ValueError(
+            "shadow_sketch sizes must be ints in [8, 1048576]")
+    if sorted(sizes) != sizes or len(set(sizes)) != len(sizes):
+        raise ValueError("shadow_sketch sizes must be strictly ascending")
+    return [int(m) for m in sizes], int(shadow_sketch["seed"])
+
+
+def _shadow_sketch_record(blocks, names, active, active_norms, cosine,
+                          exact_optimum, sizes, seed, chunk_columns=65536):
+    """What an m-dimensional Gaussian sketch WOULD have done this round.
+
+    Feasibility instrument for a secure-aggregation-compatible Gram
+    (supervisor note 2026-08-31): every client projects its effective update
+    through the SAME per-round Gaussian matrix -- pinned by test: exact clones
+    must sketch to cosine exactly 1 -- and the direction is solved on the
+    sketched Gram. Only RECORDED here; the applied weights never touch it,
+    and the bit-identity of the applied path with telemetry on and off is
+    itself under test.
+
+    Never raises. The applied path is fail-closed; this is a counterfactual
+    diagnostic, and a telemetry crash that aborted a pre-registered run would
+    create pressure to strip telemetry mid-experiment -- worse for integrity
+    than a loudly-recorded gap. Failures land in the record and on stdout.
+
+    The nested-prefix trick makes all sizes one pass: rows of a Gaussian
+    sketch are iid, so the first m coordinates of the m_max-dim sketch ARE an
+    m-dim Gaussian sketch.
+    """
+    import time
+    started = time.perf_counter()
+    record = {"sizes": [int(m) for m in sizes], "seed": int(seed),
+              "numpy_version": np.__version__, "per_size": {}}
+    try:
+        m_max = max(sizes)
+        vectors = []
+        for index in active:
+            parts = [np.asarray(blocks[index][name].detach().cpu(),
+                                dtype=np.float32).ravel() for name in names]
+            vectors.append(np.concatenate(parts))
+        X = np.stack(vectors)                          # (M, D) float32
+        M, D = X.shape
+        rng = np.random.default_rng(seed)
+        Y = np.zeros((M, m_max), dtype=np.float32)
+        for start in range(0, D, chunk_columns):
+            stop = min(start + chunk_columns, D)
+            S = rng.standard_normal((m_max, stop - start), dtype=np.float32)
+            Y += X[:, start:stop] @ S.T
+        C_true = np.asarray(cosine, dtype=np.float64)
+        norms_true = np.asarray(active_norms, dtype=np.float64)
+        for m in sizes:
+            entry = {}
+            try:
+                Ys = Y[:, :m].astype(np.float64) / math.sqrt(m)
+                r_hat = np.linalg.norm(Ys, axis=1)
+                if r_hat.min() <= 0.0:
+                    raise DirectionSolverError(
+                        "sketched norm collapsed to zero")
+                C_hat = (Ys @ Ys.T) / np.outer(r_hat, r_hat)
+                C_hat = 0.5 * (C_hat + C_hat.T)
+                np.fill_diagonal(C_hat, 1.0)
+                w_hat, value_hat = minnorm_exact_weights(C_hat)
+                mix = float(w_hat @ C_true @ w_hat)
+                if mix <= 0.0:
+                    raise DirectionSolverError(
+                        "sketched direction cancels in the true geometry")
+                gamma_true = float(np.min(C_true @ w_hat)) / math.sqrt(mix)
+                entry = {
+                    "sketched_norms": [float(v) for v in r_hat],
+                    "sketched_cosine_gram": C_hat.tolist(),
+                    "weights": [float(v) for v in w_hat],
+                    "value_sketched": float(value_hat),
+                    "gamma_true_of_sketched_direction": gamma_true,
+                    "shortfall_vs_exact": (
+                        None if exact_optimum is None
+                        else float(exact_optimum - gamma_true)),
+                    "gram_max_abs_err": float(np.max(np.abs(C_hat - C_true))),
+                    "norm_max_rel_err": float(np.max(
+                        np.abs(r_hat - norms_true) / norms_true)),
+                }
+            except (DirectionSolverError, np.linalg.LinAlgError,
+                    ValueError) as exc:
+                entry = {"failed": f"{type(exc).__name__}: {exc}"}
+                print(f"  WARNING shadow sketch m={m} failed (recorded, "
+                      f"run continues): {exc}")
+            record["per_size"][str(m)] = entry
+    except Exception as exc:                # noqa: BLE001 - diagnostics only
+        record["failed"] = f"{type(exc).__name__}: {exc}"
+        print(f"  WARNING shadow sketch failed entirely (recorded, run "
+              f"continues): {exc}")
+    record["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+    return record
+
+
 def fedspan_delta_weights(client_states, broadcast_state, module_scales,
                           step_norm=None, step_policy="fixed",
                           direction_policy=None, fixed_weights=None,
                           active_abs_tol=1e-12,
                           active_rel_tol=1e-8, mixture_norm_tol=1e-6,
-                          max_abs_delta_weight=None):
+                          max_abs_delta_weight=None, shadow_sketch=None):
     """Frozen-A, norm-consistent worst-case-cosine aggregation coefficients.
 
     Geometry is formed from concatenated effective PEFT blocks
@@ -1227,6 +1330,10 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
     if step_policy not in ("fixed", "median-active"):
         raise ValueError(
             "step_policy must be 'fixed' or 'median-active'")
+    shadow_sizes = shadow_seed = None
+    if shadow_sketch is not None:
+        shadow_sizes, shadow_seed = _validate_shadow_sketch_config(
+            shadow_sketch)
     if step_policy == "fixed":
         if (step_norm is None or not math.isfinite(float(step_norm))
                 or float(step_norm) <= 0):
@@ -1420,6 +1527,11 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
             "fixed": "declared-weights-no-solve",
         }[direction_policy],
     }
+
+    if shadow_sizes is not None:
+        direction_telemetry["shadow_sketch"] = _shadow_sketch_record(
+            blocks, names, active, active_norms, cosine, min_norm_value,
+            sizes=shadow_sizes, seed=shadow_seed)
 
     if direction_policy == "fixed":
         active_w = np.asarray([fixed_weights[index] for index in active],

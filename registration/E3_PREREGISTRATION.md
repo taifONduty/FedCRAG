@@ -347,6 +347,7 @@ Every prediction is reported, hit or miss, in the paper's supplement.
 
 | date | deviation from this registration | reason |
 |---|---|---|
+| 2026-08-31 | Interpretation clarified, no run/budget change: "K=2 clone control" is implemented literally as the two-client no-clone anchor federation {nfcorpus unsharded, arguana} × {FedSpan, norm-equalised uniform} × 3 seeds, per the original audit wording. Encoded in `e3_manifest.py`, pinned by tests. | The signed §1 phrase was ambiguous between this and an m=2-shards reading; the literal reading avoids double-running the m-sweep's m=2 cells and keeps the registered count at exactly 33. |
 | | | |
 
 ---

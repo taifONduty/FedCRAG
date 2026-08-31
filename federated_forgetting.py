@@ -296,6 +296,9 @@ def _frozen_run_configuration_sha256(args, data_sha256=None, row_scale=None):
         # would overwrite each other.
         fields["fedspan_fixed_weights"] = [float(value)
                                            for value in fixed_weights]
+    if getattr(args, "fedspan_step_policy", None) == "fedmgda":
+        fields["fedspan_fedmgda_eta0"] = float(args.fedspan_fedmgda_eta0)
+        fields["fedspan_fedmgda_decay"] = float(args.fedspan_fedmgda_decay)
     weight_pow = getattr(args, "weight_pow", None)
     if weight_pow is not None:
         fields["weight_pow"] = float(weight_pow)
@@ -503,7 +506,8 @@ def main():
                          "point loss estimate (qffl/afl only; deterministic "
                          "per round)")
     ap.add_argument("--fedspan_step_policy",
-                    choices=["fixed", "median-active"], default=None,
+                    choices=["fixed", "median-active", "fedmgda"],
+                    default=None,
                     help="explicit true effective-B step policy required for "
                          "--weight_by normmaxmin")
     ap.add_argument("--fedspan_direction_policy",
@@ -538,6 +542,16 @@ def main():
                          "it only in w. Norm-equalised uniform is 1/K per "
                          "client; a two-distribution oracle over three clones "
                          "and one singleton is 1/6 1/6 1/6 1/2")
+    ap.add_argument("--fedspan_fedmgda_eta0", type=float, default=1.0,
+                    help="fedmgda step policy only: initial global step eta0 "
+                         "(arXiv:2006.11489 Table 5 grid centre 1.0)")
+    ap.add_argument("--fedspan_fedmgda_decay", type=float, default=0.1,
+                    help="fedmgda step policy only: total exponential decay "
+                         "over the run, eta_t = eta0 * decay^((t-1)/(T-1)) "
+                         "-- the continuous form of the source's "
+                         "beta^floor(t/100) staircase, which never fires "
+                         "below 100 rounds; preserves eta_T/eta_1 = decay "
+                         "(their settled schedule, SS6.1.5; grid centre 0.1)")
     ap.add_argument("--fedspan_shadow_sketch", nargs="+", type=int,
                     default=None, metavar="M",
                     help="record, every round, what an M-dimensional shared "
@@ -692,6 +706,22 @@ def main():
             if sorted(sizes) != sizes or len(set(sizes)) != len(sizes):
                 ap.error("--fedspan_shadow_sketch sizes must be strictly "
                          "ascending")
+        if args.fedspan_step_policy == "fedmgda":
+            if args.fedspan_step_norm is not None:
+                ap.error("fedmgda step policy rejects --fedspan_step_norm: "
+                         "eta_t is computed from --fedspan_fedmgda_eta0 and "
+                         "--fedspan_fedmgda_decay")
+            if args.fedspan_direction_policy not in ("minnorm", "exact"):
+                ap.error("fedmgda step policy requires "
+                         "--fedspan_direction_policy minnorm or exact: "
+                         "Algorithm 1's lambda* IS the min-norm solve, so a "
+                         "fixed or LP direction is not FedMGDA+")
+            if (not np.isfinite(args.fedspan_fedmgda_eta0)
+                    or args.fedspan_fedmgda_eta0 <= 0):
+                ap.error("--fedspan_fedmgda_eta0 must be positive and finite")
+            if (not np.isfinite(args.fedspan_fedmgda_decay)
+                    or not 0 < args.fedspan_fedmgda_decay <= 1):
+                ap.error("--fedspan_fedmgda_decay must lie in (0, 1]")
         if args.fedspan_step_policy == "fixed":
             if (args.fedspan_step_norm is None
                     or not np.isfinite(args.fedspan_step_norm)
@@ -810,6 +840,13 @@ def main():
     if canonical_weight_by == "normmaxmin":
         if args.fedspan_step_policy == "fixed":
             step_tag = format(args.fedspan_step_norm, ".8g").replace(".", "p")
+        elif args.fedspan_step_policy == "fedmgda":
+            step_tag = ("fedmgda-e"
+                        + format(args.fedspan_fedmgda_eta0,
+                                 ".8g").replace(".", "p")
+                        + "-d"
+                        + format(args.fedspan_fedmgda_decay,
+                                 ".8g").replace(".", "p"))
         else:
             step_tag = "median-active"
         basis += f"-s{step_tag}-dir{args.fedspan_direction_policy}"
@@ -957,9 +994,16 @@ def main():
                     "sizes": tuple(args.fedspan_shadow_sketch),
                     "seed": int(digest[:8], 16),
                 }
+            fedspan_step_norm = args.fedspan_step_norm
+            if args.fedspan_step_policy == "fedmgda":
+                exponent = ((rnd) / (args.num_rounds - 1)
+                            if args.num_rounds > 1 else 0.0)
+                fedspan_step_norm = float(
+                    args.fedspan_fedmgda_eta0
+                    * args.fedspan_fedmgda_decay ** exponent)
             fedspan = fedspan_delta_weights(
                 states, round_broadcast, module_scales=module_scales,
-                step_norm=args.fedspan_step_norm,
+                step_norm=fedspan_step_norm,
                 step_policy=args.fedspan_step_policy,
                 direction_policy=args.fedspan_direction_policy,
                 fixed_weights=args.fedspan_fixed_weights,

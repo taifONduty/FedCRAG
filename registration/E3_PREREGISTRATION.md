@@ -348,6 +348,7 @@ Every prediction is reported, hit or miss, in the paper's supplement.
 | date | deviation from this registration | reason |
 |---|---|---|
 | 2026-08-31 | Interpretation clarified, no run/budget change: "K=2 clone control" is implemented literally as the two-client no-clone anchor federation {nfcorpus unsharded, arguana} × {FedSpan, norm-equalised uniform} × 3 seeds, per the original audit wording. Encoded in `e3_manifest.py`, pinned by tests. | The signed §1 phrase was ambiguous between this and an m=2-shards reading; the literal reading avoids double-running the m-sweep's m=2 cells and keeps the registered count at exactly 33. |
+| 2026-08-31 | §9.4 hyperparameters transcribed from arXiv:2006.11489 as required: Algorithm 1 — updates normalized to unit length (line 5), λ* = min-norm over {λ∈Δ, ‖λ−λ0‖∞≤ε} (line 6) with ε=1 making the ball inactive (Eq. 25), update w−η_t·d_t un-normalized (line 9). Schedule: their settled choice is exponential decay η_t = β^⌊t/100⌋, β = decay^{100/T} (§6.1.5); below 100 rounds that staircase never fires, so the continuous form η_t = η0·decay^{(t−1)/(T−1)} is implemented, preserving the design target η_T/η_1 = decay. η0 = 1.0, decay = 0.1 — the centres of their Table-5 grids (η∈{0.5,1,1.5,2}, decay∈{0…½}, their example 1/10). Implemented as `--fedspan_step_policy fedmgda` (same direction, solver, and gates as FedSpan; only the step law differs), commit-tested. | Registered precondition of §9.4. |
 | | | |
 
 ---

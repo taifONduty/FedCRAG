@@ -1327,9 +1327,9 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
             + ", ".join(repr(name) for name in DIRECTION_POLICIES))
     fixed_weights = _validate_fixed_weights(
         fixed_weights, direction_policy, len(client_states))
-    if step_policy not in ("fixed", "median-active"):
+    if step_policy not in ("fixed", "median-active", "fedmgda"):
         raise ValueError(
-            "step_policy must be 'fixed' or 'median-active'")
+            "step_policy must be 'fixed', 'median-active', or 'fedmgda'")
     shadow_sizes = shadow_seed = None
     if shadow_sketch is not None:
         shadow_sizes, shadow_seed = _validate_shadow_sketch_config(
@@ -1339,6 +1339,19 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
                 or float(step_norm) <= 0):
             raise ValueError(
                 "fixed step policy requires a positive finite step_norm")
+        declared_step_norm = float(step_norm)
+    elif step_policy == "fedmgda":
+        # Source-faithful FedMGDA+ (arXiv:2006.11489, Algorithm 1, line 9):
+        # step_norm here is eta_t, and the APPLIED norm is eta_t * ||z*|| --
+        # the un-normalized min-norm combination, resolved after the solve.
+        # This is the self-annihilating step their Theorem 1b requires, and
+        # the ONLY difference from FedSpan: same direction, same solver, same
+        # gates, different step law.
+        if (step_norm is None or not math.isfinite(float(step_norm))
+                or float(step_norm) <= 0):
+            raise ValueError(
+                "fedmgda step policy requires a positive finite eta_t "
+                "passed as step_norm")
         declared_step_norm = float(step_norm)
     else:
         if step_norm is not None:
@@ -1398,7 +1411,7 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
 
     resolved_step_norm = (
         declared_step_norm
-        if step_policy == "fixed"
+        if step_policy in ("fixed", "fedmgda")
         else float(np.median([client_norms[index] for index in active])))
     if (not math.isfinite(resolved_step_norm)
             or resolved_step_norm <= 0):
@@ -1711,6 +1724,12 @@ def fedspan_delta_weights(client_states, broadcast_state, module_scales,
             solver_constraint_violation=solver_constraint_violation,
             delta_weight_limit=max_abs_delta_weight)
 
+    if step_policy == "fedmgda":
+        # eta_t entered as step_norm; the applied step is eta_t * z*, so the
+        # resolved norm becomes eta_t * ||sum w u||. The coefficient formula
+        # below then reduces to v_k = eta_t * w_k / r_k exactly, and every
+        # downstream reconstruction check verifies against this norm.
+        step_norm = float(step_norm * mixture_norm)
     coefficients = [0.0] * K
     for local_index, client_index in enumerate(active):
         coefficients[client_index] = float(

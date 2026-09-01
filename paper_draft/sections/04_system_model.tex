@@ -113,16 +113,15 @@ leave-one-out alignment. The erosion ratio between work regimes motivated
 \textsc{a3} and is excluded from scoring; the \emph{Gram} prediction is scored,
 and is recoverable from saved checkpoints at no compute cost.
 
-\item[\textsc{p3} (coordinate invariance) --- \textbf{FALSIFICATION
-STRONGLY INDICATED; adjudication in flight.}] The registered prediction was
-that erosion under $q{=}1$ replicates in the frozen-$A$ coordinate. At the
-completed seed it does not: the same weighting yields SciFact $+0.051$ and
-ArguAna $+0.011$ against the backbone (versus $-0.070$ and $-0.025$ with
-both factors training); the second seed shows the same sign at round 5 of 8
-mid-run, and the third is queued. The registered rule (erosion persists only
-if both minorities are below backbone at $\geq$2/3 seeds) can now only be
-met if both remaining seeds erode; the formal adjudication executes when
-they finish. Per this item's own
+\item[\textsc{p3} (coordinate invariance) --- \textbf{TESTED: FALSIFIED}
+(two seeds complete; adjudication executed).] The registered prediction was
+that erosion under $q{=}1$ replicates in the frozen-$A$ coordinate. It does
+not: at both completed seeds the same weighting yields SciFact
+$+0.051$/$+0.055$ and ArguAna $+0.011$/$+0.019$ against the backbone (versus
+$-0.070$/$-0.077$ and $-0.025$/$-0.017$ with both factors training). With
+two clean seeds the registered erosion-persists rule (both minorities below
+backbone at $\geq$2/3 seeds) is unreachable regardless of the third seed,
+which is in flight and reported for completeness. Per this item's own
 pre-committed consequence, the mechanism is entangled with joint-factor
 optimisation and the model as first stated was wrong. The amendment is in
 \S\ref{sec:model-amend}; the falsification is reported as a result, not an

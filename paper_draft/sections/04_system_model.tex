@@ -1,0 +1,185 @@
+\section{A System Model of Federated Retriever Adaptation}\label{sec:model}
+
+\noindent\textbf{Status.} The observations in \S\ref{sec:phenomenon} motivated this
+model; they are therefore \emph{not} evidence for it. This section states the
+model and derives predictions on quantities and configurations that played no
+role in its construction. \S\ref{sec:tests} reports those tests. We label every
+claim as \textsc{observation}, \textsc{assumption}, or \textsc{prediction}, and
+no prediction is scored against data that motivated it.
+
+\subsection{Setting and the server's observable}
+
+$K$ silos adapt one dense retriever. In round $t$ client $k$ returns an adapter
+delta $\Delta W_k$; the server applies $\Delta W_{\mathrm{agg}}=\sum_k
+v_k\,\Delta W_k$. The server never sees documents, queries, or losses --- only
+the deltas, and hence their Gram
+$G_{ij}=\langle\Delta W_i,\Delta W_j\rangle_F$.
+
+The Gram is exactly computable for \emph{any} fixed shared $A$ via
+$G_{ij}=\sigma^2\operatorname{tr}(\Delta B_i^\top \Delta B_j M_A)$ with
+$M_A=AA^\top$, and remains exactly computable when both factors train, through
+the four-term identity on $B^+A^+-BA$. \textbf{Freezing $A$ is therefore not
+required to measure geometry, and we do not claim it is.} What the shared frozen
+factor buys is exact \emph{application}: an arbitrary aggregate weight-space
+step has no exact rank-$r$ factored representation, so realising a solved
+direction $s\,d^\star$ in the communicated parameterisation requires it. Row
+orthogonality is a conditioning choice on top, making factor-space geometry
+equal weight-space geometry without a metric.
+
+\subsection{What the server can and cannot change}
+
+Constraint C3 (one global model, no personalisation) forecloses the structural
+repair --- private per-client subspaces --- and so removes personalised
+federated learning from the design space. It does \emph{not} leave the
+aggregation direction as the only lever. Two remain: the \textbf{aggregation
+rule} (weights, direction, step norm) and the \textbf{local-work budget} (steps
+per client per round). Both are shown below to move the outcome, and the model
+must account for both.
+
+We parameterise the weighting by an exponent,
+\begin{equation}
+v_k \;\propto\; n_k^{\,q},\qquad q\in[0,1],
+\label{eq:qweight}
+\end{equation}
+recovering uniform averaging at $q=0$ and size-proportional FedAvg at $q=1$.
+Treating $q$ as continuous is what converts a two-arm contrast into a
+dose--response test.
+
+\subsection{Assumptions}
+
+\begin{description}
+\item[\textsc{a1} (first-order progress).] A client's per-round change in
+retrieval quality is governed, to first order, by the component of the applied
+global step along its own update direction:
+$\Delta\mathrm{metric}_k \approx \phi_k(\langle \Delta W_{\mathrm{agg}},
+u_k\rangle)$ with $u_k=\Delta W_k/\|\Delta W_k\|$ and $\phi_k$ increasing near
+zero. This is the model's principal leap: client deltas are multi-step outputs,
+not gradients, so \textsc{a1} is an approximation whose adequacy is an empirical
+question, tested by \textsc{p1}.
+
+\item[\textsc{a2} (received, not self, alignment).] What acts on client $k$ is
+what the \emph{rest} of the federation sends. The governing quantity is the
+leave-one-out alignment
+\begin{equation}
+a_k^{-k}\;=\;\cos\!\Big(\Delta W_k,\;\textstyle\sum_{j\neq k} v_j\,\Delta W_j\Big).
+\label{eq:loo}
+\end{equation}
+The self-inclusive alignment $\cos(\Delta W_k,\Delta W_{\mathrm{agg}})$ is
+\emph{not} a substitute: it is a closed-form function of $(v,\|\Delta W\|,C)$
+that is pinned by $v_k$ alone. At $v_{\max}=0.875$ we measure it at $0.977$
+under the true geometry, $0.978$ under an identity Gram, and $0.978$ under an
+adversarial Gram in which the majority is anti-aligned with every other client
+at $-0.3$. A statistic that cannot distinguish those three geometries carries
+no information about geometry, and we do not report it as evidence.
+
+\item[\textsc{a3} (local work drives divergence).] Increasing local steps per
+round increases both the norm and the mutual divergence of client deltas,
+lowering off-diagonal Gram cosines. Larger, less mutually agreeing deltas make
+any fixed weighting more consequential.
+\end{description}
+
+\subsection{The mechanism}
+
+Combining \textsc{a1}--\textsc{a2}: a weighting concentrates the aggregate on
+whichever client carries the most mass, and every other client then receives a
+step whose projection on its own direction is set by the off-diagonal geometry
+rather than by its own contribution. As $q\to1$ the received alignment of
+under-weighted clients falls toward zero and can pass below it, at which point
+the global step moves those clients \emph{against} their own update direction
+and they surrender ground already gained.
+
+The mechanism makes no exception for the majority. Once the deltas are mutually
+divergent, a client that dominates the aggregate is not thereby helped by the
+others: its own leave-one-out alignment is what the rest of the federation
+contributes to it, and that quantity is small or negative under exactly the
+same conditions. This is why the model predicts the failure is
+\emph{lose--lose} rather than a transfer from small silos to large ones.
+
+\subsection{Predictions}\label{sec:predictions}
+
+None of the following is a restatement of \S\ref{sec:phenomenon}. Each is
+either a new configuration, or a quantity not used to build the model.
+
+\begin{description}
+\item[\textsc{p1} (dose--response).] Minority erosion $E_k$ is monotone
+increasing in $q$ over $q\in\{0,\tfrac14,\tfrac12,\tfrac34,1\}$, and the
+majority's own final score is \emph{non-monotone} in $q$, peaking strictly below
+$q=1$. Two arms cannot establish monotonicity; the curve can. This is the
+model's sharpest test, and a non-monotone minority curve falsifies \textsc{a1}.
+
+\item[\textsc{p2} (local work $\to$ geometry).] Raising the local-step budget at
+fixed $q$ lowers the minority--majority Gram cosine and lowers minority
+leave-one-out alignment. The erosion ratio between work regimes motivated
+\textsc{a3} and is excluded from scoring; the \emph{Gram} prediction is scored,
+and is recoverable from saved checkpoints at no compute cost.
+
+\item[\textsc{p3} (coordinate invariance) --- \textbf{TESTED 2026-09-01:
+FALSIFIED.}] The registered prediction was that erosion under $q{=}1$
+replicates in the frozen-$A$ coordinate. It does not: at both completed seeds
+the same weighting yields SciFact $+0.051$/$+0.074$ and ArguAna
+$+0.011$/$+0.012$ against the backbone (versus $-0.070$/$-0.077$ and
+$-0.025$/$-0.017$ with both factors training), with the third seed in flight
+and the erosion-persists reading already unreachable. Per this item's own
+pre-committed consequence, the mechanism is entangled with joint-factor
+optimisation and the model as first stated was wrong. The amendment is in
+\S\ref{sec:model-amend}; the falsification is reported as a result, not an
+embarrassment --- it is the sharpest fact this section owns.
+
+\item[\textsc{p4} (redundancy).] In a federation containing near-duplicate
+silos, a rule reading only the Gram moves mass off the redundant block, while
+any rule that is a symmetric function of per-client losses cannot --- it assigns
+loss-tied clients equal weight by construction. Pre-registered before data
+collection (Appendix~\ref{app:prereg}) with a committed clone-block mass shift
+from $0.75$ toward $\approx0.54$.
+
+\item[\textsc{p5} (depth-graded damage).] Erosion is graded in depth: shallow
+metrics lose several times more than deep recall, because a relevant document
+leaves $\mathrm{recall}@K$ only by crossing the depth-$K$ boundary while
+shallow order flips on small adjacent margins (conditional no-flip and
+coverage lemmas, \S\ref{sec:theory}). Measured: ArguAna's recall@100
+\emph{improves} while its nDCG@10 erodes at both seeds; SciFact's deep loss is
+$4$--$7\times$ smaller than its shallow loss, not zero --- so the claim is a
+gradient, not an exemption, and the end-to-end margin mechanism is measured at
+query level rather than asserted.
+\end{description}
+
+\subsection{Amendment after the \textsc{p3} test}\label{sec:model-amend}
+
+\textsc{a1}--\textsc{a2} survive with narrowed scope: within a fixed
+parameterisation, received alignment governs \emph{who gains and who loses} ---
+the ordering. In the frozen coordinate, $n_k$ remains the worst weighting for
+the minorities (ArguAna $+0.012$ versus uniform $+0.057$ versus max--min
+alignment $+0.110$ at seed 123), exactly as alignment predicts. What
+\textsc{a1}--\textsc{a2} do not deliver is the \emph{absolute} harm: the
+below-backbone destruction requires the joint-factor pathway that freezing $A$
+removes. We therefore add:
+
+\begin{description}
+\item[\textsc{a4} (interaction).] The received-alignment mechanism composes
+multiplicatively with parameterisation error: under exact aggregation
+(shared fixed $A$), sustained mis-alignment costs a client relative gains;
+under joint two-factor training, the same mis-alignment compounds through
+inexact factor aggregation into absolute regression. Skew is necessary but
+not sufficient for destruction --- skew acting through the factor pathway is
+sufficient.
+\end{description}
+
+Two switches, either sufficient to remove the absolute component: exact
+aggregation (freeze $A$), or de-skewed weighting ($q\to0$, uniform, or
+geometry-aware). The remaining predictions (\textsc{p1}, \textsc{p2},
+\textsc{p4}, \textsc{p5}) are unchanged: they concern the redistribution
+mechanism, which the falsification left intact, and \textsc{p1}'s
+dose--response now doubles as a test of \textsc{a4}'s trainable-coordinate
+side.
+
+\subsection{What the model does not claim}
+
+It does not claim client deltas are gradients; \textsc{a1} is a first-order
+proxy and \textsc{p1} is where it can fail --- as \textsc{p3} already did,
+with the amendment that falsification bought recorded above. It does not claim the Gram
+determines retrieval quality --- only that received alignment is the leading
+term. It says nothing about optimisation across rounds: the aggregate direction
+is re-solved every round and no cross-round regret statement is available. And
+it does not predict that any particular repair improves mean retrieval quality;
+\S\ref{sec:design} reports a design the model implies together with the metrics
+on which it loses.

@@ -114,14 +114,12 @@ leave-one-out alignment. The erosion ratio between work regimes motivated
 and is recoverable from saved checkpoints at no compute cost.
 
 \item[\textsc{p3} (coordinate invariance) --- \textbf{TESTED: FALSIFIED}
-(two seeds complete; adjudication executed).] The registered prediction was
-that erosion under $q{=}1$ replicates in the frozen-$A$ coordinate. It does
-not: at both completed seeds the same weighting yields SciFact
-$+0.051$/$+0.055$ and ArguAna $+0.011$/$+0.019$ against the backbone (versus
-$-0.070$/$-0.077$ and $-0.025$/$-0.017$ with both factors training). With
-two clean seeds the registered erosion-persists rule (both minorities below
-backbone at $\geq$2/3 seeds) is unreachable regardless of the third seed,
-which is in flight and reported for completeness. Per this item's own
+(all three seeds; unanimous).] The registered prediction was that erosion
+under $q{=}1$ replicates in the frozen-$A$ coordinate. It does not: at every
+registered seed the same weighting yields positive drift (SciFact
+$+0.051$/$+0.055$/$+0.048$, ArguAna $+0.011$/$+0.019$/$+0.010$ against the
+backbone, versus $-0.070$/$-0.077$/$-0.076$ and $-0.025$/$-0.017$/$-0.015$
+with both factors training). The erosion-persists rule fails 0 of 3. Per this item's own
 pre-committed consequence, the mechanism is entangled with joint-factor
 optimisation and the model as first stated was wrong. The amendment is in
 \S\ref{sec:model-amend}; the falsification is reported as a result, not an

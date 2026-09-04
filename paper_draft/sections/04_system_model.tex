@@ -132,15 +132,24 @@ loss-tied clients equal weight by construction. Pre-registered before data
 collection (Appendix~\ref{app:prereg}) with a committed clone-block mass shift
 from $0.75$ toward $\approx0.54$.
 
-\item[\textsc{p5} (depth-graded damage).] Erosion is graded in depth: shallow
-metrics lose several times more than deep recall, because a relevant document
-leaves $\mathrm{recall}@K$ only by crossing the depth-$K$ boundary while
-shallow order flips on small adjacent margins (conditional no-flip and
-coverage lemmas, \S\ref{sec:theory}). Measured: ArguAna's recall@100
-\emph{improves} while its nDCG@10 erodes at both seeds; SciFact's deep loss is
-$4$--$7\times$ smaller than its shallow loss, not zero --- so the claim is a
-gradient, not an exemption, and the end-to-end margin mechanism is measured at
-query level rather than asserted.
+\item[\textsc{p5} (depth-graded damage) --- \textbf{TESTED: margin clause
+CONFIRMED (4/4), alignment-sign clause FALSIFIED (4/4)}.] Erosion is graded in
+depth: shallow metrics lose several times more than deep recall, because a
+relevant document leaves $\mathrm{recall}@K$ only by crossing the depth-$K$
+boundary while shallow order flips on small adjacent margins (conditional
+no-flip and coverage lemmas, \S\ref{sec:theory}). Measured at metric level:
+ArguAna's recall@100 \emph{improves} while its nDCG@10 erodes at both seeds;
+SciFact's deep loss is $4$--$7\times$ smaller than its shallow loss, not zero
+--- a gradient, not an exemption. Measured at query level (registered replay,
+\S\ref{sec:mechanism}): exits from the top ten concentrate in the thinnest
+pre-round margin quartile in every replayed file (thin/wide exit-rate ratios
+$1.9$--$2.8$), so the margin channel is real; but the registered clause that
+exits are more frequent when a client's leave-one-out alignment is negative
+fails with the opposite sign in every file, because exits peak in round one
+while alignment turns negative only later. That clause is withdrawn, not
+reinterpreted. The replay also shows the margin gradient under uniform
+weighting, so \textsc{p5} describes \emph{where} damage lands, not \emph{why}
+$n_k$ causes more of it --- for that, see \textsc{a4}.
 \end{description}
 
 \subsection{Amendment after the \textsc{p3} test}\label{sec:model-amend}
@@ -161,7 +170,12 @@ multiplicatively with parameterisation error: under exact aggregation
 under joint two-factor training, the same mis-alignment compounds through
 inexact factor aggregation into absolute regression. Skew is necessary but
 not sufficient for destruction --- skew acting through the factor pathway is
-sufficient.
+sufficient. The query-level replay fixes the form of the compounding: under
+$n_k$ the per-round exit rate of relevant documents from the top ten is
+$2.2$--$3.3\times$ uniform's at every margin quartile, and four times uniform's
+in round one. The interaction enlarges each round's perturbation of the score
+geometry as a whole; it does not selectively attack thin-margin queries, and
+the model should not be read as saying it does.
 \end{description}
 
 Two switches, either sufficient to remove the absolute component: exact

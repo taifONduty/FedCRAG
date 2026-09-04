@@ -129,8 +129,11 @@ embarrassment --- it is the sharpest fact this section owns.
 silos, a rule reading only the Gram moves mass off the redundant block, while
 any rule that is a symmetric function of per-client losses cannot --- it assigns
 loss-tied clients equal weight by construction. Pre-registered before data
-collection (Appendix~\ref{app:prereg}) with a committed clone-block mass shift
-from $0.75$ toward $\approx0.54$.
+collection (Appendix~\ref{app:prereg}): in the five-client clone federation the
+mechanical uniform mass on the clone block is $0.60$, and the committed
+prediction is that the Gram rule moves it to $\approx0.58$, $0.52$ and $0.48$ at
+rounds 1, 8 and 15 (a four-client CPU simulation gave $0.75\to0.54$; it is a
+simulation, not the registered quantity). Untested.
 
 \item[\textsc{p5} (depth-graded damage) --- \textbf{TESTED: margin clause
 CONFIRMED (4/4), alignment-sign clause FALSIFIED (4/4)}.] Erosion is graded in
@@ -157,8 +160,12 @@ $n_k$ causes more of it --- for that, see \textsc{a4}.
 \textsc{a1}--\textsc{a2} survive with narrowed scope: within a fixed
 parameterisation, received alignment governs \emph{who gains and who loses} ---
 the ordering. In the frozen coordinate, $n_k$ remains the worst weighting for
-the minorities (ArguAna $+0.012$ versus uniform $+0.057$ versus max--min
-alignment $+0.110$ at seed 123), exactly as alignment predicts. What
+the minorities (ArguAna $+0.019$ versus uniform $+0.057$ versus max--min
+alignment $+0.110$ at seed 123), as alignment predicts for the weighting
+ordering. The query-level replay, however, shows that leave-one-out alignment
+does not order outcomes \emph{across clients} (\S\ref{sec:mechanism}); the
+ordering claim is therefore limited to the effect of the weighting rule on a
+given client, and is flagged as such. What
 \textsc{a1}--\textsc{a2} do not deliver is the \emph{absolute} harm: the
 below-backbone destruction requires the joint-factor pathway that freezing $A$
 removes. We therefore add:

@@ -354,7 +354,13 @@ def _reference_qffl_coefficients(result, payload, round_label):
              f"{round_label}: q-FFL run records no positive learning rate")
     _require(_finite(q) and float(q) >= 0,
              f"{round_label}: q-FFL run records no valid qffl_q")
-    L = 1.0 / float(lr)
+    recorded_L = recorded_args.get("qffl_L")
+    if recorded_L is None:
+        L = 1.0 / float(lr)
+    else:
+        _require(_finite(recorded_L) and float(recorded_L) > 0,
+                 f"{round_label}: q-FFL run records an invalid qffl_L")
+        L = float(recorded_L)
     q = float(q)
     losses = [max(value, 1e-8) for value in _round_losses(result, round_label)]
     d2 = _trainable_update_sq_norms(payload, result, round_label)

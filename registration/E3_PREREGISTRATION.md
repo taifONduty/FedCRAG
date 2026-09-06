@@ -552,3 +552,28 @@ alone". Requires its own registration file and validator reference before launch
 2026-10-05; no compute after the freeze. Cumulative project compute on 2026-09-06 ≈ $285.
 
 Recorded by the supervisor session at Turjo's instruction, 2026-09-06.
+
+### 13.1 Amendment to A2 — q-FFL's Lipschitz constant (registered 2026-09-06, before any q-FFL run)
+
+The transcribed q-FFL uses the source heuristic L = 1/lr. With full-epoch local updates
+this makes every delta weight of order 1e-5 (analysis from recorded E1 round-1 update
+norms: supervisor/2026-09-06_qffl_degeneracy_note.md), i.e. a no-op arm that would report
+the frozen backbone under the q-FFL label. This is a protocol degeneracy, not a tuning
+question, and is fixed before launch as follows.
+
+- The driver gains `--qffl_L` (commit after 78c6dab). Absent, behaviour and filenames are
+  unchanged (L = 1/lr). Supplied, L is recorded in the run contract, the result args and
+  the filename tag `-L<value>`; the validator recomputes q-FFL's weights with the recorded L.
+- **Rule for L (fixed now, evaluated once, before the full runs):** run one q-FFL
+  preflight round at seed 123 with L = 1/lr (which records the broadcast-point losses
+  F_k and the update norms ||Δ_k|| for round 1). Set
+  L* = Σ_k F_k / Σ_k ||Δ_k||², rounded to two significant figures, so that the two
+  terms of q-FFL's normaliser h_k are of equal total size at round 1. Use q = 1 as
+  transcribed. L* is written into this section with its inputs before the two full runs
+  start and is not changed afterwards.
+- The paper reports both facts: that the published constant is degenerate under this
+  training recipe (one sentence, with the 1e-5 figure), and the rescaled arm's results,
+  labelled "q-FFL, L rescaled by registered rule".
+- Falsifier and decision rule for A2 are unchanged (§13).
+
+Approved by Turjo 2026-09-06 ("go with option 1, add the qffl_L flag").

@@ -302,6 +302,11 @@ def _frozen_run_configuration_sha256(args, data_sha256=None, row_scale=None):
     weight_pow = getattr(args, "weight_pow", None)
     if weight_pow is not None:
         fields["weight_pow"] = float(weight_pow)
+    qffl_L = getattr(args, "qffl_L", None)
+    if qffl_L is not None:
+        # Only when supplied, so every historical q-FFL configuration keeps
+        # the hash and filename it already has.
+        fields["qffl_L"] = float(qffl_L)
     shadow_sizes = getattr(args, "fedspan_shadow_sketch", None)
     if shadow_sizes is not None:
         # Same only-when-supplied rule as fixed weights: legacy runs keep
@@ -498,6 +503,12 @@ def main():
     ap.add_argument("--qffl_q", type=float, default=1.0,
                     help="q-FedAvg fairness exponent q (only with "
                          "--weight_by qffl)")
+    ap.add_argument("--qffl_L", type=float, default=None,
+                    help="q-FedAvg Lipschitz constant L (only with "
+                         "--weight_by qffl). Absent: the paper's heuristic "
+                         "L = 1/lr, which is a no-op under full-epoch local "
+                         "updates; supplied values are recorded in the run "
+                         "contract and the output filename.")
     ap.add_argument("--afl_eta", type=float, default=0.1,
                     help="AFL mixture-weight ascent step size (only with "
                          "--weight_by afl)")
@@ -660,6 +671,11 @@ def main():
                      "(the q axis reweights n_k)")
         if not np.isfinite(args.weight_pow) or args.weight_pow < 0:
             ap.error("--weight_pow must be a finite nonnegative float")
+    if args.qffl_L is not None:
+        if not args.weighted or args.weight_by != "qffl":
+            ap.error("--qffl_L is legal only with --weight_by qffl")
+        if not np.isfinite(args.qffl_L) or args.qffl_L <= 0:
+            ap.error("--qffl_L must be a finite positive float")
     if (args.fedspan_shadow_sketch is not None
             and canonical_weight_by != "normmaxmin"):
         ap.error("--fedspan_shadow_sketch is legal only with --weight_by "
@@ -837,6 +853,10 @@ def main():
         # Distinct q values are scientifically distinct runs; without this
         # tag the whole q-sweep would collapse onto one output path.
         basis += "-q" + format(args.weight_pow, ".8g").replace(".", "p")
+    if args.qffl_L is not None:
+        # Distinct L values are distinct q-FFL arms; the legacy 1/lr run
+        # keeps its untagged name.
+        basis += "-L" + format(args.qffl_L, ".8g").replace(".", "p")
     if canonical_weight_by == "normmaxmin":
         if args.fedspan_step_policy == "fixed":
             step_tag = format(args.fedspan_step_norm, ".8g").replace(".", "p")
@@ -1052,8 +1072,10 @@ def main():
             sq_norms = np.diag(update_gram(
                 states, round_broadcast, module_scales=materialized_scales,
                 dtype=torch.float64)).tolist()
+            qffl_L = (float(args.qffl_L) if args.qffl_L is not None
+                      else 1.0 / args.lr)
             delta_v = qffl_delta_weights(losses, sq_norms, q=args.qffl_q,
-                                         L=1.0 / args.lr)
+                                         L=qffl_L)
             scheme_result = delta_v
         elif args.weight_by == "fednova":
             delta_v = fednova_delta_weights(

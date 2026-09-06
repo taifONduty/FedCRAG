@@ -491,3 +491,64 @@ student's instruction. Predictions adopted-after-review per the §4 provenance
 note.
 
 Commit hash of this file at registration: 1b7d397a52a9102289723e1d34e2aa2242d7f070
+
+## 13. Addendum — Option A benchmark blocks (registered 2026-09-06, before any A1/A2/A3 data)
+
+Signed sections above are unchanged. This addendum records the decision rules for the
+blocks accepted by Turjo on 2026-09-06 ("option A of course") and the standing of the
+Part B items as of that date. Deviations from Part B are stated, not hidden.
+
+**Standing of Part B on 2026-09-06.** 9.1 E-local complete (3 seeds; licensed 3/4 silos,
+refused for NFCorpus). 9.2 P3 complete (0/3; withdrawal executed). 9.4 FedMGDA+ complete
+(3 seeds; outcome (b) with the mean-drift caveat — worst-client outside the margin, mean
+inside at its edge). 9.5 margin replay complete (clause 1 confirmed 4/4, clause 2
+falsified 4/4). **9.3 q-sweep and Part A (E3) will not run before the WWW deadline** —
+decided 2026-09-06, to be stated in the paper's limitations; both stay registered for the
+thesis. 9.6 second backbone is expanded below.
+
+**A0 — matched-total-work control.** Registered separately in
+`experiments/equal_work/REGISTRATION.md` (branch `codex/equal-total-work`, commit 2d6ec4b).
+Reading rule fixed in `research_workspace/supervisor/2026-09-06_equal_work_pilot_reading_guide.md`
+before its result: minorities still below backbone at both seeds ⇒ work skew is not the
+cause, interaction stands; both recover ⇒ A4 gains a work term and "two switches" becomes
+three; disagreement ⇒ preserved, next test is the clean seed-42 pair.
+
+**A1 — second backbone, BGE-base-en-v1.5 (expands 9.6).** Gate: independent per-silo
+fine-tune must beat frozen on every silo (as for Contriever); failure ⇒ BGE dropped, the
+E5-base gate is tried once, and if that fails the paper stays single-backbone and says so.
+Cells: AB $n_k$, AB uniform, frozen-A $n_k$, frozen-A uniform; seeds 123, 2024, 42; R=8,
+one local epoch, lr 2e-5, rank 16 (Contriever recipe; no retuning). Order: s123 AB $n_k$ →
+AB uniform → frozen-A $n_k$ (decisive trio) → remainder. **Predictions:** (i) under AB
+$n_k$ at least one of SciFact/ArguAna finishes below the BGE backbone at ≥2 of 3 seeds;
+(ii) under AB uniform no silo finishes below the backbone; (iii) frozen-A $n_k$ removes
+any below-backbone outcome at ≥2 of 3 seeds. **Falsifiers:** (i) fails ⇒ the phenomenon is
+reported as Contriever-specific and the title's generality is withdrawn to "in a Contriever
+federation"; (iii) fails while (i) holds ⇒ the interaction claim is narrowed to Contriever
+and the mechanism section says so. Primary outcome frozen-anchored nDCG@10 per client;
+co-primary worst-client and cross-client variance; resolvable margin 0.022 carried over.
+
+**A2 — published baselines (new).** q-FFL ($q{=}1$, its loss-power rule), AFL (its mixture
+ascent, $\eta{=}0.1$), FedNova (normalised averaging by local steps), each in the
+trainable coordinate at seeds 123 and 2024, Contriever, same recipe, hyperparameters from
+the source papers as implemented on 2026-08-22 and not retuned. Validator recomputation
+references and tamper tests for all three must exist and pass before any run counts.
+**Decision rule:** a baseline that keeps both minorities at or above the backbone at both
+seeds while costing the majority no more than 0.022 relative to AB $n_k$ is reported as
+removing the harm; the paper then presents FedSpan's step law as one instantiation among
+working fixes and the mechanism section cites that baseline as a third switch. A baseline
+that reduces but does not remove the harm is reported as such. No baseline is retuned on
+our data before its result is recorded.
+
+**A3 — exactness control (new, to be built).** Both LoRA factors trainable, $n_k$ weights,
+server applies a FedEx-LoRA-style residual correction so that the applied update equals
+the exact average of the products; seeds 123 and 2024. **Prediction:** the below-backbone
+harm is removed (both minorities ≥ backbone) at both seeds. **Falsifier:** harm persists at
+both seeds ⇒ inexact aggregation is *not* the operative ingredient; the interaction is
+re-attributed to the capacity/parameterisation change that freezing $A$ also makes, and the
+paper says "freezing a factor removes the harm; we could not attribute this to exactness
+alone". Requires its own registration file and validator reference before launch.
+
+**Budget for this addendum:** ≈ 180 GPU-h ≈ $170 measured; authorised $190; table freeze
+2026-10-05; no compute after the freeze. Cumulative project compute on 2026-09-06 ≈ $285.
+
+Recorded by the supervisor session at Turjo's instruction, 2026-09-06.

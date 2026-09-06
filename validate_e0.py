@@ -27,7 +27,16 @@ _LORA_KEY = re.compile(r"(.*)\.lora_(A|B)\.weight$")
 # exactly 0 on every frozen-A path. A global rescaled by 1.5x scores 5.0e+04.
 _AGGREGATE_RTOL = 1e-5
 
-_SUPPORTED_ARMS = (None, "rawmaxmin", "normmaxmin", "examples")
+_SUPPORTED_ARMS = (None, "rawmaxmin", "normmaxmin", "examples",
+                   "qffl", "afl", "fednova")
+# Recorded scheme weights are compared against a recomputation from the
+# scheme's own persisted inputs. FedNova's inputs are integers, so it is held
+# to float precision; q-FFL and AFL depend on broadcast-point losses that the
+# driver persists rounded to five decimals, so their tolerance is loosened to
+# what that rounding can move (relative 1e-5 per loss, compounded over at most
+# a few tens of rounds for AFL's chain).
+_EXACT_COEFFICIENT_RTOL = 1e-9
+_ROUNDED_LOSS_COEFFICIENT_RTOL = 1e-4
 _DIRECTION_POLICIES = ("minnorm", "maxmin-lp", "exact", "fixed")
 
 # The applied step norm and the median active client norm reach the same
@@ -190,6 +199,174 @@ def _compare_aggregates(expected, actual, label):
     return worst_deviation, worst_ratio, worst_key
 
 
+def _reference_delta_application(broadcast_state, client_states, v):
+    """w^{t+1} = w^t + sum_k v_k (w_k - w^t) on complete states, in float64.
+
+    The delta-space arms (q-FFL, FedNova) produce coefficients that need not
+    sum to one, so the simplex average is the wrong reference for them.
+    """
+    out = {}
+    for key in broadcast_state:
+        base = broadcast_state[key].detach().cpu().double()
+        accumulator = base.clone()
+        for coefficient, state in zip(v, client_states):
+            if coefficient == 0.0:
+                continue
+            accumulator += coefficient * (
+                state[key].detach().cpu().double() - base)
+        out[key] = accumulator.float()
+    return out
+
+
+def _recorded_scheme_weights(result, arm, round_label, num_clients):
+    """The weights the run says it applied, at full precision."""
+    diagnostics = result.get("scheme_diagnostics") or {}
+    record = diagnostics.get(round_label)
+    _require(record is not None,
+             f"{round_label}: {arm} round has no scheme diagnostics, so the "
+             "applied weights are not recorded at full precision")
+    _require(record.get("scheme") == arm,
+             f"{round_label}: scheme diagnostics name "
+             f"'{record.get('scheme')}', not '{arm}'")
+    weights = record.get("weights")
+    _require(isinstance(weights, list) and len(weights) == num_clients,
+             f"{round_label}: scheme diagnostics do not record one weight "
+             "per client")
+    weights = [float(value) for value in weights]
+    _require(all(_finite(value) for value in weights),
+             f"{round_label}: recorded {arm} weights contain a nonfinite value")
+    return weights
+
+
+def _require_coefficients_agree(recorded, recomputed, rtol, arm, round_label):
+    """Relative to the LARGEST recomputed coefficient, not to 1: delta-space
+    coefficients can be tiny (q-FFL with L = 1/lr gives ~1e-6), and a floor at
+    1 would let a forged input pass unnoticed."""
+    scale = max(abs(value) for value in recomputed)
+    _require(scale > 0, f"{round_label}: recomputed {arm} weights are all zero")
+    for index, (have, want) in enumerate(zip(recorded, recomputed)):
+        tolerance = rtol * scale
+        _require(
+            abs(have - want) <= tolerance,
+            f"{round_label}: recorded {arm} weight for client {index} is "
+            f"{have:.10g} but the recomputation from the persisted inputs "
+            f"gives {want:.10g} (tolerance {tolerance:.3g})")
+
+
+def _client_stats(result, round_label, field):
+    stats = (result.get("clients") or {}).get(round_label)
+    _require(isinstance(stats, dict),
+             f"{round_label}: round has no per-client stats")
+    values = []
+    for name in result["slices"]:
+        value = (stats.get(name) or {}).get(field)
+        _require(isinstance(value, (int, float)) and not isinstance(value, bool)
+                 and value >= 0 and value == value,
+                 f"{round_label}: no persisted {field} for '{name}'")
+        values.append(float(value))
+    return values
+
+
+def _round_losses(result, round_label):
+    losses = (result.get("client_losses") or {}).get(round_label)
+    _require(isinstance(losses, dict),
+             f"{round_label}: run records no broadcast-point client losses")
+    values = []
+    for name in result["slices"]:
+        value = losses.get(name)
+        _require(_finite(value),
+                 f"{round_label}: no finite persisted loss for '{name}'")
+        values.append(float(value))
+    return values
+
+
+def _reference_fednova_coefficients(result, round_label):
+    """FedNova (2007.07481): p_k = n_k / n, tau_eff = sum p_k tau_k,
+    v_k = tau_eff p_k / tau_k; clients with tau_k = 0 are masked out."""
+    counts = _client_stats(result, round_label, "num_examples")
+    steps = _client_stats(result, round_label, "num_steps")
+    active = [tau > 0 for tau in steps]
+    _require(any(active),
+             f"{round_label}: FedNova round in which no client trained")
+    mass = sum(n for n, on in zip(counts, active) if on)
+    _require(mass > 0, f"{round_label}: FedNova active example mass is zero")
+    p = [(n / mass if on else 0.0) for n, on in zip(counts, active)]
+    tau_eff = sum(pk * tau for pk, tau, on in zip(p, steps, active) if on)
+    return [(tau_eff * pk / tau if on else 0.0)
+            for pk, tau, on in zip(p, steps, active)]
+
+
+def _reference_afl_coefficients(result, round_label):
+    """AFL (1902.00146) mixture ascent replayed from the uniform start:
+    lambda_k <- lambda_k exp(eta (F_k - max F)), renormalised, one step per
+    round, using every persisted loss vector up to this round."""
+    eta = (result.get("args") or {}).get("afl_eta")
+    _require(_finite(eta) and float(eta) > 0,
+             f"{round_label}: AFL run records no positive afl_eta")
+    eta = float(eta)
+    num_clients = len(result["slices"])
+    current = int(round_label.split("_")[1])
+    lam = [1.0 / num_clients] * num_clients
+    for index in range(1, current + 1):
+        losses = _round_losses(result, f"round_{index}")
+        shift = max(losses)
+        new = [value * math.exp(eta * (loss - shift))
+               for value, loss in zip(lam, losses)]
+        total = sum(new)
+        _require(_finite(total) and total > 0,
+                 f"round_{index}: AFL weight mass is nonfinite or nonpositive")
+        lam = [value / total for value in new]
+    return lam
+
+
+def _trainable_update_sq_norms(payload, result, round_label):
+    """||sigma (B_k A_k - B_g A_g)||_F^2 per client from the persisted states."""
+    scale = (result.get("provenance") or {}).get("module_scales")
+    _require(_finite(scale) and float(scale) > 0,
+             f"{round_label}: q-FFL recomputation needs the run's scalar "
+             "PEFT scale in provenance.module_scales")
+    sigma = float(scale)
+    broadcast = payload["broadcast"]
+    modules = _lora_modules(broadcast, "broadcast")
+    base = {name: broadcast[factors["B"]].detach().cpu().double()
+            @ broadcast[factors["A"]].detach().cpu().double()
+            for name, factors in modules.items()}
+    out = []
+    for name in result["slices"]:
+        state = payload["clients"][name]
+        total = 0.0
+        for module, factors in modules.items():
+            product = (state[factors["B"]].detach().cpu().double()
+                       @ state[factors["A"]].detach().cpu().double())
+            total += float(torch.sum((sigma * (product - base[module])) ** 2))
+        out.append(total)
+    return out
+
+
+def _reference_qffl_coefficients(result, payload, round_label):
+    """q-FedAvg (1905.10497) delta-space weights, full participation:
+    h_k = q F_k^{q-1} L^2 ||w_k - w^t||^2 + L F_k^q, v_k = L F_k^q / sum_j h_j,
+    with L = 1/lr and F_k the persisted broadcast-point losses."""
+    recorded_args = result.get("args") or {}
+    lr = recorded_args.get("lr")
+    q = recorded_args.get("qffl_q")
+    _require(_finite(lr) and float(lr) > 0,
+             f"{round_label}: q-FFL run records no positive learning rate")
+    _require(_finite(q) and float(q) >= 0,
+             f"{round_label}: q-FFL run records no valid qffl_q")
+    L = 1.0 / float(lr)
+    q = float(q)
+    losses = [max(value, 1e-8) for value in _round_losses(result, round_label)]
+    d2 = _trainable_update_sq_norms(payload, result, round_label)
+    fq = [1.0 if q == 0 else f ** q for f in losses]
+    fqm1 = [0.0 if q == 0 else f ** (q - 1.0) for f in losses]
+    h = [q * a * (L ** 2) * b + L * c for a, b, c in zip(fqm1, d2, fq)]
+    total = sum(h)
+    _require(_finite(total) and total > 0,
+             f"{round_label}: q-FFL h-sum is nonfinite or nonpositive")
+    return [L * c / total for c in fq]
+
+
 def _simplex_from_recorded(weights, label):
     weights = [float(value) for value in weights]
     _require(all(_finite(value) for value in weights),
@@ -201,13 +378,50 @@ def _simplex_from_recorded(weights, label):
     return [value / total for value in weights]
 
 
-def _round_coefficients(result, round_label, num_clients):
-    """(kind, coefficients) the record says were applied for this round."""
+def _round_coefficients(result, round_label, num_clients, payload=None):
+    """(kind, coefficients) the record says were applied for this round.
+
+    ``kind`` names the application the reference must reproduce: ``fedavg``
+    (simplex average of complete states), ``delta`` (delta-space coefficients
+    on complete states) or ``frozen-b-delta`` (coefficients on raw-B deltas
+    with A copied). ``payload`` is needed only by arms whose coefficients
+    depend on the persisted states themselves (q-FFL's update norms).
+    """
     arm = result.get("weight_by_canonical")
     frozen = result["lora_mode"] == "frozen-a"
     kind = "frozen-b-delta" if frozen else "fedavg"
     _require(arm in _SUPPORTED_ARMS,
              f"{round_label}: no recomputation reference for arm '{arm}'")
+
+    if arm == "fednova":
+        recorded = _recorded_scheme_weights(result, arm, round_label,
+                                            num_clients)
+        _require_coefficients_agree(
+            recorded, _reference_fednova_coefficients(result, round_label),
+            _EXACT_COEFFICIENT_RTOL, arm, round_label)
+        return ("frozen-b-delta" if frozen else "delta"), recorded
+
+    if arm == "afl":
+        recorded = _recorded_scheme_weights(result, arm, round_label,
+                                            num_clients)
+        _require_coefficients_agree(
+            recorded, _reference_afl_coefficients(result, round_label),
+            _ROUNDED_LOSS_COEFFICIENT_RTOL, arm, round_label)
+        return kind, _simplex_from_recorded(recorded, round_label)
+
+    if arm == "qffl":
+        _require(not frozen,
+                 f"{round_label}: the q-FFL recomputation reference covers the "
+                 "trainable coordinate only")
+        _require(payload is not None,
+                 f"{round_label}: q-FFL recomputation needs the round states")
+        recorded = _recorded_scheme_weights(result, arm, round_label,
+                                            num_clients)
+        _require_coefficients_agree(
+            recorded,
+            _reference_qffl_coefficients(result, payload, round_label),
+            _ROUNDED_LOSS_COEFFICIENT_RTOL, arm, round_label)
+        return "delta", recorded
 
     if arm is None:
         _require(not result.get("weighted"),
@@ -278,9 +492,13 @@ def _validate_recomputed_global(result, payload, round_label):
     _require(sorted(clients) == sorted(slices),
              f"{round_label}: persisted client states do not match the slices")
     client_states = [clients[name] for name in slices]
-    kind, coefficients = _round_coefficients(result, round_label, len(slices))
+    kind, coefficients = _round_coefficients(result, round_label, len(slices),
+                                             payload=payload)
     if kind == "fedavg":
         expected = _reference_weighted_average(client_states, coefficients)
+    elif kind == "delta":
+        expected = _reference_delta_application(
+            payload["broadcast"], client_states, coefficients)
     else:
         expected = _reference_frozen_b_delta(
             payload["broadcast"], client_states, coefficients)

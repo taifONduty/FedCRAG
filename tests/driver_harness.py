@@ -93,10 +93,21 @@ def cosine_gram(states, broadcast):
 
 
 def install_mocks(monkeypatch, commit=CLEAN_COMMIT, clients=None,
-                  row_scale_c=1.0, example_counts=None):
+                  row_scale_c=1.0, example_counts=None, step_counts=None,
+                  losses=None):
+    """``step_counts`` and ``losses`` map client name -> value; both default
+    to the historical fixtures (one step each; no loss estimate) so existing
+    tests keep their persisted records bit-for-bit."""
     clients = clients or client_states(row_scale_c)
     example_counts = example_counts or {}
+    step_counts = step_counts or {}
     base = broadcast_state(row_scale_c)
+    if losses is not None:
+        monkeypatch.setattr(
+            driver, "estimate_client_losses",
+            lambda model, global_state, data_by_slice, slices, q_prefix,
+                   d_prefix, sample, batch_size, rng_seed:
+                [float(losses[name]) for name in slices])
 
     monkeypatch.setattr(driver, "get_git_commit", lambda: commit)
     monkeypatch.setattr(
@@ -115,14 +126,22 @@ def install_mocks(monkeypatch, commit=CLEAN_COMMIT, clients=None,
     monkeypatch.setattr(
         driver, "get_adapter_state",
         lambda model: {key: value.clone() for key, value in base.items()})
+    # Production persists the model's PEFT scale(s) in provenance; the q-FFL
+    # recomputation reads the scalar trainable-A+B scale from there.
     monkeypatch.setattr(
-        driver, "_runtime_provenance", lambda *args, **kwargs: {"test": True})
+        driver, "_runtime_provenance",
+        lambda *args, **kwargs: {
+            "test": True,
+            "module_scales": (
+                MODULE_SCALE if kwargs.get("module_scales") is None
+                or isinstance(kwargs.get("module_scales"), float)
+                else "frozen-a-mapping")})
     monkeypatch.setattr(
         driver, "client_train",
         lambda model, global_state, data, q_prefix, d_prefix, epochs,
                batch_size, lr, name, max_steps=0:
             ({key: value.clone() for key, value in clients[name].items()},
-             example_counts.get(name, 10), 1))
+             example_counts.get(name, 10), step_counts.get(name, 1)))
     monkeypatch.setattr(
         driver, "eval_global",
         lambda model, state, data, slices, q_prefix, d_prefix, metrics,
@@ -157,10 +176,11 @@ def build_argv(out_directory, lora_mode, arm, num_rounds=1,
 def run_driver(monkeypatch, out_directory, lora_mode, arm, num_rounds=1,
                direction_policy="minnorm", commit=CLEAN_COMMIT, extra=(),
                clients=None, row_scale_c=1.0, row_scale="unit",
-               example_counts=None):
+               example_counts=None, step_counts=None, losses=None):
     """Run one driver invocation; returns (result dict, result path)."""
     install_mocks(monkeypatch, commit=commit, clients=clients,
-                  row_scale_c=row_scale_c, example_counts=example_counts)
+                  row_scale_c=row_scale_c, example_counts=example_counts,
+                  step_counts=step_counts, losses=losses)
     monkeypatch.setattr(sys, "argv", build_argv(
         out_directory, lora_mode, arm, num_rounds=num_rounds,
         direction_policy=direction_policy, extra=extra,

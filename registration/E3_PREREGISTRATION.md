@@ -577,3 +577,23 @@ question, and is fixed before launch as follows.
 - Falsifier and decision rule for A2 are unchanged (§13).
 
 Approved by Turjo 2026-09-06 ("go with option 1, add the qffl_L flag").
+
+#### 13.1.1 L* fixed from the preflight (2026-09-07 10:30 UTC, before any full q-FFL run)
+
+Preflight run: `federated_contriever_seed123_weighted-qffl_r1.json` (commit 42e8246, one full
+round, legacy L = 1/lr = 50000, canonical validator passed). Recorded inputs:
+
+| client | broadcast-point loss F_k | update norm ‖Δ_k‖ | ‖Δ_k‖² |
+|---|---|---|---|
+| NFCorpus | 5.3673 | 3.0747 | 9.454 |
+| FiQA | 3.3492 | 1.4647 | 2.145 |
+| SciFact | 2.0033 | 0.1966 | 0.0387 |
+| ArguAna | 1.5226 | 0.1483 | 0.0220 |
+
+L* = Σ F_k / Σ ‖Δ_k‖² = 12.2424 / 11.6595 = 1.05 → **L* = 1.0** (two significant figures).
+
+Confirmation of the degeneracy on real data: the legacy round applied weights
+9.2e-6 / 5.7e-6 / 3.4e-6 / 2.6e-6 (sum 2.1e-5) and moved nDCG@10 by at most 3e-5 on any
+client. With L* = 1.0 the same inputs give weights 0.225 / 0.140 / 0.084 / 0.064 (sum 0.51):
+a damped step ordered by loss, as q-FFL intends. The A2 q-FFL runs use `--qffl_L 1.0`,
+q = 1, seeds 123 and 2024, and are labelled "q-FFL, L rescaled by registered rule".

@@ -57,6 +57,8 @@ bash run_e3.sh verify            # prints the registered runs without executing
 Training runs need a GPU and the BEIR corpora; `GCP_RUNBOOK.md` documents the
 exact setup we used.
 
+`--weighted --weight_by response-maxmin` is the aggregation-by-measured-response arm (design note of 8 September 2026): every client scores its held-out queries under each single-client update, the server ranks a grid of weight vectors by the worst client's predicted gain under a backbone floor, verifies the two leaders exactly and applies the better one; `validate_e0.py` recomputes the decision from the record.
+
 ## A note on the history
 
 The branch history here is deliberately kept intact, including mistakes and

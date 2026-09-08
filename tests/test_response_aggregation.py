@@ -51,3 +51,40 @@ def test_candidate_grid_keeps_fixed_points_first_and_dedups():
     assert grid["solo_a"] == [1.0, 0.0, 0.0]
     assert all(len(v) == 3 and min(v) >= 0 for v in grid.values())
     assert any(abs(sum(v) - 2.0) < 1e-12 for v in grid.values())
+
+
+def test_predict_embeddings_is_exact_at_zero_and_at_vertices():
+    rng = np.random.default_rng(0)
+    base = ra.normalise_rows(rng.normal(size=(7, 5)))
+    solos = [ra.normalise_rows(rng.normal(size=(7, 5))) for _ in range(3)]
+    responses = [s - base for s in solos]
+    assert np.allclose(ra.predict_embeddings(base, responses, [0, 0, 0]), base)
+    for j in range(3):
+        v = [0.0] * 3
+        v[j] = 1.0
+        assert np.allclose(ra.predict_embeddings(base, responses, v), solos[j], atol=1e-12)
+    mixed = ra.predict_embeddings(base, responses, [0.5, 0.25, 0.0])
+    assert np.allclose(np.linalg.norm(mixed, axis=1), 1.0)
+
+
+def test_ndcg10_matches_pytrec_eval_including_identical_id_rule():
+    pytrec_eval = pytest.importorskip("pytrec_eval")
+    rng = np.random.default_rng(1)
+    cids = [f"d{i}" for i in range(50)] + ["q3"]        # a document named like query q3
+    qids = [f"q{i}" for i in range(6)]
+    sims = rng.normal(size=(6, 51))
+    sims[3, 50] = 10.0                                  # q3's own document would rank first
+    qrels = {q: {f"d{int(rng.integers(0, 50))}": int(g) for g in rng.integers(1, 4, size=3)}
+             for q in qids}
+    qrels["q5"] = {}                                    # no relevant documents
+    ours = ra.ndcg10(sims, cids, qids, qrels)
+    run = {}
+    for i, q in enumerate(qids):
+        order = np.argsort(-sims[i])
+        run[q] = {cids[j]: float(sims[i, j]) for j in order[:60] if cids[j] != q}
+    ev = pytrec_eval.RelevanceEvaluator({q: r for q, r in qrels.items() if r},
+                                        {"ndcg_cut.10"})
+    ref = ev.evaluate(run)
+    for i, q in enumerate(qids):
+        expected = ref[q]["ndcg_cut_10"] if q in ref else 0.0
+        assert ours[i] == pytest.approx(expected, abs=1e-9), q

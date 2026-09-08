@@ -69,3 +69,66 @@ def candidate_grid(K, fixed_points, lattice_step, scales):
         for s in scales:
             add(f"lat{i}_x{s:g}", [s * x for x in p])
     return grid
+
+
+def normalise_rows(x):
+    norms = np.linalg.norm(x, axis=1, keepdims=True)
+    return x / np.maximum(norms, 1e-12)
+
+
+def predict_embeddings(base, responses, v):
+    """First-order response model (design note, section 4.1).
+
+    ``base`` holds unit-norm embeddings under the broadcast adapter, ``responses[j]`` the
+    embeddings under the single-client aggregate j minus ``base``. The prediction for
+    weights ``v`` is the renormalised sum; it is exact at v = 0 and at every vertex e_j and
+    first-order accurate in between.
+    """
+    out = np.array(base, dtype=np.float64, copy=True)
+    for vj, u in zip(v, responses):
+        if vj != 0.0:
+            out += float(vj) * u
+    return normalise_rows(out)
+
+
+def ndcg10_from_top(top_idx, cids, qids, qrels, k=10):
+    """nDCG@k per query from the row-wise indices of the highest-scoring documents
+    (``top_idx`` has at least k + 1 columns, sorted by descending score). trec_eval's
+    ndcg_cut conventions: gain is the graded relevance, discount 1/log2(rank + 1), the
+    ideal ranking uses the query's own qrels cut at k. A document whose id equals the
+    query id is skipped, as the driver's evaluation does for ArguAna. Queries without
+    relevant documents score 0."""
+    cid_arr = np.asarray(cids)
+    out = np.zeros(len(qids), dtype=np.float64)
+    for i, q in enumerate(qids):
+        rel = qrels.get(q) or {}
+        if not rel:
+            continue
+        dcg, rank = 0.0, 0
+        for j in top_idx[i]:
+            if cid_arr[j] == q:
+                continue
+            rank += 1
+            if rank > k:
+                break
+            gain = rel.get(str(cid_arr[j]), 0)
+            if gain > 0:
+                dcg += gain / np.log2(rank + 1)
+        ideal = sorted((g for g in rel.values() if g > 0), reverse=True)[:k]
+        idcg = sum(g / np.log2(r + 2) for r, g in enumerate(ideal))
+        out[i] = dcg / idcg if idcg > 0 else 0.0
+    return out
+
+
+def top_indices(sims, take):
+    """Row-wise indices of the ``take`` largest scores, sorted by descending score."""
+    sims = np.asarray(sims)
+    take = min(int(take), sims.shape[1])
+    part = np.argpartition(-sims, take - 1, axis=1)[:, :take]
+    order = np.argsort(-np.take_along_axis(sims, part, axis=1), axis=1, kind="stable")
+    return np.take_along_axis(part, order, axis=1)
+
+
+def ndcg10(sims, cids, qids, qrels, k=10):
+    """Per-query nDCG@k from a full score matrix (queries by documents)."""
+    return ndcg10_from_top(top_indices(sims, k + 1), cids, qids, qrels, k=k)

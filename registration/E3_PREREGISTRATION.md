@@ -597,3 +597,40 @@ Confirmation of the degeneracy on real data: the legacy round applied weights
 client. With L* = 1.0 the same inputs give weights 0.225 / 0.140 / 0.084 / 0.064 (sum 0.51):
 a damped step ordered by loss, as q-FFL intends. The A2 q-FFL runs use `--qffl_L 1.0`,
 q = 1, seeds 123 and 2024, and are labelled "q-FFL, L rescaled by registered rule".
+
+### 13.2 Block A5: aggregation by measured response (registered 2026-09-08, before any full run)
+
+Design: research_workspace/supervisor/2026-09-08_solution_design_response_aggregation.md.
+Arm: `--weighted --weight_by response-maxmin --lora_mode trainable-ab`, Contriever, rank 16,
+one local epoch, eight rounds, seeds 123 and 2024. Defaults: dev fraction 0.10 of each
+client's training queries (minimum 30, never test queries), lattice step 0.125, scales
+0.5 / 1.0 / 1.5, two verified candidates, floor = the frozen backbone's dev nDCG@10 with
+delta 0, two halvings. The offline round-1 pilot (results_vm/PILOT_CANDIDATES_20260908/)
+motivated the arm and fixed the verification step; nothing below was seen in a full run.
+
+Predictions, in order of confidence.
+
+P1. No client's test nDCG@10 ends below the frozen backbone at either seed.
+P2. The worst-client final test nDCG@10 is at least uniform's (E1) at both seeds, and the
+    across-client variance is at most uniform's.
+P3. FiQA's final test nDCG@10 exceeds its value under every other arm run so far (E1
+    uniform 0.266 / 0.269) at both seeds.
+P4. The applied weights put more weight on FiQA's update than on NFCorpus's in at least
+    five of eight rounds at both seeds (the round-1 pilot's structure persists).
+
+Falsifiers (design note, F3 and F4).
+
+F3. Any client below the frozen backbone on test at either seed: the floor did not
+    transfer from dev to test; the method is reported as failed and FedSpan stays the
+    paper's repair.
+F4. Halving triggered in more than half of the rounds: the response model is not usable at
+    the step sizes that matter; the paper describes the arm as a verified search.
+
+Decision rule. P1 and P2 at both seeds: the arm replaces FedSpan as the paper's repair
+section, with the pilot as motivation. P1 only: the arm is reported beside FedSpan as a
+second repair with its measured guarantee. Neither: a negative result in the appendix. The
+handicap is stated either way: the arm trains on 90 percent of each client's training
+queries, the baselines on 100 percent.
+
+Cost: about 21 GPU-hours per seed (six extra full evaluations per round). Runs after A2.
+

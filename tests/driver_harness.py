@@ -5,6 +5,7 @@ aggregation dispatch, the diagnostics, the persisted states and hashes — is
 the production code path. Only the parts that need a GPU and a corpus are
 replaced.
 """
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -31,6 +32,39 @@ CLIENT_B_BLOCKS = {
     "c1": [[0.2, 0.8], [0.4, 0.1], [0.7, 0.2]],
     "c2": [[-0.6, 0.3], [0.9, -0.2], [0.1, 0.8]],
 }
+
+
+def dev_mock_data(n_docs=40, n_q=40):
+    """A ``load_slice_with_train`` replacement with real query/document structure: query
+    ``<slice>-q<i>`` is relevant to document ``<slice>-d<i>``. Test queries stay empty, so
+    the mocked ``eval_global`` remains the only evaluation path the driver takes."""
+    def load(name, root):
+        corpus = {f"{name}-d{i}": {"text": f"{name}-d{i}"} for i in range(n_docs)}
+        train_q = {f"{name}-q{i}": f"{name}-q{i}" for i in range(n_q)}
+        train_qrels = {f"{name}-q{i}": {f"{name}-d{i}": 1} for i in range(n_q)}
+        return {"corpus": corpus, "train_q": train_q, "train_qrels": train_qrels,
+                "eval_q": {}, "eval_qrels": {}, "split_fallback": False}
+    return load
+
+
+def _hash_vec(text, salt, dim=8):
+    digest = hashlib.sha256(f"{salt}|{text}".encode()).digest()
+    return np.frombuffer(digest[:dim], dtype=np.uint8).astype(np.float64) / 255.0 - 0.5
+
+
+def fake_response_encoder(model, state, texts, batch_size):
+    """Deterministic unit embeddings that depend linearly on the adapter's B block, so
+    different aggregation weights produce different rankings on the mock dev queries."""
+    w = state[B_KEY].reshape(-1).double().numpy()[:3]
+    shift = 0.25 * float(w[0] + 0.5 * w[1] - w[2])
+    rows = []
+    for t in texts:
+        tail = t.split("-")[-1]                       # 'q7' or 'd7'
+        base = np.zeros(8) + 0.1 * _hash_vec(tail[0] + "shared", 0)
+        base[int(tail[1:]) % 8] += 2.0
+        rows.append(base + shift * _hash_vec(t, 1))
+    x = np.array(rows)
+    return x / np.linalg.norm(x, axis=1, keepdims=True)
 
 
 def broadcast_state(row_scale_c=1.0):
@@ -94,10 +128,12 @@ def cosine_gram(states, broadcast):
 
 def install_mocks(monkeypatch, commit=CLEAN_COMMIT, clients=None,
                   row_scale_c=1.0, example_counts=None, step_counts=None,
-                  losses=None):
+                  losses=None, dev_data=None, fake_encoder=None):
     """``step_counts`` and ``losses`` map client name -> value; both default
     to the historical fixtures (one step each; no loss estimate) so existing
-    tests keep their persisted records bit-for-bit."""
+    tests keep their persisted records bit-for-bit. ``dev_data`` replaces the
+    empty-query slice loader (the response arm needs training queries to
+    split); ``fake_encoder`` replaces ``driver.response_encode``."""
     clients = clients or client_states(row_scale_c)
     example_counts = example_counts or {}
     step_counts = step_counts or {}
@@ -112,9 +148,11 @@ def install_mocks(monkeypatch, commit=CLEAN_COMMIT, clients=None,
     monkeypatch.setattr(driver, "get_git_commit", lambda: commit)
     monkeypatch.setattr(
         driver, "load_slice_with_train",
-        lambda name, root: {
+        dev_data if dev_data is not None else (lambda name, root: {
             "corpus": {"d0": {"text": name}}, "train_q": {}, "train_qrels": {},
-            "eval_q": {}, "eval_qrels": {}, "split_fallback": False})
+            "eval_q": {}, "eval_qrels": {}, "split_fallback": False}))
+    if fake_encoder is not None:
+        monkeypatch.setattr(driver, "response_encode", fake_encoder)
     monkeypatch.setattr(
         driver, "resolve_local", lambda name: ("fake-model", "", "", False))
     monkeypatch.setattr(
@@ -176,11 +214,13 @@ def build_argv(out_directory, lora_mode, arm, num_rounds=1,
 def run_driver(monkeypatch, out_directory, lora_mode, arm, num_rounds=1,
                direction_policy="minnorm", commit=CLEAN_COMMIT, extra=(),
                clients=None, row_scale_c=1.0, row_scale="unit",
-               example_counts=None, step_counts=None, losses=None):
+               example_counts=None, step_counts=None, losses=None,
+               dev_data=None, fake_encoder=None):
     """Run one driver invocation; returns (result dict, result path)."""
     install_mocks(monkeypatch, commit=commit, clients=clients,
                   row_scale_c=row_scale_c, example_counts=example_counts,
-                  step_counts=step_counts, losses=losses)
+                  step_counts=step_counts, losses=losses,
+                  dev_data=dev_data, fake_encoder=fake_encoder)
     monkeypatch.setattr(sys, "argv", build_argv(
         out_directory, lora_mode, arm, num_rounds=num_rounds,
         direction_policy=direction_policy, extra=extra,

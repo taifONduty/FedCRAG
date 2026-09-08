@@ -46,6 +46,8 @@ from aggregation_schemes import (SchemeResult, afl_update, apply_delta_weights,
                                  mgda_weights, qffl_delta_weights,
                                  state_dict_sha256, update_gram,
                                  validate_frozen_a_states)
+from response_aggregation import dev_split, response_config_tag
+from response_arm import run_response_maxmin_round
 
 LORA_A_SUFFIX = ".lora_A.weight"
 
@@ -425,6 +427,14 @@ def eval_global(model, global_state, data, slices, q_prefix, d_prefix,
     return scores
 
 
+def response_encode(model, state, texts, batch_size):
+    """Unit embeddings of ``texts`` under adapter ``state``; the response arm's
+    only contact with the model, so tests can replace it."""
+    set_adapter_state(model, state)
+    return model.encode(texts, batch_size=batch_size, convert_to_numpy=True,
+                        normalize_embeddings=True, show_progress_bar=False)
+
+
 def print_scores(label, scores, slices, metrics):
     for s in slices:
         print(f"  [{label}] {s}: "
@@ -476,7 +486,8 @@ def main():
     ap.add_argument("--weight_by",
                     choices=["examples", "corpus", "maxmin", "rawmaxmin",
                              "normmaxmin",
-                             "qffl", "afl", "mgda", "fednova"],
+                             "qffl", "afl", "mgda", "fednova",
+                             "response-maxmin"],
                     default="examples",
                     help="FedAvg weighting basis when --weighted: 'examples' = "
                          "local training-pair count (canonical FedAvg n_k), "
@@ -491,7 +502,12 @@ def main():
                          "'afl' = agnostic-FL multiplicative-weights ascent "
                          "(arXiv:1902.00146), 'mgda' = min-norm weights on the "
                          "raw update Gram (arXiv:1810.04650), 'fednova' = "
-                         "tau-normalized averaging (arXiv:2007.07481)")
+                         "tau-normalized averaging (arXiv:2007.07481); "
+                         "'response-maxmin' = aggregation by measured response "
+                         "(design note 2026-09-08): clients measure their "
+                         "held-out nDCG@10 under every single-client update, "
+                         "the server applies max-min weights under a backbone "
+                         "floor after exact verification")
     ap.add_argument("--weight_pow", type=float, default=None,
                     help="q-dose-response exponent (registration SS9.3): "
                          "with --weight_by examples, weights become "
@@ -512,6 +528,32 @@ def main():
     ap.add_argument("--afl_eta", type=float, default=0.1,
                     help="AFL mixture-weight ascent step size (only with "
                          "--weight_by afl)")
+    ap.add_argument("--response_dev_fraction", type=float, default=0.1,
+                    help="response-maxmin: fraction of each client's training "
+                         "queries held out as its dev set (never test queries)")
+    ap.add_argument("--response_dev_min", type=int, default=30,
+                    help="response-maxmin: minimum dev queries per client "
+                         "(capped at half of the client's queries)")
+    ap.add_argument("--response_lattice_step", type=float, default=0.125,
+                    help="response-maxmin: simplex grid resolution; 1/step must "
+                         "be an integer")
+    ap.add_argument("--response_scales", type=str, default="0.5,1.0,1.5",
+                    help="response-maxmin: comma-separated step scales applied "
+                         "to every simplex point (1.0 = convex combinations)")
+    ap.add_argument("--response_verify", type=int, default=2,
+                    help="response-maxmin: number of leading candidates "
+                         "evaluated exactly before one is applied")
+    ap.add_argument("--response_floor", choices=["frozen", "none"],
+                    default="frozen",
+                    help="response-maxmin: per-client floor on the measured "
+                         "dev metric ('frozen' = the untrained backbone)")
+    ap.add_argument("--response_floor_delta", type=float, default=0.0,
+                    help="response-maxmin: slack below the floor (negative "
+                         "values tighten it)")
+    ap.add_argument("--response_halvings", type=int, default=2,
+                    help="response-maxmin: step halvings tried when no verified "
+                         "candidate satisfies the floor before the broadcast "
+                         "is kept")
     ap.add_argument("--loss_sample", type=int, default=2048,
                     help="max training pairs per client for the broadcast-"
                          "point loss estimate (qffl/afl only; deterministic "
@@ -676,6 +718,32 @@ def main():
             ap.error("--qffl_L is legal only with --weight_by qffl")
         if not np.isfinite(args.qffl_L) or args.qffl_L <= 0:
             ap.error("--qffl_L must be a finite positive float")
+    response_scales = None
+    if args.weight_by == "response-maxmin":
+        if not args.weighted:
+            ap.error("--weight_by response-maxmin requires --weighted")
+        if args.lora_mode != "trainable-ab":
+            ap.error("--weight_by response-maxmin covers the trainable-ab "
+                     "coordinate only")
+        if not (0.0 < args.response_dev_fraction <= 0.5):
+            ap.error("--response_dev_fraction must be in (0, 0.5]")
+        if (args.response_verify < 1 or args.response_halvings < 0
+                or args.response_dev_min < 1):
+            ap.error("--response_verify >= 1, --response_halvings >= 0 and "
+                     "--response_dev_min >= 1 are required")
+        if args.response_lattice_step <= 0:
+            ap.error("--response_lattice_step must be positive")
+        inverse = 1.0 / args.response_lattice_step
+        if abs(inverse - round(inverse)) > 1e-9:
+            ap.error("--response_lattice_step must be 1/m for an integer m")
+        try:
+            response_scales = [float(x) for x in args.response_scales.split(",")]
+        except ValueError:
+            ap.error("--response_scales must be comma-separated numbers")
+        if not response_scales or min(response_scales) <= 0:
+            ap.error("--response_scales must be positive")
+        if not np.isfinite(args.response_floor_delta):
+            ap.error("--response_floor_delta must be finite")
     if (args.fedspan_shadow_sketch is not None
             and canonical_weight_by != "normmaxmin"):
         ap.error("--fedspan_shadow_sketch is legal only with --weight_by "
@@ -831,6 +899,36 @@ def main():
         print(f"  sharded federation: {federation.slices} "
               f"caps={[step_caps[s] for s in federation.slices]} -> "
               f"{shard_manifest_path}")
+    dev_data = None
+    if args.weight_by == "response-maxmin":
+        # Held-out queries for the response arm come from each client's own
+        # training queries, never from the test split; the partition is
+        # deterministic per (seed, slice) and recorded in the result JSON.
+        dev_data, split_record = {}, {"fraction": args.response_dev_fraction,
+                                      "min_dev": args.response_dev_min,
+                                      "per_client": {}}
+        for s in args.slices:
+            qids = [q for q, rels in data[s]["train_qrels"].items()
+                    if q in data[s]["train_q"]
+                    and any(v > 0 for v in rels.values())]
+            train_ids, dev_ids = dev_split(qids, args.response_dev_fraction,
+                                           args.seed, s, args.response_dev_min)
+            dev_set = set(dev_ids)
+            data[s]["dev_q"] = {q: data[s]["train_q"][q] for q in dev_ids}
+            data[s]["dev_qrels"] = {q: data[s]["train_qrels"][q]
+                                    for q in dev_ids}
+            data[s]["train_q"] = {q: t for q, t in data[s]["train_q"].items()
+                                  if q not in dev_set}
+            data[s]["train_qrels"] = {q: r for q, r
+                                      in data[s]["train_qrels"].items()
+                                      if q not in dev_set}
+            split_record["per_client"][s] = {
+                "n_train_queries": len(train_ids),
+                "n_dev_queries": len(dev_ids),
+                "dev_sha256": hashlib.sha256(
+                    "\n".join(dev_ids).encode("utf-8")).hexdigest()}
+            print(f"  dev split {s}: {len(train_ids)} train / "
+                  f"{len(dev_ids)} dev queries")
     data_sha256 = _data_fingerprints(data)
     model_path, q_prefix, d_prefix, fp16 = resolve_local(args.model)
 
@@ -844,6 +942,28 @@ def main():
     # sigma alone. Mixing them counts c twice.
     materialized_scales = peft_scales(module_scales)
     global_state = get_adapter_state(model)
+    response_config = None
+    if dev_data is not None:
+        for s in args.slices:
+            corpus = data[s]["corpus"]
+            cids = list(corpus.keys())
+            qids = list(data[s]["dev_q"].keys())
+            dev_data[s] = {
+                "cids": cids,
+                "ctext": [d_prefix + doc_text(corpus[c]) for c in cids],
+                "qids": qids,
+                "qtext": [q_prefix + data[s]["dev_q"][q] for q in qids],
+                "qrels": {q: {d: int(v)
+                              for d, v in data[s]["dev_qrels"][q].items()}
+                          for q in qids}}
+        response_config = {
+            "dev_fraction": args.response_dev_fraction,
+            "dev_min": args.response_dev_min,
+            "lattice_step": args.response_lattice_step,
+            "scales": response_scales, "n_verify": args.response_verify,
+            "floor": args.response_floor,
+            "floor_delta": args.response_floor_delta,
+            "halvings": args.response_halvings}
 
     # Preserve historical trainable-A+B filenames. New frozen-A runs add a
     # canonical result-affecting configuration hash so capped/full and other
@@ -857,6 +977,9 @@ def main():
         # Distinct L values are distinct q-FFL arms; the legacy 1/lr run
         # keeps its untagged name.
         basis += "-L" + format(args.qffl_L, ".8g").replace(".", "p")
+    if args.weight_by == "response-maxmin":
+        # Distinct arm configurations are distinct experiments.
+        basis += "-rmm" + response_config_tag(response_config)
     if canonical_weight_by == "normmaxmin":
         if args.fedspan_step_policy == "fixed":
             step_tag = format(args.fedspan_step_norm, ".8g").replace(".", "p")
@@ -924,6 +1047,8 @@ def main():
                commit, args.model, model_path, model, module_scales,
                args.data_root, data_sha256),
            "args": vars(args), "clients": {}, "R_matrix": {}, "BWT": None}
+    if dev_data is not None:
+        out["dev_split"] = split_record
     if shard_manifest is not None:
         out["shard_manifest"] = shard_manifest
         out["shard_manifest_path"] = shard_manifest_path
@@ -936,8 +1061,9 @@ def main():
     dump_json(out, jpath)
 
     ADAPTIVE = ("maxmin", "rawmaxmin", "normmaxmin", "qffl", "afl",
-                "mgda", "fednova")
+                "mgda", "fednova", "response-maxmin")
     afl_lam = [1.0 / len(args.slices)] * len(args.slices)
+    dev_frozen = None
 
     for rnd in range(args.num_rounds):
         print(f"  --- round {rnd+1}/{args.num_rounds} ---")
@@ -1082,6 +1208,29 @@ def main():
                 n_examples, [client_stats[s]["num_steps"]
                              for s in args.slices])
             scheme_result = delta_v
+        elif args.weight_by == "response-maxmin":
+            counts = np.asarray(n_examples, dtype=np.float64)
+            fixed = {"uniform": [1.0 / len(states)] * len(states),
+                     "examples": [float(x) for x in
+                                  counts / max(float(counts.sum()), 1e-12)],
+                     "fednova": [float(x) for x in fednova_delta_weights(
+                         n_examples, [client_stats[s]["num_steps"]
+                                      for s in args.slices])]}
+
+            def encode(state, texts):
+                return response_encode(model, state, texts,
+                                       args.eval_batch_size)
+            response_result, response_record, dev_frozen = \
+                run_response_maxmin_round(
+                    encode, round_broadcast, states, dev_data, args.slices,
+                    {**response_config, "fixed_points": fixed}, dev_frozen)
+            response_record["scheme"] = canonical_weight_by
+            out.setdefault("scheme_diagnostics", {})[label] = response_record
+            delta_v = response_result
+            print(f"  response-maxmin chosen={response_record['chosen']} "
+                  f"status={response_record['status']} weights="
+                  f"{[round(w, 3) for w in response_result]} "
+                  f"shortlist={response_record['shortlist']}")
         elif args.weight_by == "corpus":
             weights = [len(data[s]["corpus"]) for s in args.slices]
         else:

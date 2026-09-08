@@ -132,3 +132,53 @@ def top_indices(sims, take):
 def ndcg10(sims, cids, qids, qrels, k=10):
     """Per-query nDCG@k from a full score matrix (queries by documents)."""
     return ndcg10_from_top(top_indices(sims, k + 1), cids, qids, qrels, k=k)
+
+
+def _feasible(means, floors):
+    if floors is None:
+        return True
+    return all(f is None or m >= f for m, f in zip(means, floors))
+
+
+def rank_candidates(pred_means, current, floors, n_top):
+    """Names of the ``n_top`` floor-feasible candidates ordered by worst-client gain
+    (descending), then mean gain, then name. ``floors`` is a per-client list (None entries
+    mean no floor for that client) or None for no floor at all."""
+    rows = []
+    for name, means in pred_means.items():
+        if not _feasible(means, floors):
+            continue
+        gains = [m - c for m, c in zip(means, current)]
+        rows.append((-min(gains), -float(np.mean(gains)), name))
+    rows.sort()
+    return [name for _, _, name in rows[:n_top]]
+
+
+def choose_applied(measured_means, current, floors):
+    """The same rule on measured values: (name, worst-client gain) of the best feasible
+    candidate, or (None, None) when no candidate satisfies the floor."""
+    best = rank_candidates(measured_means, current, floors, 1)
+    if not best:
+        return None, None
+    gains = [m - c for m, c in zip(measured_means[best[0]], current)]
+    return best[0], float(min(gains))
+
+
+def paired_lower_bound(diffs, alpha=0.05, n_boot=2000, seed=0):
+    """One-sided bootstrap lower confidence bound at level 1 - alpha on the mean of paired
+    per-query differences (design note, section 4.4). NaN for an empty input."""
+    d = np.asarray(diffs, dtype=np.float64)
+    if d.size == 0:
+        return float("nan")
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, d.size, size=(int(n_boot), d.size))
+    return float(np.quantile(d[idx].mean(axis=1), alpha))
+
+
+def response_config_tag(config):
+    """Eight hex characters binding the arm's configuration into the output filename, so
+    two settings never overwrite each other."""
+    keys = ("dev_fraction", "dev_min", "lattice_step", "scales", "n_verify", "floor",
+            "floor_delta", "halvings")
+    payload = json.dumps([config[k] for k in keys], sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]

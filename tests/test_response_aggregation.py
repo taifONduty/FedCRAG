@@ -88,3 +88,42 @@ def test_ndcg10_matches_pytrec_eval_including_identical_id_rule():
     for i, q in enumerate(qids):
         expected = ref[q]["ndcg_cut_10"] if q in ref else 0.0
         assert ours[i] == pytest.approx(expected, abs=1e-9), q
+
+
+def test_rank_candidates_orders_by_worst_client_then_mean_and_applies_floor():
+    current = [0.30, 0.20]
+    pred = {"a": [0.33, 0.23],      # gains +0.03 / +0.03: min 0.03, mean 0.03
+            "b": [0.36, 0.23],      # min 0.03, mean 0.045: ahead of a on the tie
+            "c": [0.40, 0.21],      # min 0.01
+            "d": [0.50, 0.19]}      # below a floor of 0.20 on client 2
+    assert ra.rank_candidates(pred, current, floors=None, n_top=4) == ["b", "a", "c", "d"]
+    assert ra.rank_candidates(pred, current, floors=[0.30, 0.20], n_top=2) == ["b", "a"]
+    assert ra.rank_candidates(pred, current, floors=[0.0, 0.20], n_top=9) == ["b", "a", "c"]
+    assert ra.rank_candidates(pred, current, floors=[0.0, 0.99], n_top=2) == []
+
+
+def test_choose_applied_uses_measured_values_and_reports_min_gain():
+    current = [0.30, 0.20]
+    measured = {"a": [0.31, 0.25], "b": [0.36, 0.19]}
+    name, gain = ra.choose_applied(measured, current, floors=None)
+    assert name == "a" and gain == pytest.approx(0.01)
+    name, gain = ra.choose_applied(measured, current, floors=[0.32, 0.0])
+    assert name == "b" and gain == pytest.approx(-0.01)
+    assert ra.choose_applied(measured, current, floors=[0.9, 0.9]) == (None, None)
+
+
+def test_paired_lower_bound_is_below_the_mean_and_deterministic():
+    rng = np.random.default_rng(2)
+    diffs = rng.normal(0.02, 0.1, size=300)
+    lo = ra.paired_lower_bound(diffs, alpha=0.05, n_boot=500, seed=0)
+    assert lo < diffs.mean()
+    assert lo == ra.paired_lower_bound(diffs, alpha=0.05, n_boot=500, seed=0)
+    assert np.isnan(ra.paired_lower_bound([], alpha=0.05))
+
+
+def test_response_config_tag_is_short_and_configuration_sensitive():
+    cfg = dict(dev_fraction=0.1, dev_min=30, lattice_step=0.125, scales=[0.5, 1.0, 1.5],
+               n_verify=2, floor="frozen", floor_delta=0.0, halvings=2)
+    tag = ra.response_config_tag(cfg)
+    assert len(tag) == 8 and tag == ra.response_config_tag(dict(cfg))
+    assert tag != ra.response_config_tag({**cfg, "n_verify": 3})

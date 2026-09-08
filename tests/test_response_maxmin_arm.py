@@ -109,3 +109,48 @@ def test_arm_without_weighted_is_refused(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", argv)
     with pytest.raises(SystemExit):
         driver.main()
+
+
+def _rewrite(path, result):
+    driver_harness.rewrite_result(path, result)
+
+
+def test_validator_accepts_a_genuine_run(monkeypatch, tmp_path):
+    run_arm(monkeypatch, tmp_path)
+    assert validate_run_directory(tmp_path)["rounds_validated"] == 1
+
+
+def test_validator_refuses_forged_weights(monkeypatch, tmp_path):
+    result, path = run_arm(monkeypatch, tmp_path)
+    rec = result["scheme_diagnostics"]["round_1"]
+    rec["weights"] = [w * 1.1 + 0.01 for w in rec["weights"]]
+    _rewrite(path, result)
+    with pytest.raises(E0ValidationError):
+        validate_run_directory(tmp_path)
+
+
+def test_validator_refuses_a_choice_the_measurements_do_not_support(monkeypatch, tmp_path):
+    result, path = run_arm(monkeypatch, tmp_path, extra=("--response_floor", "none"))
+    rec = result["scheme_diagnostics"]["round_1"]
+    assert len(rec["shortlist"]) == 2                  # no floor: both leaders verified
+    other = [n for n in rec["shortlist"] if n != rec["chosen"]][0]
+    rec["chosen"] = other
+    rec["weights"] = rec["verified"][other]["v"]
+    _rewrite(path, result)
+    with pytest.raises(E0ValidationError):
+        validate_run_directory(tmp_path)
+
+
+def test_validator_refuses_a_shortlist_the_predictions_do_not_support(monkeypatch, tmp_path):
+    result, path = run_arm(monkeypatch, tmp_path)
+    rec = result["scheme_diagnostics"]["round_1"]
+    loser = [n for n in rec["candidates"] if n not in rec["shortlist"]][0]
+    rec["candidates"][loser]["pred"] = [1.0] * 3      # would have won the shortlist
+    _rewrite(path, result)
+    with pytest.raises(E0ValidationError):
+        validate_run_directory(tmp_path)
+
+
+def test_validator_accepts_the_zero_step_outcome(monkeypatch, tmp_path):
+    run_arm(monkeypatch, tmp_path, extra=("--response_floor_delta", "-1.0"))
+    assert validate_run_directory(tmp_path)["rounds_validated"] == 1

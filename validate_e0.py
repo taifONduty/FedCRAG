@@ -27,8 +27,10 @@ _LORA_KEY = re.compile(r"(.*)\.lora_(A|B)\.weight$")
 # exactly 0 on every frozen-A path. A global rescaled by 1.5x scores 5.0e+04.
 _AGGREGATE_RTOL = 1e-5
 
+from response_aggregation import choose_applied, rank_candidates
+
 _SUPPORTED_ARMS = (None, "rawmaxmin", "normmaxmin", "examples",
-                   "qffl", "afl", "fednova")
+                   "qffl", "afl", "fednova", "response-maxmin")
 # Recorded scheme weights are compared against a recomputation from the
 # scheme's own persisted inputs. FedNova's inputs are integers, so it is held
 # to float precision; q-FFL and AFL depend on broadcast-point losses that the
@@ -384,6 +386,88 @@ def _simplex_from_recorded(weights, label):
     return [value / total for value in weights]
 
 
+def _reference_response_maxmin_choice(result, round_label, num_clients):
+    """Recompute the response-maxmin server decision from the record: the shortlist
+    from the recorded predictions and floors, the choice from the recorded
+    measurements, the halving chain if any, and the coefficients that follow.
+
+    The predictions and measurements are client-side quantities that need the
+    corpora, so they are not recomputed here; what is checked is that the applied
+    weights are exactly what the recorded evidence implies under the recorded
+    arguments, the same way q-FFL's weights must follow from its recorded losses.
+    """
+    record = (result.get("scheme_diagnostics") or {}).get(round_label)
+    _require(record is not None,
+             f"{round_label}: response-maxmin round has no scheme diagnostics")
+    args = result.get("args") or {}
+    n_verify = int(args.get("response_verify") or 0)
+    _require(n_verify >= 1, f"{round_label}: response_verify missing from args")
+    current = [float(x) for x in (record.get("dev_current") or [])]
+    frozen = [float(x) for x in (record.get("dev_frozen") or [])]
+    _require(len(current) == num_clients and len(frozen) == num_clients,
+             f"{round_label}: dev_current/dev_frozen do not cover every client")
+    _require(all(_finite(x) for x in current + frozen),
+             f"{round_label}: nonfinite dev scores recorded")
+    floors = ([f - float(args.get("response_floor_delta") or 0.0) for f in frozen]
+              if args.get("response_floor", "frozen") == "frozen" else None)
+    recorded_floors = record.get("floors")
+    _require(
+        (recorded_floors is None and floors is None)
+        or (recorded_floors is not None and floors is not None
+            and len(recorded_floors) == num_clients
+            and max(abs(float(a) - b) for a, b in zip(recorded_floors, floors)) <= 1e-12),
+        f"{round_label}: recorded floors disagree with the arguments and dev_frozen")
+    candidates = record.get("candidates") or {}
+    _require(isinstance(candidates, dict) and candidates,
+             f"{round_label}: response-maxmin round records no candidates")
+    pred = {}
+    for name, entry in candidates.items():
+        values = (entry or {}).get("pred")
+        _require(isinstance(values, list) and len(values) == num_clients
+                 and all(_finite(float(x)) for x in values),
+                 f"{round_label}: candidate {name} has no complete prediction")
+        pred[name] = [float(x) for x in values]
+    shortlist = rank_candidates(pred, current, floors, n_verify)
+    _require(shortlist == list(record.get("shortlist") or []),
+             f"{round_label}: recorded shortlist {record.get('shortlist')} is not the "
+             f"top-{n_verify} of the recorded predictions ({shortlist})")
+    verified = record.get("verified") or {}
+    for name in shortlist:
+        _require(name in verified,
+                 f"{round_label}: shortlisted candidate {name} was not verified")
+        _require(max(abs(float(a) - float(b)) for a, b
+                     in zip(verified[name]["v"], candidates[name]["v"])) <= 1e-12,
+                 f"{round_label}: verified weights for {name} differ from the grid")
+    measured = {name: [float(x) for x in verified[name]["measured"]]
+                for name in shortlist}
+    chosen, _ = choose_applied(measured, current, floors)
+    if chosen is None and shortlist:
+        v = [float(x) for x in candidates[shortlist[0]]["v"]]
+        for h in range(1, int(args.get("response_halvings") or 0) + 1):
+            name = f"{shortlist[0]}_half{h}"
+            if name not in verified:
+                break
+            v = [x / 2.0 for x in v]
+            _require(max(abs(float(a) - b) for a, b
+                         in zip(verified[name]["v"], v)) <= 1e-12,
+                     f"{round_label}: halving {h} did not halve the step")
+            chosen, _ = choose_applied(
+                {name: [float(x) for x in verified[name]["measured"]]},
+                current, floors)
+            if chosen is not None:
+                break
+    if chosen is None:
+        _require(record.get("chosen") is None and record.get("status") == "zero_step",
+                 f"{round_label}: no verified candidate satisfies the floor, yet the "
+                 f"record claims chosen={record.get('chosen')} "
+                 f"status={record.get('status')}")
+        return [0.0] * num_clients
+    _require(record.get("chosen") == chosen,
+             f"{round_label}: the record names {record.get('chosen')} as applied but "
+             f"the recorded measurements select {chosen}")
+    return [float(x) for x in verified[chosen]["v"]]
+
+
 def _round_coefficients(result, round_label, num_clients, payload=None):
     """(kind, coefficients) the record says were applied for this round.
 
@@ -427,6 +511,21 @@ def _round_coefficients(result, round_label, num_clients, payload=None):
             recorded,
             _reference_qffl_coefficients(result, payload, round_label),
             _ROUNDED_LOSS_COEFFICIENT_RTOL, arm, round_label)
+        return "delta", recorded
+
+    if arm == "response-maxmin":
+        _require(not frozen, f"{round_label}: response-maxmin covers the "
+                             "trainable coordinate only")
+        recorded = _recorded_scheme_weights(result, arm, round_label, num_clients)
+        expected = _reference_response_maxmin_choice(result, round_label,
+                                                     num_clients)
+        if max(abs(x) for x in expected) == 0.0:
+            _require(max(abs(x) for x in recorded) == 0.0,
+                     f"{round_label}: the record implies a zero step but "
+                     "nonzero weights are recorded")
+        else:
+            _require_coefficients_agree(recorded, expected,
+                                        _EXACT_COEFFICIENT_RTOL, arm, round_label)
         return "delta", recorded
 
     if arm is None:

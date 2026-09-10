@@ -140,28 +140,100 @@ def _feasible(means, floors):
     return all(f is None or m >= f for m, f in zip(means, floors))
 
 
-def rank_candidates(pred_means, current, floors, n_top):
-    """Names of the ``n_top`` floor-feasible candidates ordered by worst-client gain
-    (descending), then mean gain, then name. ``floors`` is a per-client list (None entries
-    mean no floor for that client) or None for no floor at all."""
+def rank_candidates(pred_means, current, floors, n_top, scores=None):
+    """Names of the ``n_top`` floor-feasible candidates ordered by the worst client's
+    selection statistic (descending), then its mean, then name. The statistic is the mean
+    gain ``means - current`` unless ``scores`` maps a name to its per-client statistic (the
+    pessimistic gain of method v2). The floor always applies to the means. ``floors`` is a
+    per-client list (None entries mean no floor for that client) or None for no floor."""
     rows = []
     for name, means in pred_means.items():
         if not _feasible(means, floors):
             continue
-        gains = [m - c for m, c in zip(means, current)]
-        rows.append((-min(gains), -float(np.mean(gains)), name))
+        stat = (list(scores[name]) if scores is not None
+                else [m - c for m, c in zip(means, current)])
+        rows.append((-min(stat), -float(np.mean(stat)), name))
     rows.sort()
     return [name for _, _, name in rows[:n_top]]
 
 
-def choose_applied(measured_means, current, floors):
-    """The same rule on measured values: (name, worst-client gain) of the best feasible
-    candidate, or (None, None) when no candidate satisfies the floor."""
-    best = rank_candidates(measured_means, current, floors, 1)
+def choose_applied(measured_means, current, floors, scores=None):
+    """The same rule on measured values: (name, worst-client statistic) of the best
+    feasible candidate, or (None, None) when no candidate satisfies the floor."""
+    best = rank_candidates(measured_means, current, floors, 1, scores)
     if not best:
         return None, None
-    gains = [m - c for m, c in zip(measured_means[best[0]], current)]
-    return best[0], float(min(gains))
+    stat = (list(scores[best[0]]) if scores is not None
+            else [m - c for m, c in zip(measured_means[best[0]], current)])
+    return best[0], float(min(stat))
+
+
+def pessimistic_gain(diffs):
+    """Mean of paired per-query gains minus one standard error: the selection statistic of
+    method v2 (research_loop/2026-09-11_solution_loop.md, section 4), which stops a client
+    with few dev queries from winning the max-min through noise. NaN for an empty input;
+    the single value for one query."""
+    d = np.asarray(diffs, dtype=np.float64)
+    if d.size == 0:
+        return float("nan")
+    if d.size == 1:
+        return float(d[0])
+    return float(d.mean() - d.std(ddof=1) / np.sqrt(d.size))
+
+
+def magnitude_candidates(norms, game_weights, eq_scales, game_scales, rel_floor=1e-6):
+    """Weight vectors that act on update magnitudes (loop document, sections 3 and 6).
+
+    With product-space update norms r_k and the unit-direction game weights w*:
+      eq_x{s}:   v_k = s * rbar / (n_active * r_k)   equal magnitude shares, total s * rbar;
+      game_x{s}: v_k = s * w*_k * rbar / r_k          unit directions mixed by w*.
+    rbar is the mean active norm, so eq_x1 has the total magnitude of uniform weights with
+    equal shares. A client whose norm is at most ``rel_floor`` times the largest moved
+    nowhere and receives weight 0.
+    """
+    r = np.asarray(norms, dtype=np.float64)
+    K = r.size
+    largest = float(r.max()) if K and bool(np.all(np.isfinite(r))) else 0.0
+    if largest <= 0.0:
+        return {}
+    active = r > rel_floor * largest
+    rbar = float(r[active].mean())
+    inverse = np.where(active, rbar / np.where(active, r, 1.0), 0.0)
+    n_active = int(active.sum())
+    out = {}
+    for s in eq_scales:
+        out[f"eq_x{s:g}"] = [float(s * inverse[k] / n_active) for k in range(K)]
+    w = np.asarray(game_weights, dtype=np.float64)
+    for s in game_scales:
+        out[f"game_x{s:g}"] = [float(s * w[k] * inverse[k]) for k in range(K)]
+    return out
+
+
+def uniform_subsets(K):
+    """Every nonempty subset of clients averaged uniformly, named ``sub_<indices>``."""
+    out = {}
+    for mask in range(1, 2 ** K):
+        idx = [k for k in range(K) if mask >> k & 1]
+        out["sub_" + "".join(str(k) for k in idx)] = [
+            1.0 / len(idx) if k in idx else 0.0 for k in range(K)]
+    return out
+
+
+def greedy_soup(order, gains_of):
+    """Per-client greedy soup over the vertices (Model soups' greedy rule applied to every
+    client at once): walk the vertices in ``order`` and keep the uniform soup of the
+    vertices kept so far, adding the next one only if every client's gain improves. The
+    first vertex always enters. ``gains_of(v)`` returns per-client gains for weights v.
+    Returns (weights, kept indices)."""
+    K = len(order)
+    soup, current = [], None
+    for k in order:
+        trial = soup + [int(k)]
+        v = [1.0 / len(trial) if j in trial else 0.0 for j in range(K)]
+        gains = [float(g) for g in gains_of(v)]
+        if current is None or all(a > b for a, b in zip(gains, current)):
+            soup, current = trial, gains
+    return [1.0 / len(soup) if j in soup else 0.0 for j in range(K)], soup
 
 
 def paired_lower_bound(diffs, alpha=0.05, n_boot=2000, seed=0):
@@ -180,5 +252,10 @@ def response_config_tag(config):
     two settings never overwrite each other."""
     keys = ("dev_fraction", "dev_min", "lattice_step", "scales", "n_verify", "floor",
             "floor_delta", "halvings")
-    payload = json.dumps([config[k] for k in keys], sort_keys=True)
+    values = [config[k] for k in keys]
+    # Method v2 keys enter the tag only when set, so the registered v1 tag is unchanged.
+    for key in ("candidates", "select", "eq_scales", "game_scales", "model_pick"):
+        if key in config:
+            values.append([key, config[key]])
+    payload = json.dumps(values, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]

@@ -554,6 +554,27 @@ def main():
                     help="response-maxmin: step halvings tried when no verified "
                          "candidate satisfies the floor before the broadcast "
                          "is kept")
+    ap.add_argument("--response_candidates", choices=["lattice", "compact"],
+                    default="lattice",
+                    help="response-maxmin: 'lattice' = the registered v1 grid "
+                         "(fixed points, vertices, simplex lattice at every "
+                         "scale); 'compact' = method v2 (fixed points, vertices, "
+                         "magnitude-equalised and game families, per-client "
+                         "greedy soup, best uniform subset)")
+    ap.add_argument("--response_select", choices=["mean", "pessimistic"],
+                    default="mean",
+                    help="response-maxmin: worst-client selection statistic; "
+                         "'pessimistic' = mean paired gain minus one standard "
+                         "error (the floor always applies to means)")
+    ap.add_argument("--response_eq_scales", type=str, default="0.5,1.0,2.0",
+                    help="response-maxmin compact: total-magnitude scales of "
+                         "the magnitude-equalised family (1.0 = uniform's total)")
+    ap.add_argument("--response_game_scales", type=str, default="1.0,2.0",
+                    help="response-maxmin compact: total-magnitude scales of "
+                         "the unit-direction game family")
+    ap.add_argument("--response_model_pick", action="store_true",
+                    help="response-maxmin compact: add the response model's best "
+                         "lattice point as one more contender")
     ap.add_argument("--loss_sample", type=int, default=2048,
                     help="max training pairs per client for the broadcast-"
                          "point loss estimate (qffl/afl only; deterministic "
@@ -719,6 +740,7 @@ def main():
         if not np.isfinite(args.qffl_L) or args.qffl_L <= 0:
             ap.error("--qffl_L must be a finite positive float")
     response_scales = None
+    response_eq_scales, response_game_scales = None, None
     if args.weight_by == "response-maxmin":
         if not args.weighted:
             ap.error("--weight_by response-maxmin requires --weighted")
@@ -744,6 +766,20 @@ def main():
             ap.error("--response_scales must be positive")
         if not np.isfinite(args.response_floor_delta):
             ap.error("--response_floor_delta must be finite")
+        try:
+            response_eq_scales = [float(x) for x in args.response_eq_scales.split(",")]
+            response_game_scales = [float(x) for x in args.response_game_scales.split(",")]
+        except ValueError:
+            ap.error("--response_eq_scales and --response_game_scales must be "
+                     "comma-separated numbers")
+        if (args.response_candidates == "compact"
+                and (not response_eq_scales or not response_game_scales
+                     or min(response_eq_scales + response_game_scales) <= 0)):
+            ap.error("--response_eq_scales and --response_game_scales must be "
+                     "nonempty and positive for --response_candidates compact")
+        if args.response_model_pick and args.response_candidates != "compact":
+            ap.error("--response_model_pick applies to --response_candidates "
+                     "compact only")
     if (args.fedspan_shadow_sketch is not None
             and canonical_weight_by != "normmaxmin"):
         ap.error("--fedspan_shadow_sketch is legal only with --weight_by "
@@ -964,6 +1000,16 @@ def main():
             "floor": args.response_floor,
             "floor_delta": args.response_floor_delta,
             "halvings": args.response_halvings}
+        if args.response_candidates == "compact":
+            # Method v2 keys (research_loop/2026-09-11_solution_loop.md, section 6);
+            # absent from a v1 configuration so its registered tag is unchanged.
+            response_config.update({
+                "candidates": "compact", "select": args.response_select,
+                "eq_scales": response_eq_scales,
+                "game_scales": response_game_scales,
+                "model_pick": bool(args.response_model_pick)})
+        elif args.response_select != "mean":
+            response_config["select"] = args.response_select
 
     # Preserve historical trainable-A+B filenames. New frozen-A runs add a
     # canonical result-affecting configuration hash so capped/full and other

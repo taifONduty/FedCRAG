@@ -127,3 +127,67 @@ def test_response_config_tag_is_short_and_configuration_sensitive():
     tag = ra.response_config_tag(cfg)
     assert len(tag) == 8 and tag == ra.response_config_tag(dict(cfg))
     assert tag != ra.response_config_tag({**cfg, "n_verify": 3})
+
+
+def test_pessimistic_gain_is_mean_minus_one_standard_error():
+    d = np.array([0.1, 0.3, -0.1, 0.2])
+    assert ra.pessimistic_gain(d) == pytest.approx(d.mean() - d.std(ddof=1) / 2.0)
+    assert ra.pessimistic_gain([0.25]) == 0.25
+    assert np.isnan(ra.pessimistic_gain([]))
+
+
+def test_magnitude_candidates_equalise_shares_and_drop_idle_clients():
+    norms = [4.0, 1.0, 0.5, 0.0]            # the last client moved nowhere
+    game = [0.4, 0.3, 0.3, 0.0]
+    cands = ra.magnitude_candidates(norms, game, eq_scales=[1.0, 2.0], game_scales=[1.0])
+    assert set(cands) == {"eq_x1", "eq_x2", "game_x1"}
+    rbar = np.mean([4.0, 1.0, 0.5])
+    # equal magnitude shares: v_k r_k equal for active clients, total rbar at scale 1
+    shares = [v * r for v, r in zip(cands["eq_x1"], norms)]
+    assert shares[:3] == pytest.approx([rbar / 3] * 3) and shares[3] == 0.0
+    assert sum(v * r for v, r in zip(cands["eq_x2"], norms)) == pytest.approx(2 * rbar)
+    # the game family mixes unit directions by w*: magnitude share k is w*_k
+    gshares = [v * r for v, r in zip(cands["game_x1"], norms)]
+    assert np.asarray(gshares[:3]) / rbar == pytest.approx([0.4, 0.3, 0.3])
+    assert cands["game_x1"][3] == 0.0
+    assert ra.magnitude_candidates([0.0, 0.0], [0.5, 0.5], [1.0], [1.0]) == {}
+
+
+def test_uniform_subsets_enumerate_every_nonempty_subset():
+    subs = ra.uniform_subsets(3)
+    assert len(subs) == 7 and subs["sub_02"] == [0.5, 0.0, 0.5] and subs["sub_1"] == [0.0, 1.0, 0.0]
+
+
+def test_greedy_soup_adds_a_vertex_only_when_every_client_improves():
+    # client gains of the uniform soup over a set S: client 0 likes vertex 0 only
+    def gains_of(v):
+        kept = [j for j, x in enumerate(v) if x > 0]
+        return [1.0 if kept == [0] else 0.5 if 0 in kept else 0.0,   # client 0 hurt by others
+                0.2 * len(kept)]                                       # client 1 likes everyone
+    v, kept = ra.greedy_soup([0, 1, 2], gains_of)
+    assert kept == [0] and v == [1.0, 0.0, 0.0]
+    v, kept = ra.greedy_soup([1, 2, 0], lambda v: [sum(v) * 0 + len([x for x in v if x > 0])] * 2)
+    assert kept == [1, 2, 0] and v == pytest.approx([1 / 3] * 3)
+
+
+def test_rank_candidates_uses_scores_when_given_and_floors_on_means():
+    pred = {"a": [0.5, 0.5], "b": [0.6, 0.6], "c": [0.9, 0.1]}
+    current = [0.4, 0.4]
+    scores = {"a": [0.2, 0.2], "b": [0.05, 0.3], "c": [0.5, -0.1]}
+    assert ra.rank_candidates(pred, current, None, 3) == ["b", "a", "c"]          # mean rule
+    assert ra.rank_candidates(pred, current, None, 3, scores) == ["a", "b", "c"]  # pessimistic
+    assert ra.rank_candidates(pred, current, [0.55, 0.0], 3, scores) == ["b", "c"]
+    name, stat = ra.choose_applied(pred, current, None, scores)
+    assert name == "a" and stat == 0.2
+
+
+def test_response_config_tag_is_sensitive_to_the_v2_keys():
+    cfg = dict(dev_fraction=0.1, dev_min=30, lattice_step=0.125, scales=[0.5, 1.0, 1.5],
+               n_verify=2, floor="frozen", floor_delta=0.0, halvings=2)
+    v1 = ra.response_config_tag(cfg)
+    v2 = ra.response_config_tag({**cfg, "candidates": "compact", "select": "pessimistic",
+                                 "eq_scales": [0.5, 1.0, 2.0], "game_scales": [1.0, 2.0],
+                                 "model_pick": False})
+    assert v1 != v2 and v2 != ra.response_config_tag({**cfg, "candidates": "compact",
+                                                      "select": "mean", "eq_scales": [1.0],
+                                                      "game_scales": [1.0], "model_pick": True})

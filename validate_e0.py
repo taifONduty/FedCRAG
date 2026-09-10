@@ -8,6 +8,8 @@ import argparse
 import hashlib
 import json
 import math
+
+import numpy as np
 import re
 import statistics
 import sys
@@ -27,7 +29,9 @@ _LORA_KEY = re.compile(r"(.*)\.lora_(A|B)\.weight$")
 # exactly 0 on every frozen-A path. A global rescaled by 1.5x scores 5.0e+04.
 _AGGREGATE_RTOL = 1e-5
 
-from response_aggregation import choose_applied, rank_candidates
+from aggregation_schemes import maxmin_weights, update_gram
+from response_aggregation import (choose_applied, magnitude_candidates,
+                                  rank_candidates)
 
 _SUPPORTED_ARMS = (None, "rawmaxmin", "normmaxmin", "examples",
                    "qffl", "afl", "fednova", "response-maxmin")
@@ -386,7 +390,87 @@ def _simplex_from_recorded(weights, label):
     return [value / total for value in weights]
 
 
-def _reference_response_maxmin_choice(result, round_label, num_clients):
+def _response_selection_scores(record, names, source, select, round_label):
+    """Per-client selection statistics recorded for ``names`` (None under the mean rule)."""
+    if select != "pessimistic":
+        return None
+    scores = {}
+    for name in names:
+        values = (source.get(name) or {}).get("stat")
+        _require(isinstance(values, list) and len(values) == len(record["dev_current"])
+                 and all(_finite(float(x)) for x in values),
+                 f"{round_label}: candidate {name} has no complete selection statistic")
+        scores[name] = [float(x) for x in values]
+    return scores
+
+
+def _check_response_families(record, args, payload, slices, round_label):
+    """Method v2: the magnitude-equalised and game candidates must follow from the
+    persisted states through the same geometry the arm computed."""
+    families = record.get("families") or []
+    if not families:
+        return
+    _require(payload is not None,
+             f"{round_label}: response-maxmin families need the round states")
+    num_clients = len(slices)
+    clients = [payload["clients"][name] for name in slices]
+    G = update_gram(clients, payload["broadcast"], normalize=False,
+                    dtype=torch.float64)
+    norms = [float(x) for x in np.sqrt(np.clip(np.diag(G), 0.0, None))]
+    game = [float(x) for x in maxmin_weights(clients, payload["broadcast"])]
+    geometry = record.get("geometry") or {}
+    _require(len(geometry.get("norms") or []) == num_clients
+             and max(abs(float(a) - b) for a, b in zip(geometry["norms"], norms))
+             <= 1e-6 * max(1.0, max(norms)),
+             f"{round_label}: recorded update norms differ from the persisted states")
+    _require(max(abs(float(a) - b) for a, b in zip(geometry.get("game_weights") or
+                                                   [float("nan")] * num_clients, game))
+             <= 1e-6,
+             f"{round_label}: recorded game weights differ from the persisted states")
+    eq_scales = [float(x) for x in str(args.get("response_eq_scales") or "").split(",") if x]
+    game_scales = [float(x) for x in str(args.get("response_game_scales") or "").split(",") if x]
+    expected = magnitude_candidates(norms, game, eq_scales, game_scales)
+    candidates = record.get("candidates") or {}
+    for name in families:
+        _require(name in expected and name in candidates,
+                 f"{round_label}: family candidate {name} is not implied by the arguments")
+        recorded = [float(x) for x in candidates[name]["v"]]
+        _require(max(abs(a - b) for a, b in zip(recorded, expected[name]))
+                 <= 1e-6 * max(1.0, max(abs(x) for x in expected[name])),
+                 f"{round_label}: family candidate {name} differs from the persisted "
+                 "geometry")
+
+
+def _check_response_picks(record, contenders, pred, scores, current, round_label):
+    """Method v2: the subset and model picks must be the best of their pools by the
+    recorded statistic; the greedy soup must be a uniform subset."""
+    picks = record.get("picks") or {}
+    candidates = record.get("candidates") or {}
+    for pick, prefix in (("subset", "sub_"), ("model", "lat")):
+        if pick not in picks:
+            continue
+        names = [n for n in candidates if n.startswith(prefix)]
+        _require(names, f"{round_label}: {pick} pick without a recorded pool")
+        pool_pred = {n: [float(x) for x in candidates[n]["pred"]] for n in names}
+        pool_scores = ({n: [float(x) for x in candidates[n]["stat"]] for n in names}
+                       if scores is not None else None)
+        best = rank_candidates(pool_pred, current, None, 1, pool_scores)
+        _require(best and best[0] == picks[pick].get("source"),
+                 f"{round_label}: recorded {pick} pick {picks[pick].get('source')} is not "
+                 f"the best of its pool ({best})")
+        _require(max(abs(float(a) - float(b)) for a, b
+                     in zip(picks[pick]["v"], candidates[best[0]]["v"])) <= 1e-12,
+                 f"{round_label}: {pick} pick weights differ from its source")
+    if "greedy" in picks:
+        v = [float(x) for x in picks["greedy"]["v"]]
+        kept = [i for i, x in enumerate(v) if x > 0]
+        _require(kept and all(abs(x - 1.0 / len(kept)) <= 1e-12 for x in v if x > 0)
+                 and sorted(kept) == sorted(int(i) for i in picks["greedy"].get("kept", [])),
+                 f"{round_label}: greedy soup weights are not a uniform subset of the "
+                 "recorded kept vertices")
+
+
+def _reference_response_maxmin_choice(result, round_label, num_clients, payload=None):
     """Recompute the response-maxmin server decision from the record: the shortlist
     from the recorded predictions and floors, the choice from the recorded
     measurements, the halving chain if any, and the coefficients that follow.
@@ -395,6 +479,8 @@ def _reference_response_maxmin_choice(result, round_label, num_clients):
     corpora, so they are not recomputed here; what is checked is that the applied
     weights are exactly what the recorded evidence implies under the recorded
     arguments, the same way q-FFL's weights must follow from its recorded losses.
+    Method v2 adds: the selection statistic named in the arguments, the family
+    candidates recomputed from the persisted states, and the model-chosen picks.
     """
     record = (result.get("scheme_diagnostics") or {}).get(round_label)
     _require(record is not None,
@@ -402,6 +488,9 @@ def _reference_response_maxmin_choice(result, round_label, num_clients):
     args = result.get("args") or {}
     n_verify = int(args.get("response_verify") or 0)
     _require(n_verify >= 1, f"{round_label}: response_verify missing from args")
+    select = args.get("response_select") or "mean"
+    _require(record.get("select", "mean") == select,
+             f"{round_label}: recorded selection rule differs from the arguments")
     current = [float(x) for x in (record.get("dev_current") or [])]
     frozen = [float(x) for x in (record.get("dev_frozen") or [])]
     _require(len(current) == num_clients and len(frozen) == num_clients,
@@ -427,7 +516,14 @@ def _reference_response_maxmin_choice(result, round_label, num_clients):
                  and all(_finite(float(x)) for x in values),
                  f"{round_label}: candidate {name} has no complete prediction")
         pred[name] = [float(x) for x in values]
-    shortlist = rank_candidates(pred, current, floors, n_verify)
+    contenders = list(record.get("contenders") or pred)
+    _require(all(name in pred for name in contenders),
+             f"{round_label}: a contender has no recorded prediction")
+    scores = _response_selection_scores(record, contenders, candidates, select, round_label)
+    _check_response_families(record, args, payload, result["slices"], round_label)
+    _check_response_picks(record, contenders, pred, scores, current, round_label)
+    shortlist = rank_candidates({n: pred[n] for n in contenders}, current, floors,
+                                n_verify, scores)
     _require(shortlist == list(record.get("shortlist") or []),
              f"{round_label}: recorded shortlist {record.get('shortlist')} is not the "
              f"top-{n_verify} of the recorded predictions ({shortlist})")
@@ -440,7 +536,9 @@ def _reference_response_maxmin_choice(result, round_label, num_clients):
                  f"{round_label}: verified weights for {name} differ from the grid")
     measured = {name: [float(x) for x in verified[name]["measured"]]
                 for name in shortlist}
-    chosen, _ = choose_applied(measured, current, floors)
+    chosen, _ = choose_applied(
+        measured, current, floors,
+        _response_selection_scores(record, shortlist, verified, select, round_label))
     if chosen is None and shortlist:
         v = [float(x) for x in candidates[shortlist[0]]["v"]]
         for h in range(1, int(args.get("response_halvings") or 0) + 1):
@@ -453,7 +551,9 @@ def _reference_response_maxmin_choice(result, round_label, num_clients):
                      f"{round_label}: halving {h} did not halve the step")
             chosen, _ = choose_applied(
                 {name: [float(x) for x in verified[name]["measured"]]},
-                current, floors)
+                current, floors,
+                _response_selection_scores(record, [name], verified, select,
+                                           round_label))
             if chosen is not None:
                 break
     if chosen is None:
@@ -518,7 +618,7 @@ def _round_coefficients(result, round_label, num_clients, payload=None):
                              "trainable coordinate only")
         recorded = _recorded_scheme_weights(result, arm, round_label, num_clients)
         expected = _reference_response_maxmin_choice(result, round_label,
-                                                     num_clients)
+                                                     num_clients, payload)
         if max(abs(x) for x in expected) == 0.0:
             _require(max(abs(x) for x in recorded) == 0.0,
                      f"{round_label}: the record implies a zero step but "

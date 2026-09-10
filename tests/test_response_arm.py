@@ -151,3 +151,57 @@ def test_prior_dev_frozen_is_kept_as_the_floor():
         fake_encode, broadcast, clients, make_dev(), SLICES, CONFIG, dev_frozen=frozen)
     assert out == frozen and record["dev_frozen"] == frozen
     assert record["floors"] == frozen
+
+
+def test_update_geometry_reports_norms_cosines_and_a_game_direction():
+    broadcast, clients = make_states()
+    geo = response_arm.update_geometry(broadcast, clients)
+    assert len(geo["norms"]) == 3 and min(geo["norms"]) > 0
+    cos = np.asarray(geo["cosine_gram"])
+    assert np.allclose(np.diag(cos), 1.0) and np.allclose(cos, cos.T)
+    w = np.asarray(geo["game_weights"])
+    assert w.sum() == pytest.approx(1.0) and w.min() >= 0
+    assert geo["game_value"] == pytest.approx(float(min(cos @ w)))
+    assert geo["game_status"] == "optimal" and geo["game_fallback"] is None
+
+
+COMPACT = {**CONFIG, "candidates": "compact", "select": "pessimistic",
+           "eq_scales": [0.5, 1.0, 2.0], "game_scales": [1.0, 2.0], "model_pick": True}
+
+
+def test_compact_round_builds_families_and_picks_and_applies_a_contender():
+    broadcast, clients = make_states()
+    result, record, _ = response_arm.run_response_maxmin_round(
+        fake_encode, broadcast, clients, make_dev(), SLICES, COMPACT, dev_frozen=None)
+    assert record["candidate_mode"] == "compact" and record["select"] == "pessimistic"
+    assert set(record["families"]) == {"eq_x0.5", "eq_x1", "eq_x2", "game_x1", "game_x2"}
+    assert {"greedy", "subset", "model"} <= set(record["picks"])
+    assert set(record["contenders"]) >= {"uniform", "examples", "solo_c0", "eq_x1", "game_x1"}
+    # the lattice and the subsets are predicted but are not contenders themselves
+    assert any(n.startswith("lat") for n in record["candidates"])
+    assert not any(n.startswith("lat") or n.startswith("sub_") for n in record["contenders"])
+    assert all(n in record["contenders"] for n in record["shortlist"])
+    chosen = record["chosen"]
+    assert chosen in record["contenders"] and record["weights"] == record["verified"][chosen]["v"]
+    for entry in record["verified"].values():
+        assert len(entry["stat"]) == 3
+        assert all(s <= g + 1e-12 for s, g in zip(entry["stat"], entry["measured_gain"]))
+    assert sum(record["applied_magnitude_shares"]) == pytest.approx(1.0)
+    for name in record["families"]:
+        assert record["candidates"][name]["v"] == pytest.approx(
+            ra.magnitude_candidates(
+                record["geometry"]["norms"], record["geometry"]["game_weights"],
+                COMPACT["eq_scales"], COMPACT["game_scales"])[name])
+    # the shortlist is the top of the contenders by the recorded pessimistic statistic
+    pred = {n: record["candidates"][n]["pred"] for n in record["contenders"]}
+    scores = {n: record["candidates"][n]["stat"] for n in record["contenders"]}
+    assert record["shortlist"] == ra.rank_candidates(
+        pred, record["dev_current"], record["floors"], 2, scores)
+
+
+def test_lattice_mode_record_is_unchanged_by_the_v2_keys():
+    broadcast, clients = make_states()
+    _, v1, _ = response_arm.run_response_maxmin_round(
+        fake_encode, broadcast, clients, make_dev(), SLICES, CONFIG, dev_frozen=None)
+    assert v1["candidate_mode"] == "lattice" and v1["families"] == [] and v1["picks"] == {}
+    assert v1["contenders"] == list(v1["candidates"])

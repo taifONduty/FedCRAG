@@ -154,3 +154,57 @@ def test_validator_refuses_a_shortlist_the_predictions_do_not_support(monkeypatc
 def test_validator_accepts_the_zero_step_outcome(monkeypatch, tmp_path):
     run_arm(monkeypatch, tmp_path, extra=("--response_floor_delta", "-1.0"))
     assert validate_run_directory(tmp_path)["rounds_validated"] == 1
+
+
+V2_FLAGS = ("--response_candidates", "compact", "--response_select", "pessimistic",
+            "--response_eq_scales", "0.5,1.0,2.0", "--response_game_scales", "1.0,2.0",
+            "--response_model_pick")
+
+
+def test_v2_arm_runs_validates_and_has_its_own_tag(monkeypatch, tmp_path):
+    result, path = run_arm(monkeypatch, tmp_path, extra=V2_FLAGS)
+    rec = result["scheme_diagnostics"]["round_1"]
+    assert rec["candidate_mode"] == "compact" and rec["select"] == "pessimistic"
+    assert set(rec["families"]) == {"eq_x0.5", "eq_x1", "eq_x2", "game_x1", "game_x2"}
+    assert {"greedy", "subset", "model"} <= set(rec["picks"])
+    assert rec["chosen"] in rec["contenders"]
+    assert len(rec["geometry"]["norms"]) == 3 and sum(rec["applied_magnitude_shares"]) == pytest.approx(1.0)
+    assert validate_run_directory(tmp_path)["rounds_validated"] == 1
+    _, v1_path = run_arm(monkeypatch, tmp_path / "v1")
+    assert path.name != v1_path.name
+
+
+def test_validator_refuses_a_forged_family_candidate(monkeypatch, tmp_path):
+    result, path = run_arm(monkeypatch, tmp_path, extra=V2_FLAGS)
+    rec = result["scheme_diagnostics"]["round_1"]
+    rec["candidates"]["eq_x1"]["v"] = [x * 1.5 for x in rec["candidates"]["eq_x1"]["v"]]
+    _rewrite(path, result)
+    with pytest.raises(E0ValidationError):
+        validate_run_directory(tmp_path)
+
+
+def test_validator_refuses_a_subset_pick_the_statistics_do_not_support(monkeypatch, tmp_path):
+    result, path = run_arm(monkeypatch, tmp_path, extra=V2_FLAGS)
+    rec = result["scheme_diagnostics"]["round_1"]
+    source = rec["picks"]["subset"]["source"]
+    other = [n for n in rec["candidates"] if n.startswith("sub_") and n != source][0]
+    rec["candidates"][other]["stat"] = [1.0] * 3       # would have been the best subset
+    _rewrite(path, result)
+    with pytest.raises(E0ValidationError):
+        validate_run_directory(tmp_path)
+
+
+def test_validator_refuses_a_pessimistic_choice_the_statistics_do_not_support(monkeypatch, tmp_path):
+    result, path = run_arm(monkeypatch, tmp_path, extra=V2_FLAGS + ("--response_floor", "none"))
+    rec = result["scheme_diagnostics"]["round_1"]
+    assert len(rec["shortlist"]) == 2
+    other = [n for n in rec["shortlist"] if n != rec["chosen"]][0]
+    rec["verified"][other]["stat"] = [1.0] * 3          # forged statistic for the loser
+    _rewrite(path, result)
+    with pytest.raises(E0ValidationError):
+        validate_run_directory(tmp_path)
+
+
+def test_model_pick_is_refused_outside_compact_mode(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit):
+        run_arm(monkeypatch, tmp_path, extra=("--response_model_pick",))

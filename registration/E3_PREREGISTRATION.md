@@ -634,3 +634,41 @@ queries, the baselines on 100 percent.
 
 Cost: about 21 GPU-hours per seed (six extra full evaluations per round). Runs after A2.
 
+
+### 13.2.2 Execution note for block A5 (written 2026-09-11 17:05 UTC, while the seed-123 same-split baseline runs and before any arm run)
+
+Order and hardware. The seed-123 same-split uniform baseline is running on the Tokyo L4
+(chain8, commit 8eca0e6, started 13:31 UTC). Stage 2 on the same machine, launched only
+after 13.2.1 is committed: the arm at seed 123, the arm at seed 2024, then the same-split
+uniform baseline at seed 2024, each validated by validate_e0 before the next starts, with
+power-off at the end. Because that chain cannot be relied on to finish all four runs before
+the pre-defense report deadline (13 September, 17:59 UTC), the seed-2024 same-split uniform
+baseline is also executed on the Azure T4 (same commit, data, recipe and mixed precision),
+launched after the response study on that machine ends. Precedence, fixed now: for the
+paper, the Tokyo copy is the seed-2024 comparator once it validates, and the T4 copy is
+reported beside it as a hardware replication; for the pre-defense report, whichever
+validated copy exists at writing time is used and its hardware is stated. No table mixes
+hardware silently; every use of the T4 copy says so. Each run's provenance records the
+platform, the backbone snapshot hash and the data hash, so any difference is visible.
+
+Recipe note. The A5 runs use the driver's default of gradient checkpointing on, as every
+A2 run did (commit f25c1cb); the E1 runs had it off. Checkpointing recomputes activations
+in the backward pass and changes memory and speed only; the loss and its gradient are the
+same functions of the parameters. The A5 baselines and arms share the setting, so the
+comparison inside the block is unaffected. Training-critical arguments are otherwise those
+of E1: batch 32, evaluation batch 256, learning rate 2e-5, rank 16, trainable A and B, one
+local epoch, eight rounds, mixed precision on, held-out fraction 0.10 with minimum 30.
+
+Flags for stage 2, every value from 13.2 or 13.2.1, written out so the record is explicit:
+`--weighted --weight_by response-maxmin --lora_mode trainable-ab --response_dev_fraction 0.1
+--response_dev_min 30 --response_lattice_step 0.125 --response_scales 0.5,1.0,1.5
+--response_verify 2 --response_floor frozen --response_floor_delta 0.0 --response_halvings 2
+--response_candidates compact --response_select <rule>` plus the family flags
+(`--response_eq_scales 0.5,1.0,2.0 --response_game_scales 1.0,2.0 --response_eq_top 2,3` if
+the families stay, `--response_eq_scales none --response_game_scales none
+--response_eq_top none` if the decision rule drops them; 'none' switches a family off,
+added to the driver and validator under test on 2026-09-11 at commit 308d23d) and
+`--response_model_pick` only if the rule includes the model pick. The baseline at seed
+2024 adds `--dev_holdout` to the common flags and nothing else. The chain script refuses
+to start unless the repository is at the commit carrying 13.2.1 and every placeholder is
+filled from the recorded output of the decision script.

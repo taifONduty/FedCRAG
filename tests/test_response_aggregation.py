@@ -217,3 +217,12 @@ def test_magnitude_candidates_top_m_equalise_the_largest_updates_only():
     assert shares2 == pytest.approx([rbar / 2, rbar / 2, 0.0, 0.0])
     shares3 = [v * r for v, r in zip(cands["eq3_x1"], norms)]
     assert shares3 == pytest.approx([rbar / 3] * 3 + [0.0])
+
+
+def test_parse_number_list_treats_none_and_empty_as_off():
+    assert ra.parse_number_list("none", float) == [] and ra.parse_number_list("", float) == []
+    assert ra.parse_number_list(" None ", int) == []
+    assert ra.parse_number_list("0.5, 1.0,2", float) == [0.5, 1.0, 2.0]
+    assert ra.parse_number_list("2,3", int) == [2, 3]
+    with pytest.raises(ValueError):
+        ra.parse_number_list("1.0,abc", float)

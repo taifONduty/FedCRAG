@@ -276,6 +276,15 @@ def paired_lower_bound(diffs, alpha=0.05, n_boot=2000, seed=0):
     return float(np.quantile(d[idx].mean(axis=1), alpha))
 
 
+def parse_number_list(text, cast):
+    """Comma-separated numbers from a command-line flag. The empty string or 'none' (any
+    case) is the empty list, which switches the corresponding candidate family off."""
+    cleaned = str(text).strip()
+    if cleaned.lower() in ("", "none"):
+        return []
+    return [cast(item.strip()) for item in cleaned.split(",") if item.strip()]
+
+
 def response_config_tag(config):
     """Eight hex characters binding the arm's configuration into the output filename, so
     two settings never overwrite each other."""

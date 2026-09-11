@@ -46,7 +46,7 @@ from aggregation_schemes import (SchemeResult, afl_update, apply_delta_weights,
                                  mgda_weights, qffl_delta_weights,
                                  state_dict_sha256, update_gram,
                                  validate_frozen_a_states)
-from response_aggregation import dev_split, response_config_tag
+from response_aggregation import dev_split, parse_number_list, response_config_tag
 from response_arm import run_response_maxmin_round
 
 LORA_A_SUFFIX = ".lora_A.weight"
@@ -571,13 +571,16 @@ def main():
                          "floor always applies to means)")
     ap.add_argument("--response_eq_top", type=str, default="2,3",
                     help="response-maxmin compact: also equalise magnitudes among "
-                         "the m largest updates only, for each m listed")
+                         "the m largest updates only, for each m listed; 'none' "
+                         "adds no such candidate")
     ap.add_argument("--response_eq_scales", type=str, default="0.5,1.0,2.0",
                     help="response-maxmin compact: total-magnitude scales of "
-                         "the magnitude-equalised family (1.0 = uniform's total)")
+                         "the magnitude-equalised family (1.0 = uniform's total); "
+                         "'none' switches the family off")
     ap.add_argument("--response_game_scales", type=str, default="1.0,2.0",
                     help="response-maxmin compact: total-magnitude scales of "
-                         "the unit-direction game family")
+                         "the unit-direction game family; 'none' switches the "
+                         "family off")
     ap.add_argument("--response_model_pick", action="store_true",
                     help="response-maxmin compact: add the response model's best "
                          "lattice point as one more contender")
@@ -779,17 +782,20 @@ def main():
         if not np.isfinite(args.response_floor_delta):
             ap.error("--response_floor_delta must be finite")
         try:
-            response_eq_scales = [float(x) for x in args.response_eq_scales.split(",")]
-            response_game_scales = [float(x) for x in args.response_game_scales.split(",")]
-            response_eq_top = [int(x) for x in args.response_eq_top.split(",") if x.strip()]
+            response_eq_scales = parse_number_list(args.response_eq_scales, float)
+            response_game_scales = parse_number_list(args.response_game_scales, float)
+            response_eq_top = parse_number_list(args.response_eq_top, int)
         except ValueError:
-            ap.error("--response_eq_scales and --response_game_scales must be "
-                     "comma-separated numbers")
+            ap.error("--response_eq_scales, --response_game_scales and "
+                     "--response_eq_top must be comma-separated numbers or 'none'")
+        # 'none' switches a magnitude family off (registration 13.2.1 decision rule);
+        # any scale that is present must be a finite positive number.
         if (args.response_candidates == "compact"
-                and (not response_eq_scales or not response_game_scales
-                     or min(response_eq_scales + response_game_scales) <= 0)):
-            ap.error("--response_eq_scales and --response_game_scales must be "
-                     "nonempty and positive for --response_candidates compact")
+                and any(not np.isfinite(s) or s <= 0
+                        for s in response_eq_scales + response_game_scales)):
+            ap.error("--response_eq_scales and --response_game_scales must be finite "
+                     "and positive for --response_candidates compact ('none' switches "
+                     "a family off)")
         if args.response_model_pick and args.response_candidates != "compact":
             ap.error("--response_model_pick applies to --response_candidates "
                      "compact only")

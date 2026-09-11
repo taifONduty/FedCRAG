@@ -226,6 +226,36 @@ def test_pareto_arm_runs_and_validates(monkeypatch, tmp_path):
         validate_run_directory(tmp_path)
 
 
+NO_FAMILY_FLAGS = ("--response_candidates", "compact", "--response_select", "mean",
+                   "--response_eq_scales", "none", "--response_game_scales", "none",
+                   "--response_eq_top", "none")
+
+
+def test_compact_arm_runs_and_validates_with_the_magnitude_families_off(monkeypatch, tmp_path):
+    # the addendum's decision rule may drop the eq and game families; 'none' switches
+    # them off while the fixed points, vertices, greedy soup and subset pick remain
+    result, path = run_arm(monkeypatch, tmp_path, extra=NO_FAMILY_FLAGS)
+    rec = result["scheme_diagnostics"]["round_1"]
+    assert rec["candidate_mode"] == "compact" and rec["families"] == []
+    assert not any(n.startswith(("eq", "game")) for n in rec["candidates"])
+    assert {"greedy", "subset"} <= set(rec["picks"]) and "model" not in rec["picks"]
+    assert rec["chosen"] in rec["contenders"]
+    assert result["args"]["response_eq_scales"] == "none"
+    assert validate_run_directory(tmp_path)["rounds_validated"] == 1
+    _, v2_path = run_arm(monkeypatch, tmp_path / "v2", extra=V2_FLAGS)
+    assert path.name != v2_path.name
+
+
+@pytest.mark.parametrize("eq_scales, game_scales",
+                         [("0,1.0", "1.0"), ("1.0", "-1"), ("abc", "1.0"), ("1.0", "nan")])
+def test_compact_arm_refuses_nonpositive_or_malformed_family_scales(
+        monkeypatch, tmp_path, eq_scales, game_scales):
+    flags = ("--response_candidates", "compact", "--response_eq_scales", eq_scales,
+             "--response_game_scales", game_scales)
+    with pytest.raises(SystemExit):
+        run_arm(monkeypatch, tmp_path, extra=flags)
+
+
 def test_dev_holdout_baseline_trains_on_the_arm_split_and_records_it(monkeypatch, tmp_path):
     result, path = driver_harness.run_driver(
         monkeypatch, tmp_path, "trainable-ab", "uniform",

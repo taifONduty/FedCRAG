@@ -30,7 +30,7 @@ _LORA_KEY = re.compile(r"(.*)\.lora_(A|B)\.weight$")
 _AGGREGATE_RTOL = 1e-5
 
 from aggregation_schemes import maxmin_weights, update_gram
-from response_aggregation import (choose_applied, magnitude_candidates,
+from response_aggregation import (choose_applied, magnitude_candidates, parse_number_list,
                                   rank_candidates)
 
 _SUPPORTED_ARMS = (None, "rawmaxmin", "normmaxmin", "examples",
@@ -427,9 +427,9 @@ def _check_response_families(record, args, payload, slices, round_label):
                                                    [float("nan")] * num_clients, game))
              <= 1e-6,
              f"{round_label}: recorded game weights differ from the persisted states")
-    eq_scales = [float(x) for x in str(args.get("response_eq_scales") or "").split(",") if x]
-    game_scales = [float(x) for x in str(args.get("response_game_scales") or "").split(",") if x]
-    eq_top = [int(x) for x in str(args.get("response_eq_top") or "").split(",") if x.strip()]
+    eq_scales = parse_number_list(args.get("response_eq_scales") or "", float)
+    game_scales = parse_number_list(args.get("response_game_scales") or "", float)
+    eq_top = parse_number_list(args.get("response_eq_top") or "", int)
     expected = magnitude_candidates(norms, game, eq_scales, game_scales, eq_top=eq_top)
     candidates = record.get("candidates") or {}
     for name in families:

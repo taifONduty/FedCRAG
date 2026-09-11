@@ -635,7 +635,7 @@ queries, the baselines on 100 percent.
 Cost: about 21 GPU-hours per seed (six extra full evaluations per round). Runs after A2.
 
 
-### 13.2.2 Execution note for block A5 (written 2026-09-11 17:05 UTC, while the seed-123 same-split baseline runs and before any arm run)
+### 13.2.2 Execution note for block A5 (written 2026-09-11 16:24 UTC, the time of commit af95536, while the seed-123 same-split baseline runs and before any arm run; the heading first carried a forward-dated stamp of 17:05 UTC, corrected in the next commit)
 
 Order and hardware. The seed-123 same-split uniform baseline is running on the Tokyo L4
 (chain8, commit 8eca0e6, started 13:31 UTC). Stage 2 on the same machine, launched only

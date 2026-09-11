@@ -44,7 +44,10 @@ class _ClientTensors:
     """One client's base embeddings and stacked responses, resident on the device once."""
 
     def __init__(self, base_c, base_q, responses, device):
-        dtype = torch.float64 if device == "cpu" else torch.float32
+        # float64 on every device: the floor test is an exact comparison against the
+        # numpy reference, and float32 GPU predictions were seen to fall a hair below it
+        # on synthetic ties (Tokyo, 11 September); the cost on the L4 is about a minute per round.
+        dtype = torch.float64
         self.c0 = torch.as_tensor(np.asarray(base_c), dtype=dtype, device=device)
         self.q0 = torch.as_tensor(np.asarray(base_q), dtype=dtype, device=device)
         self.rc = torch.stack([torch.as_tensor(np.asarray(r[0]), dtype=dtype, device=device)

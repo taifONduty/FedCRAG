@@ -63,7 +63,9 @@ class _ClientTensors:
         q_hat = q_hat / q_hat.norm(dim=1, keepdim=True).clamp_min(1e-12)
         sims = q_hat @ c_hat.T
         take = min(int(take), sims.shape[1])
-        return torch.topk(sims, k=take, dim=1).indices.cpu().numpy()
+        # Full stable sort: equal scores keep ascending index order on every device,
+        # matching response_aggregation.top_indices (CUDA topk orders ties arbitrarily).
+        return torch.argsort(-sims, dim=1, stable=True)[:, :take].cpu().numpy()
 
 
 def _client_tensors(base, responses, slices, device):

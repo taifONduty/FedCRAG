@@ -121,12 +121,12 @@ def ndcg10_from_top(top_idx, cids, qids, qrels, k=10):
 
 
 def top_indices(sims, take):
-    """Row-wise indices of the ``take`` largest scores, sorted by descending score."""
+    """Row-wise indices of the ``take`` largest scores, sorted by descending score, with
+    equal scores in ascending index order (a full stable sort, so the tie order is the
+    same on every device and in the torch path)."""
     sims = np.asarray(sims)
     take = min(int(take), sims.shape[1])
-    part = np.argpartition(-sims, take - 1, axis=1)[:, :take]
-    order = np.argsort(-np.take_along_axis(sims, part, axis=1), axis=1, kind="stable")
-    return np.take_along_axis(part, order, axis=1)
+    return np.argsort(-sims, axis=1, kind="stable")[:, :take]
 
 
 def ndcg10(sims, cids, qids, qrels, k=10):

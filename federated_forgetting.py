@@ -561,11 +561,17 @@ def main():
                          "scale); 'compact' = method v2 (fixed points, vertices, "
                          "magnitude-equalised and game families, per-client "
                          "greedy soup, best uniform subset)")
-    ap.add_argument("--response_select", choices=["mean", "pessimistic"],
+    ap.add_argument("--response_select", choices=["mean", "pessimistic", "pareto"],
                     default="mean",
-                    help="response-maxmin: worst-client selection statistic; "
-                         "'pessimistic' = mean paired gain minus one standard "
-                         "error (the floor always applies to means)")
+                    help="response-maxmin: selection rule; 'mean' = worst-client "
+                         "mean paired gain; 'pessimistic' = worst-client mean "
+                         "gain minus one standard error; 'pareto' = among "
+                         "candidates whose pessimistic gain is nonnegative for "
+                         "every client, the largest total, else max-min (the "
+                         "floor always applies to means)")
+    ap.add_argument("--response_eq_top", type=str, default="2,3",
+                    help="response-maxmin compact: also equalise magnitudes among "
+                         "the m largest updates only, for each m listed")
     ap.add_argument("--response_eq_scales", type=str, default="0.5,1.0,2.0",
                     help="response-maxmin compact: total-magnitude scales of "
                          "the magnitude-equalised family (1.0 = uniform's total)")
@@ -740,7 +746,7 @@ def main():
         if not np.isfinite(args.qffl_L) or args.qffl_L <= 0:
             ap.error("--qffl_L must be a finite positive float")
     response_scales = None
-    response_eq_scales, response_game_scales = None, None
+    response_eq_scales, response_game_scales, response_eq_top = None, None, None
     if args.weight_by == "response-maxmin":
         if not args.weighted:
             ap.error("--weight_by response-maxmin requires --weighted")
@@ -769,6 +775,7 @@ def main():
         try:
             response_eq_scales = [float(x) for x in args.response_eq_scales.split(",")]
             response_game_scales = [float(x) for x in args.response_game_scales.split(",")]
+            response_eq_top = [int(x) for x in args.response_eq_top.split(",") if x.strip()]
         except ValueError:
             ap.error("--response_eq_scales and --response_game_scales must be "
                      "comma-separated numbers")
@@ -1007,7 +1014,8 @@ def main():
                 "candidates": "compact", "select": args.response_select,
                 "eq_scales": response_eq_scales,
                 "game_scales": response_game_scales,
-                "model_pick": bool(args.response_model_pick)})
+                "model_pick": bool(args.response_model_pick),
+                "eq_top": response_eq_top})
         elif args.response_select != "mean":
             response_config["select"] = args.response_select
 

@@ -392,7 +392,7 @@ def _simplex_from_recorded(weights, label):
 
 def _response_selection_scores(record, names, source, select, round_label):
     """Per-client selection statistics recorded for ``names`` (None under the mean rule)."""
-    if select != "pessimistic":
+    if select not in ("pessimistic", "pareto"):
         return None
     scores = {}
     for name in names:
@@ -429,7 +429,8 @@ def _check_response_families(record, args, payload, slices, round_label):
              f"{round_label}: recorded game weights differ from the persisted states")
     eq_scales = [float(x) for x in str(args.get("response_eq_scales") or "").split(",") if x]
     game_scales = [float(x) for x in str(args.get("response_game_scales") or "").split(",") if x]
-    expected = magnitude_candidates(norms, game, eq_scales, game_scales)
+    eq_top = [int(x) for x in str(args.get("response_eq_top") or "").split(",") if x.strip()]
+    expected = magnitude_candidates(norms, game, eq_scales, game_scales, eq_top=eq_top)
     candidates = record.get("candidates") or {}
     for name in families:
         _require(name in expected and name in candidates,
@@ -441,7 +442,11 @@ def _check_response_families(record, args, payload, slices, round_label):
                  "geometry")
 
 
-def _check_response_picks(record, contenders, pred, scores, current, round_label):
+def _response_objective(select):
+    return "pareto" if select == "pareto" else "maxmin"
+
+
+def _check_response_picks(record, contenders, pred, scores, current, round_label, select="mean"):
     """Method v2: the subset and model picks must be the best of their pools by the
     recorded statistic; the greedy soup must be a uniform subset."""
     picks = record.get("picks") or {}
@@ -454,7 +459,8 @@ def _check_response_picks(record, contenders, pred, scores, current, round_label
         pool_pred = {n: [float(x) for x in candidates[n]["pred"]] for n in names}
         pool_scores = ({n: [float(x) for x in candidates[n]["stat"]] for n in names}
                        if scores is not None else None)
-        best = rank_candidates(pool_pred, current, None, 1, pool_scores)
+        best = rank_candidates(pool_pred, current, None, 1, pool_scores,
+                               _response_objective(select))
         _require(best and best[0] == picks[pick].get("source"),
                  f"{round_label}: recorded {pick} pick {picks[pick].get('source')} is not "
                  f"the best of its pool ({best})")
@@ -521,9 +527,9 @@ def _reference_response_maxmin_choice(result, round_label, num_clients, payload=
              f"{round_label}: a contender has no recorded prediction")
     scores = _response_selection_scores(record, contenders, candidates, select, round_label)
     _check_response_families(record, args, payload, result["slices"], round_label)
-    _check_response_picks(record, contenders, pred, scores, current, round_label)
+    _check_response_picks(record, contenders, pred, scores, current, round_label, select)
     shortlist = rank_candidates({n: pred[n] for n in contenders}, current, floors,
-                                n_verify, scores)
+                                n_verify, scores, _response_objective(select))
     _require(shortlist == list(record.get("shortlist") or []),
              f"{round_label}: recorded shortlist {record.get('shortlist')} is not the "
              f"top-{n_verify} of the recorded predictions ({shortlist})")
@@ -538,7 +544,8 @@ def _reference_response_maxmin_choice(result, round_label, num_clients, payload=
                 for name in shortlist}
     chosen, _ = choose_applied(
         measured, current, floors,
-        _response_selection_scores(record, shortlist, verified, select, round_label))
+        _response_selection_scores(record, shortlist, verified, select, round_label),
+        _response_objective(select))
     if chosen is None and shortlist:
         v = [float(x) for x in candidates[shortlist[0]]["v"]]
         for h in range(1, int(args.get("response_halvings") or 0) + 1):
@@ -553,7 +560,8 @@ def _reference_response_maxmin_choice(result, round_label, num_clients, payload=
                 {name: [float(x) for x in verified[name]["measured"]]},
                 current, floors,
                 _response_selection_scores(record, [name], verified, select,
-                                           round_label))
+                                           round_label),
+                _response_objective(select))
             if chosen is not None:
                 break
     if chosen is None:

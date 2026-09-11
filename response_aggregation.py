@@ -140,27 +140,46 @@ def _feasible(means, floors):
     return all(f is None or m >= f for m, f in zip(means, floors))
 
 
-def rank_candidates(pred_means, current, floors, n_top, scores=None):
-    """Names of the ``n_top`` floor-feasible candidates ordered by the worst client's
-    selection statistic (descending), then its mean, then name. The statistic is the mean
-    gain ``means - current`` unless ``scores`` maps a name to its per-client statistic (the
-    pessimistic gain of method v2). The floor always applies to the means. ``floors`` is a
-    per-client list (None entries mean no floor for that client) or None for no floor."""
+def rank_candidates(pred_means, current, floors, n_top, scores=None, objective="maxmin"):
+    """Names of the ``n_top`` floor-feasible candidates in selection order.
+
+    ``objective="maxmin"``: by the worst client's selection statistic (descending), then
+    its mean, then name. The statistic is the mean gain ``means - current`` unless
+    ``scores`` maps a name to its per-client statistic (the pessimistic gain of method
+    v2). ``objective="pareto"`` (measured Pareto steps): candidates whose statistic is
+    nonnegative for every client rank first, by the total statistic (descending); if none
+    qualifies, all floor-feasible candidates rank by the worst client's statistic, so the
+    rule degrades to max-min and the caller can see that it did. The floor always applies
+    to the means. ``floors`` is a per-client list (None entries mean no floor for that
+    client) or None for no floor."""
+    if objective not in ("maxmin", "pareto"):
+        raise ValueError(f"unknown objective {objective!r}")
     rows = []
     for name, means in pred_means.items():
         if not _feasible(means, floors):
             continue
         stat = (list(scores[name]) if scores is not None
                 else [m - c for m, c in zip(means, current)])
-        rows.append((-min(stat), -float(np.mean(stat)), name))
+        if objective == "pareto":
+            pareto = min(stat) >= 0.0
+            rows.append((0 if pareto else 1,
+                         -float(np.sum(stat)) if pareto else -min(stat),
+                         -float(np.mean(stat)), name))
+        else:
+            rows.append((0, -min(stat), -float(np.mean(stat)), name))
     rows.sort()
-    return [name for _, _, name in rows[:n_top]]
+    return [row[-1] for row in rows[:n_top]]
 
 
-def choose_applied(measured_means, current, floors, scores=None):
+def pareto_feasible(stat):
+    """True when every client's statistic is nonnegative (a measured Pareto step)."""
+    return len(stat) > 0 and min(float(x) for x in stat) >= 0.0
+
+
+def choose_applied(measured_means, current, floors, scores=None, objective="maxmin"):
     """The same rule on measured values: (name, worst-client statistic) of the best
     feasible candidate, or (None, None) when no candidate satisfies the floor."""
-    best = rank_candidates(measured_means, current, floors, 1, scores)
+    best = rank_candidates(measured_means, current, floors, 1, scores, objective)
     if not best:
         return None, None
     stat = (list(scores[best[0]]) if scores is not None
@@ -181,12 +200,14 @@ def pessimistic_gain(diffs):
     return float(d.mean() - d.std(ddof=1) / np.sqrt(d.size))
 
 
-def magnitude_candidates(norms, game_weights, eq_scales, game_scales, rel_floor=1e-6):
+def magnitude_candidates(norms, game_weights, eq_scales, game_scales, rel_floor=1e-6,
+                         eq_top=()):
     """Weight vectors that act on update magnitudes (loop document, sections 3 and 6).
 
     With product-space update norms r_k and the unit-direction game weights w*:
-      eq_x{s}:   v_k = s * rbar / (n_active * r_k)   equal magnitude shares, total s * rbar;
-      game_x{s}: v_k = s * w*_k * rbar / r_k          unit directions mixed by w*.
+      eq_x{s}:    v_k = s * rbar / (n_active * r_k)  equal magnitude shares, total s * rbar;
+      eq{m}_x{s}: the same among the m largest updates only, the others at 0 (``eq_top``);
+      game_x{s}:  v_k = s * w*_k * rbar / r_k         unit directions mixed by w*.
     rbar is the mean active norm, so eq_x1 has the total magnitude of uniform weights with
     equal shares. A client whose norm is at most ``rel_floor`` times the largest moved
     nowhere and receives weight 0.
@@ -201,8 +222,16 @@ def magnitude_candidates(norms, game_weights, eq_scales, game_scales, rel_floor=
     inverse = np.where(active, rbar / np.where(active, r, 1.0), 0.0)
     n_active = int(active.sum())
     out = {}
+    order = [int(k) for k in np.argsort(-r) if active[k]]
     for s in eq_scales:
         out[f"eq_x{s:g}"] = [float(s * inverse[k] / n_active) for k in range(K)]
+        for m in eq_top:
+            m = int(m)
+            if not 1 <= m < n_active:
+                continue
+            top = set(order[:m])
+            out[f"eq{m}_x{s:g}"] = [float(s * inverse[k] / m) if k in top else 0.0
+                                    for k in range(K)]
     w = np.asarray(game_weights, dtype=np.float64)
     for s in game_scales:
         out[f"game_x{s:g}"] = [float(s * w[k] * inverse[k]) for k in range(K)]
@@ -254,7 +283,7 @@ def response_config_tag(config):
             "floor_delta", "halvings")
     values = [config[k] for k in keys]
     # Method v2 keys enter the tag only when set, so the registered v1 tag is unchanged.
-    for key in ("candidates", "select", "eq_scales", "game_scales", "model_pick"):
+    for key in ("candidates", "select", "eq_scales", "game_scales", "model_pick", "eq_top"):
         if key in config:
             values.append([key, config[key]])
     payload = json.dumps(values, sort_keys=True)

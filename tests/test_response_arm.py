@@ -205,3 +205,18 @@ def test_lattice_mode_record_is_unchanged_by_the_v2_keys():
         fake_encode, broadcast, clients, make_dev(), SLICES, CONFIG, dev_frozen=None)
     assert v1["candidate_mode"] == "lattice" and v1["families"] == [] and v1["picks"] == {}
     assert v1["contenders"] == list(v1["candidates"])
+
+
+def test_pareto_round_records_feasibility_and_top_m_families():
+    broadcast, clients = make_states()
+    cfg = {**COMPACT, "select": "pareto", "eq_top": [2]}
+    result, record, _ = response_arm.run_response_maxmin_round(
+        fake_encode, broadcast, clients, make_dev(), SLICES, cfg, dev_frozen=None)
+    assert record["select"] == "pareto" and "eq2_x1" in record["families"]
+    assert record["applied_pareto"] in (True, False)
+    chosen = record["chosen"]
+    assert record["applied_pareto"] == (min(record["verified"][chosen]["stat"]) >= 0.0)
+    pred = {n: record["candidates"][n]["pred"] for n in record["contenders"]}
+    scores = {n: record["candidates"][n]["stat"] for n in record["contenders"]}
+    assert record["shortlist"] == ra.rank_candidates(
+        pred, record["dev_current"], record["floors"], 2, scores, "pareto")

@@ -191,3 +191,29 @@ def test_response_config_tag_is_sensitive_to_the_v2_keys():
     assert v1 != v2 and v2 != ra.response_config_tag({**cfg, "candidates": "compact",
                                                       "select": "mean", "eq_scales": [1.0],
                                                       "game_scales": [1.0], "model_pick": True})
+
+
+def test_pareto_objective_prefers_all_positive_candidates_by_total_then_degrades_to_maxmin():
+    pred = {"a": [0.5, 0.5], "b": [0.6, 0.6], "c": [0.9, 0.1], "d": [0.7, 0.7]}
+    current = [0.4, 0.4]
+    scores = {"a": [0.02, 0.02], "b": [0.05, 0.01], "c": [0.5, -0.1], "d": [0.09, 0.0]}
+    # feasible (all >= 0): a total 0.04, b total 0.06, d total 0.09; c is not
+    assert ra.rank_candidates(pred, current, None, 4, scores, "pareto") == ["d", "b", "a", "c"]
+    assert ra.rank_candidates(pred, current, None, 4, scores) == ["a", "b", "d", "c"]  # max-min
+    # nothing feasible: max-min order
+    neg = {n: [x - 1.0 for x in v] for n, v in scores.items()}
+    assert ra.rank_candidates(pred, current, None, 4, neg, "pareto") == ["a", "b", "d", "c"]
+    assert ra.pareto_feasible([0.0, 0.1]) and not ra.pareto_feasible([-1e-9, 0.1]) and not ra.pareto_feasible([])
+    with pytest.raises(ValueError):
+        ra.rank_candidates(pred, current, None, 1, scores, "other")
+
+
+def test_magnitude_candidates_top_m_equalise_the_largest_updates_only():
+    norms = [4.0, 1.0, 0.5, 0.25]
+    cands = ra.magnitude_candidates(norms, [0.25] * 4, eq_scales=[1.0], game_scales=[], eq_top=[2, 3, 4, 9])
+    assert set(cands) == {"eq_x1", "eq2_x1", "eq3_x1"}          # m must be below the active count
+    rbar = np.mean(norms)
+    shares2 = [v * r for v, r in zip(cands["eq2_x1"], norms)]
+    assert shares2 == pytest.approx([rbar / 2, rbar / 2, 0.0, 0.0])
+    shares3 = [v * r for v, r in zip(cands["eq3_x1"], norms)]
+    assert shares3 == pytest.approx([rbar / 3] * 3 + [0.0])

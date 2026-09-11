@@ -111,8 +111,12 @@ def update_geometry(round_broadcast, client_states):
 
 
 def _stat(select, per_query_gains):
-    return (pessimistic_gain(per_query_gains) if select == "pessimistic"
+    return (pessimistic_gain(per_query_gains) if select in ("pessimistic", "pareto")
             else float(np.mean(per_query_gains)))
+
+
+def _objective(select):
+    return "pareto" if select == "pareto" else "maxmin"
 
 
 def run_response_maxmin_round(encode, round_broadcast, client_states, dev, slices,
@@ -158,7 +162,8 @@ def run_response_maxmin_round(encode, round_broadcast, client_states, dev, slice
     if mode == "compact":
         families = magnitude_candidates(geometry["norms"], geometry["game_weights"],
                                         config.get("eq_scales", []),
-                                        config.get("game_scales", []))
+                                        config.get("game_scales", []),
+                                        eq_top=config.get("eq_top", ()))
     if mode == "lattice":
         pool = candidate_grid(K, fixed, config["lattice_step"], config["scales"])
         contenders = list(pool)
@@ -193,12 +198,14 @@ def run_response_maxmin_round(encode, round_broadcast, client_states, dev, slice
         picks["greedy"] = {"v": soup_v, "kept": soup_idx, "order": order}
         subset_names = [n for n in pool if n.startswith("sub_")]
         best_sub = rank_candidates({n: pred_means[n] for n in subset_names}, current,
-                                  None, 1, {n: pred_stat[n] for n in subset_names})
+                                  None, 1, {n: pred_stat[n] for n in subset_names},
+                                  _objective(select))
         picks["subset"] = {"v": pool[best_sub[0]], "source": best_sub[0]}
         if config.get("model_pick"):
             lat_names = [n for n in pool if n.startswith("lat")]
             best_lat = rank_candidates({n: pred_means[n] for n in lat_names}, current,
-                                      None, 1, {n: pred_stat[n] for n in lat_names})
+                                      None, 1, {n: pred_stat[n] for n in lat_names},
+                                      _objective(select))
             picks["model"] = {"v": pool[best_lat[0]], "source": best_lat[0]}
         for name, pick in picks.items():
             v = [float(x) for x in pick["v"]]
@@ -213,10 +220,11 @@ def run_response_maxmin_round(encode, round_broadcast, client_states, dev, slice
             pred_stat[name] = [_stat(select, pq - base[s]["per_query"])
                                for pq, s in zip(pred_pq[name], slices)]
 
-    scores = pred_stat if select == "pessimistic" else None
+    scores = pred_stat if select in ("pessimistic", "pareto") else None
     shortlist = rank_candidates({n: pred_means[n] for n in contenders}, current, floors,
                                 int(config["n_verify"]),
-                                {n: scores[n] for n in contenders} if scores else None)
+                                {n: scores[n] for n in contenders} if scores else None,
+                                _objective(select))
     verified = {}
 
     def verify(name, v, halvings):
@@ -235,8 +243,9 @@ def run_response_maxmin_round(encode, round_broadcast, client_states, dev, slice
 
     measured_means = {name: verify(name, pool[name], 0) for name in shortlist}
     measured_scores = ({n: verified[n]["stat"] for n in measured_means}
-                       if select == "pessimistic" else None)
-    chosen, min_gain = choose_applied(measured_means, current, floors, measured_scores)
+                       if select in ("pessimistic", "pareto") else None)
+    chosen, min_gain = choose_applied(measured_means, current, floors, measured_scores,
+                                      _objective(select))
     status, halvings_used = "optimal", 0
     if chosen is None and shortlist:
         v = list(pool[shortlist[0]])
@@ -246,7 +255,8 @@ def run_response_maxmin_round(encode, round_broadcast, client_states, dev, slice
             means = {name: verify(name, v, h)}
             chosen, min_gain = choose_applied(
                 means, current, floors,
-                {name: verified[name]["stat"]} if select == "pessimistic" else None)
+                {name: verified[name]["stat"]} if select in ("pessimistic", "pareto") else None,
+                _objective(select))
             if chosen is not None:
                 status, halvings_used = "halved", h
                 break
@@ -269,6 +279,7 @@ def run_response_maxmin_round(encode, round_broadcast, client_states, dev, slice
                        for name, v in pool.items()},
         "contenders": contenders, "families": list(families), "picks": picks,
         "candidate_mode": mode, "select": select,
+        "applied_pareto": (bool(min(verified[chosen]["stat"]) >= 0.0) if chosen else None),
         "verified": verified, "dev_current": current, "dev_frozen": list(dev_frozen),
         "floors": floors, "solo_measured": solo_measured, "halvings_used": halvings_used,
         "geometry": geometry, "applied_magnitude_shares": shares,

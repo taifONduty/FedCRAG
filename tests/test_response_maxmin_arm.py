@@ -165,7 +165,9 @@ def test_v2_arm_runs_validates_and_has_its_own_tag(monkeypatch, tmp_path):
     result, path = run_arm(monkeypatch, tmp_path, extra=V2_FLAGS)
     rec = result["scheme_diagnostics"]["round_1"]
     assert rec["candidate_mode"] == "compact" and rec["select"] == "pessimistic"
-    assert set(rec["families"]) == {"eq_x0.5", "eq_x1", "eq_x2", "game_x1", "game_x2"}
+    # default --response_eq_top 2,3 with three clients: m = 2 is valid, m = 3 is not
+    assert set(rec["families"]) == {"eq_x0.5", "eq_x1", "eq_x2", "eq2_x0.5", "eq2_x1", "eq2_x2",
+                                    "game_x1", "game_x2"}
     assert {"greedy", "subset", "model"} <= set(rec["picks"])
     assert rec["chosen"] in rec["contenders"]
     assert len(rec["geometry"]["norms"]) == 3 and sum(rec["applied_magnitude_shares"]) == pytest.approx(1.0)
@@ -208,3 +210,17 @@ def test_validator_refuses_a_pessimistic_choice_the_statistics_do_not_support(mo
 def test_model_pick_is_refused_outside_compact_mode(monkeypatch, tmp_path):
     with pytest.raises(SystemExit):
         run_arm(monkeypatch, tmp_path, extra=("--response_model_pick",))
+
+
+def test_pareto_arm_runs_and_validates(monkeypatch, tmp_path):
+    flags = ("--response_candidates", "compact", "--response_select", "pareto",
+             "--response_eq_scales", "1.0", "--response_game_scales", "1.0",
+             "--response_eq_top", "2")
+    result, path = run_arm(monkeypatch, tmp_path, extra=flags)
+    rec = result["scheme_diagnostics"]["round_1"]
+    assert rec["select"] == "pareto" and "eq2_x1" in rec["families"]
+    assert validate_run_directory(tmp_path)["rounds_validated"] == 1
+    rec["candidates"]["eq2_x1"]["v"] = [x * 2 for x in rec["candidates"]["eq2_x1"]["v"]]
+    _rewrite(path, result)
+    with pytest.raises(E0ValidationError):
+        validate_run_directory(tmp_path)

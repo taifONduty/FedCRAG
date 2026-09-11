@@ -581,6 +581,12 @@ def main():
     ap.add_argument("--response_model_pick", action="store_true",
                     help="response-maxmin compact: add the response model's best "
                          "lattice point as one more contender")
+    ap.add_argument("--dev_holdout", action="store_true",
+                    help="hold out the response arm's dev split (same seeded "
+                         "partition, --response_dev_fraction / --response_dev_min) "
+                         "from training under any other arm, so a baseline trains "
+                         "on exactly the queries the response arm trains on; the "
+                         "split is recorded and the held-out queries are not used")
     ap.add_argument("--loss_sample", type=int, default=2048,
                     help="max training pairs per client for the broadcast-"
                          "point loss estimate (qffl/afl only; deterministic "
@@ -787,6 +793,12 @@ def main():
         if args.response_model_pick and args.response_candidates != "compact":
             ap.error("--response_model_pick applies to --response_candidates "
                      "compact only")
+    if args.dev_holdout:
+        if args.weight_by == "response-maxmin":
+            ap.error("--dev_holdout is implied by --weight_by response-maxmin")
+        if not (0.0 < args.response_dev_fraction <= 0.5) or args.response_dev_min < 1:
+            ap.error("--dev_holdout needs --response_dev_fraction in (0, 0.5] and "
+                     "--response_dev_min >= 1")
     if (args.fedspan_shadow_sketch is not None
             and canonical_weight_by != "normmaxmin"):
         ap.error("--fedspan_shadow_sketch is legal only with --weight_by "
@@ -943,12 +955,15 @@ def main():
               f"caps={[step_caps[s] for s in federation.slices]} -> "
               f"{shard_manifest_path}")
     dev_data = None
-    if args.weight_by == "response-maxmin":
+    if args.weight_by == "response-maxmin" or args.dev_holdout:
         # Held-out queries for the response arm come from each client's own
         # training queries, never from the test split; the partition is
         # deterministic per (seed, slice) and recorded in the result JSON.
+        # --dev_holdout applies the same partition under another arm (the
+        # same-split baseline) and simply never uses the held-out queries.
         dev_data, split_record = {}, {"fraction": args.response_dev_fraction,
                                       "min_dev": args.response_dev_min,
+                                      "holdout_only": bool(args.dev_holdout),
                                       "per_client": {}}
         for s in args.slices:
             qids = [q for q, rels in data[s]["train_qrels"].items()
@@ -986,7 +1001,7 @@ def main():
     materialized_scales = peft_scales(module_scales)
     global_state = get_adapter_state(model)
     response_config = None
-    if dev_data is not None:
+    if dev_data is not None and args.weight_by == "response-maxmin":
         for s in args.slices:
             corpus = data[s]["corpus"]
             cids = list(corpus.keys())
@@ -1034,6 +1049,10 @@ def main():
     if args.weight_by == "response-maxmin":
         # Distinct arm configurations are distinct experiments.
         basis += "-rmm" + response_config_tag(response_config)
+    if args.dev_holdout:
+        # A baseline trained on the arm's split is a different experiment from the
+        # same arm trained on every query.
+        basis += "-devholdout" + format(args.response_dev_fraction, ".8g").replace(".", "p")
     if canonical_weight_by == "normmaxmin":
         if args.fedspan_step_policy == "fixed":
             step_tag = format(args.fedspan_step_norm, ".8g").replace(".", "p")

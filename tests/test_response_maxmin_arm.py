@@ -224,3 +224,25 @@ def test_pareto_arm_runs_and_validates(monkeypatch, tmp_path):
     _rewrite(path, result)
     with pytest.raises(E0ValidationError):
         validate_run_directory(tmp_path)
+
+
+def test_dev_holdout_baseline_trains_on_the_arm_split_and_records_it(monkeypatch, tmp_path):
+    result, path = driver_harness.run_driver(
+        monkeypatch, tmp_path, "trainable-ab", "uniform",
+        example_counts=COUNTS, step_counts=STEPS,
+        dev_data=driver_harness.dev_mock_data(),
+        extra=("--dev_holdout", "--response_dev_fraction", "0.25", "--response_dev_min", "2"))
+    split = result["dev_split"]
+    assert split["holdout_only"] is True and split["fraction"] == 0.25
+    assert split["per_client"]["c0"] == {"n_train_queries": 30, "n_dev_queries": 10,
+                                         "dev_sha256": split["per_client"]["c0"]["dev_sha256"]}
+    assert "-devholdout0p25" in path.name and "scheme_diagnostics" not in result
+    assert validate_run_directory(tmp_path)["rounds_validated"] == 1
+    # the same seed and slice give the response arm the identical held-out queries
+    arm_result, _ = run_arm(monkeypatch, tmp_path / "arm")
+    assert arm_result["dev_split"]["per_client"]["c0"]["dev_sha256"] == split["per_client"]["c0"]["dev_sha256"]
+
+
+def test_dev_holdout_is_refused_with_the_response_arm(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit):
+        run_arm(monkeypatch, tmp_path, extra=("--dev_holdout",))

@@ -61,7 +61,10 @@ def fake_response_encoder(model, state, texts, batch_size):
     for t in texts:
         tail = t.split("-")[-1]                       # 'q7' or 'd7'
         base = np.zeros(8) + 0.1 * _hash_vec(tail[0] + "shared", 0)
-        base[int(tail[1:]) % 8] += 2.0
+        # texts that share a slot (d3, d11, d19) get distinct magnitudes, so no two
+        # embeddings tie exactly at the zero adapter: exact ties made the round-one
+        # floor depend on the sort's tie order (Tokyo, 11 September)
+        base[int(tail[1:]) % 8] += 2.0 + 0.01 * (int(tail[1:]) // 8)
         rows.append(base + shift * _hash_vec(t, 1))
     x = np.array(rows)
     return x / np.linalg.norm(x, axis=1, keepdims=True)

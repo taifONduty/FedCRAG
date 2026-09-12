@@ -635,6 +635,63 @@ queries, the baselines on 100 percent.
 Cost: about 21 GPU-hours per seed (six extra full evaluations per round). Runs after A2.
 
 
+### 13.2.1 Amendment: candidate set and selection statistic (registered 2026-09-12 04:27 UTC, before any full arm run; the two bracketed choices of the 10 September draft settled by the saved-round study under the rules written before its results were seen)
+
+Reason. The literature review of 10 September (research_loop/L2) quantifies the optimism of
+selecting the maximum over many candidates on dev splits of 70 to 550 queries (about 0.06
+nDCG@10 per round on the two small silos at 50 candidates), and the geometry measured on the
+seed-123 E1 states (research_loop/2026-09-11_solution_loop.md, section 3) shows that the harm
+acts through update magnitudes: uniform weights still give the majority's direction a cosine
+of 0.92 to 0.99 with the aggregate. The registered lattice of about 500 candidates is therefore
+replaced by a compact set that acts on magnitudes, and selection uses a statistic that a small
+silo cannot win through noise.
+
+Arm: `--weighted --weight_by response-maxmin --lora_mode trainable-ab --response_candidates
+compact --response_select mean --response_eq_scales 0.5,1.0,2.0 --response_game_scales 1.0,2.0
+--response_eq_top 2,3 --response_model_pick`, all other flags as registered in 13.2.
+
+Candidates per round, fixed before anything is measured: uniform; n_k; FedNova; the four
+vertices; eq(s) with v_k = s rbar / (K r_k) for s in {0.5, 1, 2}, r_k the product-space norm
+of client k's update and rbar their mean; eq{m}(s), magnitudes equalised among the m largest
+updates only, m in {2, 3}; game(s) with v_k = s w*_k rbar / r_k for s in {1, 2}, w* the
+unit-direction max-min game weights. Chosen by the response model after the K + 1 encodes:
+the per-client greedy soup over the vertices, the best uniform subset, and the response
+model's best lattice point (model pick). At most 15 contenders.
+
+Selection rule: mean, the worst client's mean paired gain on its held-out queries (the
+registered v1 statistic). The two best contenders by that rule among those whose predicted
+means clear the floor are verified exactly; the better measured one is applied if its
+measured means clear the floor; two halvings; zero step. Floor unchanged: the frozen
+backbone's dev nDCG@10 with delta 0. The pessimistic and Pareto rules stay implemented and
+their statistics are recorded for every candidate, so the choice can be audited afterwards.
+
+Recorded per round and checked by the validator: r_k, the cosine Gram, w* and the game
+value, the family vectors recomputed from the persisted states, the picks against the
+recorded statistics, and the magnitude shares of the applied aggregate.
+
+Predictions added to P1 to P4 (unchanged): P5, the applied candidate is from the eq or game
+family in at least four of eight rounds at both seeds. P6, the majority's magnitude share of
+the applied aggregate is below 0.5 in at least six of eight rounds at both seeds. Falsifier
+F5: if P5 fails at both seeds the magnitude theory of section 3 is not what the measured
+responses reward, and the paper reports the arm as a measured search without that
+explanation.
+
+How the choices were settled. Decision rules written 2026-09-11 00:40 UTC after study round
+nk4 and before any other round (research_loop/13_2_v2_addendum_draft.md): the families stay
+if a family candidate beats uniform's worst-silo test gain at three or more of the five
+remaining rounds (uniform 4, nk 2, uniform 2, nk 6, uniform 6); the selection rule is the one
+whose split-half selection on test queries yields the largest total held-out gain summed over
+those rounds, among rules whose held-out worst-silo gain is never below uniform's by more than
+0.005 in any round; the model pick is included only if the lattice winner's dev-selected
+worst-silo advantage transfers to test at three or more of the five. Outcome, from
+research_loop/code/decide_addendum.py on the study JSONs (record
+research_loop/study/decide_final_2026-09-12T0426Z.txt): families qualify at nk 6, uniform 2
+and uniform 6 (3 of 5, kept); the model pick transfers at 4 of 5 (included); summed held-out
+gain mean 0.591, pareto 0.585, pessimistic 0.527, none ever below uniform's worst silo by
+more than 0.005 (mean). The study's dev split was contaminated (the saved states had trained
+on those queries), which is why the rules were written on test responses; the arm's own dev
+split is held out of training and has no such artifact.
+
 ### 13.2.2 Execution note for block A5 (written 2026-09-11 16:26 UTC, the clock of commit af95536, while the seed-123 same-split baseline runs and before any arm run; the heading first carried a forward-dated stamp of 17:05 UTC, corrected in the next commit)
 
 Order and hardware. The seed-123 same-split uniform baseline is running on the Tokyo L4

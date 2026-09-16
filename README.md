@@ -6,42 +6,65 @@ different amounts of private data jointly train one retrieval model with LoRA
 adapters, and the project studies what the server's aggregation rule does to
 each of them.
 
-## What we found
+## Current findings
 
-Three results, each with the seeds and caveats spelled out in the paper draft
-under `paper_draft/`:
+Documentation snapshot: 16 September 2026. The
+[research status](docs/research-status.md) records the completed comparisons,
+result sources and limitations. These findings concern one four-client BEIR
+proxy federation with a Contriever backbone, not all federated retrievers.
 
-1. **The default weighting hurts everyone.** FedAvg's standard rule weights
-   each client by its data size. In our four-silo BEIR testbed (size ratio
-   157:20:1.3:1), that rule leaves the small clients *below the untrained
-   backbone* after training (SciFact -0.074 +/- 0.004 nDCG@10 across three
-   seeds), and a budget-matched control shows every measured silo ends worse
-   than if it had trained alone. Plain uniform weighting beats size weighting
-   for every client, including the largest one.
-2. **The damage needs two ingredients.** A pre-registered experiment reran the
-   same skewed weighting with a shared frozen LoRA A-factor, which makes
-   aggregation exact. The harm disappeared (two of three seeds complete, both
-   clean; the third can no longer change the outcome). So weight skew alone
-   redistributes, and weight skew combined with standard two-factor LoRA
-   training is what destroys. Removing either ingredient removes the absolute
-   harm. This overturned our own earlier explanation, and the repo keeps the
-   record of both.
-3. **A geometry-aware aggregation rule (FedSpan) redistributes.** The server
-   solves a small min-norm problem on the cosine Gram of client updates and
-   protects the worst-aligned client. Within its own coordinate it reliably
-   lifts the smallest silos at little cost to the large ones. It is not a
-   mean-score improvement, and the paper says so.
+1. **Average improvement can hide client-level degradation.** In two clean
+   paired eight-round runs, size-proportional aggregation with full local
+   epochs and two trainable LoRA factors leaves the two smallest clients
+   below their pretrained scores. Uniform weighting improves all four clients
+   over that configuration and keeps them above the pretrained model. The
+   registered local-only comparison supports a participation disadvantage
+   for three clients, not all four.
+2. **The configuration matters.** Equal weighting, a shared frozen factor and
+   equal-total-work controls each remove the below-backbone losses in their
+   measured settings. These interventions do not establish three universally
+   necessary or sufficient causes: freezing a factor also changes the
+   trainable space, and equalising work changes data exposure and warmup.
+   Saved-state measurements show that unequal update magnitudes leave the
+   largest client influential even under equal weights.
+3. **Uniform remains a strong baseline.** FedNova and q-FFL remove the losses
+   at both seeds; AFL does not. None improves on uniform for every client.
+   FedSpan helps the smallest clients relative to frozen-factor uniform, but
+   loses to ordinary two-factor uniform on worst-client score and
+   cross-client variance.
+4. **Measured-response aggregation produces a tradeoff.** Both full runs
+   improve the three smaller clients over uniform on matched training splits,
+   but NFCorpus finishes slightly lower and cross-client variance increases.
+   All clients remain above their pretrained test scores in every measured
+   round. This does not meet the complete registered success rule. Numerical
+   validation also does not erase the recorded candidate-count protocol
+   discrepancy.
+
+Continual retrieval across sequential experiences remains unevaluated. The
+current evidence concerns retrieval quality, not generated-answer quality or
+formal privacy protection.
+
+## Presentation notes
+
+- [Six-step method, equations, notation and an example](docs/presentation-method.md)
+- [Related work and aggregation baselines](docs/presentation-literature.md)
+- [Two-seed results and claim boundaries](docs/research-status.md)
+
+These notes document the current solution. They do not amend experiment
+registrations or replace the paper draft.
 
 ## Layout
 
 - `federated_forgetting.py` - the training and evaluation driver
 - `aggregation_schemes.py` - weighting rules: uniform, n_k, q-FedAvg, FedMGDA+,
   FedSpan (exact min-norm solver with a per-round optimality certificate)
+- `response_arm.py`, `response_aggregation.py` - measured-response candidate
+  construction, prediction, selection and exact held-out verification
 - `e3_shard.py`, `e3_manifest.py`, `run_e3.sh` - the clone-federation
   experiment, generated from a manifest and gated on a round-1 geometry check
 - `validate_e0.py` - independent validator that recomputes every round's
   aggregate from the persisted client states and refuses mismatches
-- `tests/` - 408 tests, including mutation and tamper tests
+- `tests/` - unit, integration, mutation and tamper tests
 - `registration/` - the signed pre-registration for the experiment program,
   with predictions and decision rules committed before the data existed
 - `paper_draft/` - LaTeX source of the paper in progress
@@ -57,7 +80,17 @@ bash run_e3.sh verify            # prints the registered runs without executing
 Training runs need a GPU and the BEIR corpora; `GCP_RUNBOOK.md` documents the
 exact setup we used.
 
-`--weighted --weight_by response-maxmin` is the aggregation-by-measured-response arm (design note of 8 September 2026): every client scores its held-out queries under each single-client update, the server ranks a grid of weight vectors by the worst client's predicted gain under a backbone floor, verifies the two leaders exactly and applies the better one; `validate_e0.py` recomputes the decision from the record.
+`--weighted --weight_by response-maxmin` selects aggregation by measured
+response. Each client measures embedding responses to the current model and
+each single-client update. In the completed v2 runs, the server ranks compact
+contenders, including response-selected mixtures, by the worst client's
+predicted mean retrieval gain. Up to two leaders are evaluated directly, and
+the best verified floor-feasible candidate is applied. The registered rule
+allows two step halvings and otherwise retains the current model.
+`validate_e0.py` recomputes the decision from the record. See the
+[method notes](docs/presentation-method.md) and
+[registration](registration/E3_PREREGISTRATION.md) for the full configuration;
+the two flags alone do not specify it.
 
 ## A note on the history
 

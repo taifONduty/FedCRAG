@@ -25,7 +25,8 @@ say() { echo "[e3] $*" | tee -a "$LOG"; }
 finish() {
   say "$1 $(date -u +%FT%TZ)"; touch "$OUT/$1.marker"; sync
   [ "$MODE" = "run" ] && sudo poweroff
-  exit 0
+  [ "$1" = "DONE" ] && exit 0
+  exit 1
 }
 trap 'finish FAILED' ERR
 

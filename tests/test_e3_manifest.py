@@ -1,4 +1,6 @@
 """The 33 registered E3 runs must match the signed registration exactly."""
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -131,3 +133,12 @@ def test_p0_gate_passes_clone_geometry_and_fails_non_clone():
     assert not ok and "FAIL" in report          # shards not clone-like
     ok, report = p0_gate(_gate_result(block=0.30, cross=0.35))
     assert not ok                               # singletons as close as clones
+
+
+def test_launcher_exits_nonzero_when_a_step_fails(tmp_path):
+    env = dict(os.environ, E3_PYTHON="/usr/bin/false", E3_OUT=str(tmp_path))
+    proc = subprocess.run(["bash", "run_e3.sh", "verify"], env=env,
+                          cwd=Path(__file__).resolve().parents[1],
+                          capture_output=True, text=True)
+    assert (tmp_path / "FAILED.marker").exists()
+    assert proc.returncode != 0

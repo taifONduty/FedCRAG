@@ -275,7 +275,7 @@ def build_manifest(root, clients, experiences_per_client, schedule, counts, corp
             queries_for_hard += [side[q][0] for q in train_ids + guard_ids]
             queries_for_hard += [cell["eval_q"][q] for q in test_ids]
         relevant |= {p for rels in cell["eval_qrels"].values() for p in rels}
-        hard = {p for hits in retriever(queries_for_hard, hard_k) for p in hits} - relevant
+        hard = set(_hard_hits(root, topic, queries_for_hard, hard_k, retriever)) - relevant
         chosen = relevant | hard
         if len(chosen) > corpus_size:
             raise ValueError(f"client {topic}: {len(chosen)} relevant and hard passages "
@@ -291,6 +291,21 @@ def build_manifest(root, clients, experiences_per_client, schedule, counts, corp
         client["digests"] = _client_digests(client)
         manifest["clients"][str(topic)] = client
     return manifest
+
+
+def _hard_hits(root, client, query_texts, hard_k, retriever):
+    """BM25 hits for one client's queries, cached beside the collection so a failed build
+    does not repeat the retrieval."""
+    cache_dir = os.path.join(root, "msmarco-passage", "bm25_hits")
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"client{client}_k{hard_k}_{_digest(query_texts)[:16]}.json")
+    if os.path.exists(path):
+        with open(path) as handle:
+            return json.load(handle)
+    hits = sorted({p for row in retriever(query_texts, hard_k) for p in row}, key=int)
+    with open(path, "w") as handle:
+        json.dump(hits, handle)
+    return hits
 
 
 def _client_digests(client):

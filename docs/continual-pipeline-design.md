@@ -61,7 +61,7 @@ never cross a split boundary.
 
 Corpus per client. Fixed for the whole run and identical across experiences: every passage
 judged relevant for any of the client's selected queries, plus deterministic hard
-distractors (the top BM25 passages for the client's training, guard and test queries over
+distractors (the top-5 BM25 passages for the client's training, guard and test queries over
 the full collection, a frozen lexical process fixed before any training and never a method
 under test), plus passages sampled uniformly from the collection, to 60,000 passages in all. The full
 passage-id list per client is recorded with its digest. This pool size follows CREAM's

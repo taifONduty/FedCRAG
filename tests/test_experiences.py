@@ -153,3 +153,18 @@ def test_schedules_share_one_build_and_differ_only_in_order(tmp_path):
         assert a["clients"][client]["digests"] == b["clients"][client]["digests"]
         assert a["clients"][client]["corpus"] == b["clients"][client]["corpus"]
     experiences.verify_manifest(b)
+
+
+def test_hard_distractor_hits_are_cached_per_client(tmp_path):
+    root = synthetic_msmarco(tmp_path)
+    calls = []
+    def counting(query_texts, k):
+        calls.append(len(query_texts))
+        return fake_bm25(query_texts, k)
+    kwargs = dict(clients=(0,), experiences_per_client=2, schedule={0: (0, 1)},
+                  counts={"train": 20, "guard": 4, "test": 3}, corpus_size=120, hard_k=2,
+                  seed=5, retriever=counting)
+    first = experiences.build_manifest(root, **kwargs)
+    again = experiences.build_manifest(root, **kwargs)
+    assert len(calls) == 1
+    assert first["clients"]["0"]["corpus"] == again["clients"]["0"]["corpus"]

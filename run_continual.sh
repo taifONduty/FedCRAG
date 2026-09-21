@@ -61,10 +61,10 @@ manifests() {
   say "manifests"
   [ -f "$MANIFESTS/primary_B.json" ] || "$PY" experiences.py build --data_root "$DATA" --seed 1 \
     --clients 0 1 2 3 4 --experiences 4 --schedules "{\"A\":$SCHEDULE_A,\"B\":$SCHEDULE_B}" \
-    --counts "$COUNTS_PRIMARY" --corpus_size 60000 --hard_k 10 --name primary --out "$MANIFESTS"
+    --counts "$COUNTS_PRIMARY" --corpus_size 60000 --hard_k 5 --name primary --out "$MANIFESTS"
   [ -f "$MANIFESTS/calibration_cal.json" ] || "$PY" experiences.py build --data_root "$DATA" --seed 1 \
     --clients 5 --pseudo_clients 2 --experiences 4 --schedules "{\"cal\":$SCHEDULE_CAL}" \
-    --counts "$COUNTS_CAL" --corpus_size 60000 --hard_k 10 --name calibration --out "$MANIFESTS"
+    --counts "$COUNTS_CAL" --corpus_size 60000 --hard_k 5 --name calibration --out "$MANIFESTS"
   for m in "$MANIFESTS"/*.json; do "$PY" experiences.py verify --seed 1 --out "$m"; done
   ( cd "$MANIFESTS" && sha256sum *.json > SHA256SUMS && cat SHA256SUMS | tee -a "$LOG" )
 }

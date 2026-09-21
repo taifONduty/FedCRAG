@@ -846,3 +846,9 @@ pass: method arms are designed and registered separately.
 To be appended as 14.1 before the pilot: the manifest digests (schedules A and B and the
 calibration stream) with the commit that built them, the measured cost of one unit on the
 L4 and the extrapolated pilot cost, and the frozen recipe with the calibration outcomes.
+
+Amendment to 14, before any run of the continual driver (2026-09-22 18:32 UTC, the clock of
+the commit that adds it). The first manifest build, at commit 793ce22 on the L4, stopped
+because client 0 had 79,169 relevant and top-10 BM25 passages, more than the 60,000-passage
+pool. The construction therefore uses the top-5 BM25 passages per selected query instead of
+the top-10; everything else in 14 is unchanged. No training run had started.

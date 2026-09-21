@@ -61,7 +61,9 @@ def load_runs(out_dir):
         directory = path.rsplit("/", 2)[-2]
         if not glob.glob(f"{out_dir}/{directory}/.validated"):
             continue
-        _, arm, schedule, seed = directory.split("-")
+        # pilot-<arm>-<schedule>-s<seed>; only the arm contains hyphens, so read from the right
+        parts = directory.split("-")
+        arm, schedule, seed = "-".join(parts[1:-2]), parts[-2], parts[-1]
         with open(path) as handle:
             summary = json.load(handle)["summary"]
         rows.append({"arm": arm, "schedule": schedule, "seed": int(seed[1:]),

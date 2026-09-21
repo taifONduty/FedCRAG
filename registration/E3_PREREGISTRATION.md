@@ -729,3 +729,46 @@ added to the driver and validator under test on 2026-09-11 at commit 308d23d) an
 2024 adds `--dev_holdout` to the common flags and nothing else. The chain script refuses
 to start unless the repository is at the commit carrying 13.2.1 and every placeholder is
 filled from the recorded output of the decision script.
+
+
+### 13.2.3 Record of deviations and harness corrections (written 2026-09-21 15:25 UTC, the clock of the commit that adds it; after both A5 runs; no recorded result changes)
+
+Deviations of the executed A5 runs from 13.2.1, found by the source audit of 17 September
+2026 (AUDIT_REPORT.md, findings F04 and F05) and confirmed on the run records on 21 September:
+
+1. Contender count. 13.2.1 says "at most 15 contenders". Both runs logged 19 or 20 contenders
+   in every round: the fixed points, the family candidates and the derived picks. The
+   registered selection rule, floor and exact verification were applied to that larger list.
+   The cap is not amended after the fact; the runs are reported with the counts they logged.
+2. The game family. 13.2.1 calls w* "the unit-direction max-min game weights". The code
+   (response_arm.update_geometry) solves the max-min LP over the simplex, max_w min_k (Cw)_k,
+   and records its payoff as game_value. That LP is not the unit-direction (minimum-norm) game:
+   on the three-client exhibit of tests/test_direction_policy.py the LP direction reaches a
+   worst-case cosine of 0.4116 where 0.5484 is attainable. The game(s) candidates of both runs
+   were built from the LP weights; their results stay attached to that solver. From commit
+   b6e2590 the record also carries game_min_cosine, the cosine the LP direction achieves.
+3. Response-model fidelity. The design's 0.010 bound on the model's error among the exactly
+   verified candidates is exceeded once, 0.0138 in round one at seed 123 (seed 2024: 0.0079).
+   Exact verification decided the applied candidate in every round, as registered.
+
+Harness corrections on branch www27, commits 1ecca87 to f3bdf47 (21 September 2026). None
+alters a recorded result; each has a regression test.
+
+- The no-train-split fallback (ArguAna) keeps its sorted halves in order; before, the
+  example order depended on the Python hash seed. Membership is unchanged. New ArguAna runs
+  therefore do not reproduce the historical example order bit for bit.
+- The fallback is used only when qrels/train.tsv is absent; any other loading error stops
+  the run.
+- validate_e0 requires each round's broadcast to be the previous round's global and the first
+  broadcast to be the recorded initial adapter state. E1 uniform seed 123, E1 n_k seed 123
+  and A2 AFL seed 2024 were re-validated under this check on 21 September 2026 and pass.
+- The data fingerprint covers the held-out dev queries; provenance hashes response_arm.py
+  and response_aggregation.py; the driver refuses to overwrite an existing result file.
+- --loss_batch_size names the batch of the q-FFL/AFL loss estimate; its default is the
+  historical --eval_batch_size, which the CLI had described as speed-only.
+- The result field BWT is renamed round1_to_final_drift; it was never a backward-transfer
+  statistic over experiences.
+- run_e3.sh exits nonzero on failure.
+
+The prospective temporal protocol will be registered in a section of its own before any
+run of it.

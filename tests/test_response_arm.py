@@ -223,3 +223,12 @@ def test_pareto_round_records_feasibility_and_top_m_families():
     scores = {n: record["candidates"][n]["stat"] for n in record["contenders"]}
     assert record["shortlist"] == ra.rank_candidates(
         pred, record["dev_current"], record["floors"], 2, scores, "pareto")
+
+
+def test_geometry_reports_the_cosine_the_lp_direction_achieves():
+    broadcast, clients = make_states()
+    geo = response_arm.update_geometry(broadcast, clients)
+    cos = np.asarray(geo["cosine_gram"])
+    w = np.asarray(geo["game_weights"])
+    achieved = float(min(cos @ w) / np.sqrt(w @ cos @ w))
+    assert geo["game_min_cosine"] == pytest.approx(achieved)

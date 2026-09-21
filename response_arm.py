@@ -92,9 +92,12 @@ def _predicted_means(base, responses, dev, slices, v, device="cpu", tensors=None
 
 def update_geometry(round_broadcast, client_states):
     """Product-space geometry of the round's updates (loop document, section 3): the
-    norms r_k of dW_k = B_k A_k - B_g A_g, their cosine Gram, and the unit-direction game
-    (max-min cosine over the simplex) weights and value. The Gram is exact in factor space
-    (``update_gram``); the game is the existing LP solver."""
+    norms r_k of dW_k = B_k A_k - B_g A_g, their cosine Gram, and the max-min LP over the
+    simplex, max_w min_k (Cw)_k, solved by the existing LP solver. ``game_value`` is that
+    LP payoff, an unnormalised inner product; ``game_min_cosine`` is the smallest cosine
+    the LP direction makes with a client update. This is not the minimum-norm
+    (unit-direction) game, whose optimal worst-case cosine can be higher. The Gram is
+    exact in factor space (``update_gram``)."""
     G = update_gram(client_states, round_broadcast, normalize=False, dtype=torch.float64)
     K = G.shape[0]
     norms = np.sqrt(np.clip(np.diag(G), 0.0, None))
@@ -109,9 +112,14 @@ def update_geometry(round_broadcast, client_states):
         np.fill_diagonal(cosine, 1.0)
     game = maxmin_weights(client_states, round_broadcast)
     weights = [float(x) for x in game]
-    value = float(min(cosine @ np.asarray(weights))) if active.any() else float("nan")
+    w = np.asarray(weights)
+    value = float(min(cosine @ w)) if active.any() else float("nan")
+    direction_norm = float(np.sqrt(max(float(w @ cosine @ w), 0.0)))
+    min_cosine = (value / direction_norm if active.any() and direction_norm > 0
+                  else float("nan"))
     return {"norms": [float(x) for x in norms], "cosine_gram": cosine.tolist(),
             "game_weights": weights, "game_value": value,
+            "game_min_cosine": min_cosine,
             "game_status": game.status, "game_fallback": game.fallback}
 
 

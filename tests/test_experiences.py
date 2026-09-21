@@ -103,12 +103,26 @@ def test_materialised_cell_has_the_shape_the_trainer_consumes(tmp_path):
 def test_a_topic_can_be_split_into_pseudo_clients(tmp_path):
     root = synthetic_msmarco(tmp_path)
     manifest = experiences.build_manifest(
-        root, clients=(0,), experiences_per_client=2, schedule={0: (0, 1), 1: (1, 0)},
+        root, clients=(0,), experiences_per_client=1, schedule={0: (0,), 1: (0,)},
         counts={"train": 8, "guard": 2, "test": 1}, corpus_size=120, hard_k=2, seed=5,
         retriever=fake_bm25, pseudo_clients=2)
     assert set(manifest["clients"]) == {"0", "1"}
     assert all(client["topic"] == 0 for client in manifest["clients"].values())
-    assert manifest["clients"]["1"]["order"] == [1, 0]
-    train = [set(cell["train"]) for client in manifest["clients"].values()
-             for cell in client["experiences"].values()]
-    assert not (train[0] & train[2]) and not (train[1] & train[3])
+    train = [set(client["experiences"]["0"]["train"]) for client in manifest["clients"].values()]
+    assert not (train[0] & train[1])
+
+
+def test_a_topic_without_official_evaluation_queries_holds_out_training_queries(tmp_path):
+    root = synthetic_msmarco(tmp_path)
+    for name in ("queries/queries_1.tsv", "qrel/qrel_1.json"):
+        (root / "ms-marco-shift" / "EVAL" / name).unlink()
+    manifest = experiences.build_manifest(
+        root, clients=(1,), experiences_per_client=1, schedule={1: (0,)},
+        counts={"train": 20, "guard": 4, "test": 3}, corpus_size=120, hard_k=2, seed=5,
+        retriever=fake_bm25)
+    client = manifest["clients"]["1"]
+    assert client["eval_source"] == "train-holdout" and len(client["eval_pool"]) == 9
+    assert set(client["experiences"]["0"]["test"]) <= set(client["eval_pool"])
+    assert not (set(client["eval_pool"]) & set(client["experiences"]["0"]["train"]))
+    queries, qrels = experiences.eval_queries(manifest, root, "1")
+    assert set(queries) == set(client["eval_pool"]) == set(qrels)

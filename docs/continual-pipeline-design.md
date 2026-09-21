@@ -32,7 +32,10 @@ the primary experiment and reserved for the calibration stream (section 6).
 
 Experiences. Four per client, a constructed semantic-shift stream, not chronology. Within
 a topic cluster the TRAIN queries are partitioned by k-means (k = 4) on TF-IDF unigram and
-bigram features reduced by truncated SVD to 100 dimensions. The vocabulary, IDF weights,
+bigram features reduced by truncated SVD to 50 dimensions and unit-normalised (cosine
+geometry). Among the standard settings tried on the feasibility table only (SVD 100 or 50
+or 200, with and without normalisation), this one gives the largest smallest sub-cluster;
+plain Euclidean k-means left a catch-all cluster of 20,000 to 28,000 queries per topic. The vocabulary, IDF weights,
 SVD and centroids are fitted on eligible TRAIN query text only; EVAL queries are assigned
 to the frozen centroids afterwards. Recorded in the manifest: the TF-IDF parameters,
 vocabulary digest, SVD and k-means seeds, restarts, centroid digests and the assignment of

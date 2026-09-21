@@ -10,9 +10,10 @@ import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import normalize
 
 TFIDF = {"ngram_range": (1, 2), "min_df": 2, "sublinear_tf": True}
-SVD_DIM = 100
+SVD_DIM = 50
 KMEANS_RESTARTS = 10
 RERUNS = 5
 
@@ -32,13 +33,15 @@ def _file_digest(path):
 # ------------------------------------------------------------------ clustering
 
 def cluster_queries(texts, k, seed):
-    """k-means on TF-IDF features reduced by SVD, fitted on ``texts`` only."""
+    """k-means on unit-normalised TF-IDF features reduced by SVD (cosine geometry),
+    fitted on ``texts`` only."""
     vectorizer = TfidfVectorizer(**TFIDF)
     features = vectorizer.fit_transform(texts)
     svd = TruncatedSVD(n_components=min(SVD_DIM, features.shape[1] - 1), random_state=seed)
-    reduced = svd.fit_transform(features)
+    reduced = normalize(svd.fit_transform(features))
     kmeans = KMeans(n_clusters=k, n_init=KMEANS_RESTARTS, random_state=seed).fit(reduced)
-    record = {"tfidf": dict(TFIDF), "svd_dim": int(svd.n_components), "k": k, "seed": seed,
+    record = {"tfidf": dict(TFIDF), "svd_dim": int(svd.n_components), "unit_rows": True,
+              "k": k, "seed": seed,
               "n_init": KMEANS_RESTARTS,
               "vocabulary_sha256": _digest(sorted(vectorizer.vocabulary_)),
               "centroid_sha256": hashlib.sha256(
@@ -49,7 +52,7 @@ def cluster_queries(texts, k, seed):
 
 def assign_queries(model, texts):
     """Assign held-out texts to the frozen centroids."""
-    reduced = model["_svd"].transform(model["_vectorizer"].transform(texts))
+    reduced = normalize(model["_svd"].transform(model["_vectorizer"].transform(texts)))
     return model["_kmeans"].predict(reduced).tolist()
 
 
@@ -105,6 +108,11 @@ def load_msshift(root):
     return labels
 
 
+def has_official_eval(root, topic):
+    return os.path.exists(os.path.join(root, "ms-marco-shift", "EVAL", "queries",
+                                       f"queries_{topic}.tsv"))
+
+
 def load_eval(root, topic):
     """MS-Shift's official evaluation queries and qrels for one topic cluster."""
     base = os.path.join(root, "ms-marco-shift", "EVAL")
@@ -112,6 +120,22 @@ def load_eval(root, topic):
     with open(os.path.join(base, "qrel", f"qrel_{topic}.json")) as handle:
         qrels = json.load(handle)
     return queries, {q: rels for q, rels in qrels.items() if q in queries}
+
+
+HOLDOUT_FRACTION = 0.15
+
+
+def eval_queries(manifest, root, client):
+    """The evaluation pool of one client: the official queries of its topic, or, for a
+    topic without official evaluation queries, its held-out training queries."""
+    entry = manifest["clients"][client]
+    pool = set(entry["eval_pool"])
+    if entry["eval_source"] == "official":
+        queries, qrels = load_eval(root, entry["topic"])
+    else:
+        queries = load_queries(os.path.join(root, "msmarco-passage", "queries.train.tsv"))
+        qrels = load_train_qrels(os.path.join(root, "msmarco-passage", "qrels.train.tsv"))
+    return ({q: queries[q] for q in pool}, {q: qrels[q] for q in pool})
 
 
 def collection_ids(root):
@@ -171,8 +195,19 @@ def _cells(root, clients, k, seed, minimum, pseudo_clients=1):
     cells = {}
     for topic in clients:
         topic_ids = sorted((q for q, (_, t) in side.items() if t == topic), key=int)
-        eval_q, eval_qrels = load_eval(root, topic)
-        topic_eval = sorted((q for q in eval_q if q in eval_qrels), key=int)
+        if has_official_eval(root, topic):
+            source = "official"
+            eval_q, eval_qrels = load_eval(root, topic)
+            topic_eval = sorted((q for q in eval_q if q in eval_qrels), key=int)
+        else:
+            source = "train-holdout"
+            rng = np.random.default_rng([seed, topic, 99])
+            held = rng.choice(len(topic_ids), size=int(HOLDOUT_FRACTION * len(topic_ids)),
+                              replace=False)
+            topic_eval = sorted((topic_ids[i] for i in held), key=int)
+            eval_q = {q: side[q][0] for q in topic_eval}
+            eval_qrels = {q: train_qrels[q] for q in topic_eval}
+            topic_ids = [q for q in topic_ids if q not in set(topic_eval)]
         split = _pseudo_clients(topic, topic_ids, [side[q][0] for q in topic_ids],
                                 topic_eval, [eval_q[q] for q in topic_eval],
                                 pseudo_clients, seed)
@@ -180,7 +215,7 @@ def _cells(root, clients, k, seed, minimum, pseudo_clients=1):
             model = cluster_with_minimum([side[q][0] for q in qids], k, seed, minimum)
             eval_assignment = assign_queries(model, [eval_q[q] for q in eval_ids])
             cells[client] = {
-                "topic": topic, "model": model,
+                "topic": topic, "model": model, "eval_source": source, "eval_pool": eval_ids,
                 "train": {e: [q for q, a in zip(qids, model["assignment"]) if a == e]
                           for e in range(k)},
                 "eval": {e: [q for q, a in zip(eval_ids, eval_assignment) if a == e]
@@ -216,6 +251,7 @@ def build_manifest(root, clients, experiences_per_client, schedule, counts, corp
     for topic in sorted(cells):
         cell = cells[topic]
         client = {"topic": cell["topic"], "order": list(schedule[topic]),
+                  "eval_source": cell["eval_source"], "eval_pool": list(cell["eval_pool"]),
                   "clustering": cell["model"]["record"], "experiences": {}}
         relevant, queries_for_hard = set(), []
         for e in range(k):
@@ -293,7 +329,7 @@ def materialise(manifest, root, client, experience, corpus=None):
     the evaluation consume."""
     cell = manifest["clients"][client]["experiences"][str(experience)]
     train_queries = load_queries(os.path.join(root, "msmarco-passage", "queries.train.tsv"))
-    eval_q, _ = load_eval(root, manifest["clients"][client]["topic"])
+    eval_q, _ = eval_queries(manifest, root, client)
     data = {"corpus": corpus if corpus is not None else client_corpus(manifest, root, client)}
     for split, source in (("train", train_queries), ("guard", train_queries), ("test", eval_q)):
         data[f"{split}_q"] = {q: source[q] for q in cell[split]}

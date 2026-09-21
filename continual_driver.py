@@ -216,7 +216,7 @@ def main():
            "continual_source_sha256": {n: _sha256_file(os.path.join(here, n))
                                        for n in SOURCE_FILES},
            "rounds": [], "references": {c: {} for c in clients}, "matrix": {},
-           "frozen": {}, "official_eval": {}, "summary": {}}
+           "frozen": {}, "eval_pool": {}, "summary": {}}
     for c in clients:
         out["frozen"][c] = evaluate(model, initial, corpora[c], cells[c], range(T),
                                     q_prefix, d_prefix, args.eval_batch_size)
@@ -287,15 +287,16 @@ def main():
 
     for c in clients:
         state = initial if args.arm == "frozen" else (states[c] if local else global_state)
-        queries, qrels = experiences.load_eval(args.data_root, manifest["clients"][c]["topic"])
-        qids = sorted(q for q in queries if q in qrels)
+        queries, qrels = experiences.eval_queries(manifest, args.data_root, c)
+        qids = sorted(queries, key=int)
         cids = list(corpora[c])
         c_emb = response_encode(model, state, [d_prefix + doc_text(corpora[c][x]) for x in cids],
                                 args.eval_batch_size)
         q_emb = response_encode(model, state, [q_prefix + queries[q] for q in qids],
                                 args.eval_batch_size)
         scored = _summarise(regression.per_query_scores(cids, c_emb, qids, q_emb, qrels))
-        out["official_eval"][c] = {m: scored[m] for m in regression.MEASURES} | {"n": len(qids)}
+        out["eval_pool"][c] = {m: scored[m] for m in regression.MEASURES} | {
+            "n": len(qids), "source": manifest["clients"][c]["eval_source"]}
     out["summary"] = summarise(out)
     dump_json(out, jpath)
     print(f"saved {jpath}")

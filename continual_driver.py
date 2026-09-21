@@ -187,7 +187,7 @@ def main():
     clients = sorted(manifest["clients"], key=int)
     T, R = manifest["experiences_per_client"], args.rounds
     orders = {c: list(manifest["clients"][c]["order"]) for c in clients}
-    corpora = {c: experiences.client_corpus(manifest, args.data_root, c) for c in clients}
+    corpora = experiences.client_corpora(manifest, args.data_root, clients)
     cells = {c: {e: experiences.materialise(manifest, args.data_root, c, e, corpora[c])
                  for e in range(T)} for c in clients}
 

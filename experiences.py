@@ -334,10 +334,13 @@ def verify_manifest(manifest):
             raise ValueError(f"client {name}: corpus has repeated passages")
 
 
-def client_corpus(manifest, root, client):
-    ids = manifest["clients"][client]["corpus"]
-    passages = load_passages(root, ids)
-    return {pid: {"text": passages[pid]} for pid in ids}
+def client_corpora(manifest, root, clients=None):
+    """Every client's fixed corpus, read in one pass over the collection."""
+    clients = list(clients or manifest["clients"])
+    wanted = {pid for c in clients for pid in manifest["clients"][c]["corpus"]}
+    passages = load_passages(root, wanted)
+    return {c: {pid: {"text": passages[pid]} for pid in manifest["clients"][c]["corpus"]}
+            for c in clients}
 
 
 def materialise(manifest, root, client, experience, corpus=None):
@@ -346,7 +349,8 @@ def materialise(manifest, root, client, experience, corpus=None):
     cell = manifest["clients"][client]["experiences"][str(experience)]
     train_queries = load_queries(os.path.join(root, "msmarco-passage", "queries.train.tsv"))
     eval_q, _ = eval_queries(manifest, root, client)
-    data = {"corpus": corpus if corpus is not None else client_corpus(manifest, root, client)}
+    data = {"corpus": corpus if corpus is not None
+            else client_corpora(manifest, root, [client])[client]}
     for split, source in (("train", train_queries), ("guard", train_queries), ("test", eval_q)):
         data[f"{split}_q"] = {q: source[q] for q in cell[split]}
         data[f"{split}_qrels"] = {q: cell["qrels"][q] for q in cell[split]}

@@ -168,3 +168,21 @@ def test_hard_distractor_hits_are_cached_per_client(tmp_path):
     again = experiences.build_manifest(root, **kwargs)
     assert len(calls) == 1
     assert first["clients"]["0"]["corpus"] == again["clients"]["0"]["corpus"]
+
+
+def test_every_client_corpus_comes_from_one_pass_over_the_collection(tmp_path, monkeypatch):
+    root = synthetic_msmarco(tmp_path)
+    manifest = experiences.build_manifest(
+        root, clients=(0, 1), experiences_per_client=2, schedule={0: (0, 1), 1: (1, 0)},
+        counts={"train": 20, "guard": 4, "test": 3}, corpus_size=120, hard_k=2, seed=5,
+        retriever=fake_bm25)
+    scans = []
+    original = experiences.load_passages
+    monkeypatch.setattr(experiences, "load_passages",
+                        lambda r, wanted: scans.append(len(set(wanted))) or original(r, wanted))
+    corpora = experiences.client_corpora(manifest, root)
+    assert len(scans) == 1
+    assert set(corpora) == {"0", "1"}
+    for client, corpus in corpora.items():
+        assert list(corpus) == manifest["clients"][client]["corpus"]
+        assert all("text" in doc for doc in corpus.values())

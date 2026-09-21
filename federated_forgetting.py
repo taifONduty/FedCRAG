@@ -374,9 +374,9 @@ def estimate_client_losses(model, global_state, data_by_slice, slices,
 
     MNRL-consistent estimator: for a deterministic sample of up to ``sample``
     training pairs per client, loss = in-batch-negatives cross-entropy over
-    cosine scores at the MNRL default scale of 20. No gradients; batched with
-    the eval batch size. The sample is fixed per (seed, round) so all schemes
-    see identical losses.
+    cosine scores at the MNRL default scale of 20. No gradients; ``batch_size``
+    fixes the negative pool. The sample is fixed per (seed, round) so all
+    schemes see identical losses.
     """
     set_adapter_state(model, global_state)
     out = []
@@ -468,8 +468,11 @@ def main():
     ap.add_argument("--local_epochs", type=int, default=1)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--eval_batch_size", type=int, default=128,
-                    help="encode batch for evaluation only (no gradients; "
-                         "affects speed, not results)")
+                    help="encode batch for evaluation (no gradients)")
+    ap.add_argument("--loss_batch_size", type=int, default=None,
+                    help="batch of the in-batch-negative loss estimate for "
+                         "qffl/afl; it fixes the negatives, so it is a protocol "
+                         "choice. Default: --eval_batch_size (historical runs)")
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--lora_rank", type=int, default=16)
     ap.add_argument("--lora_mode", choices=["trainable-ab", "frozen-a"],
@@ -1151,6 +1154,8 @@ def main():
     afl_lam = [1.0 / len(args.slices)] * len(args.slices)
     dev_frozen = None
 
+    loss_batch_size = (args.eval_batch_size if args.loss_batch_size is None
+                       else args.loss_batch_size)
     for rnd in range(args.num_rounds):
         print(f"  --- round {rnd+1}/{args.num_rounds} ---")
         label = f"round_{rnd+1}"
@@ -1161,7 +1166,7 @@ def main():
         if args.weighted and args.weight_by in ("qffl", "afl"):
             losses = estimate_client_losses(
                 model, round_broadcast, data, args.slices, q_prefix, d_prefix,
-                args.loss_sample, args.eval_batch_size,
+                args.loss_sample, loss_batch_size,
                 rng_seed=args.seed * 1000 + rnd)
             out.setdefault("client_losses", {})[label] = \
                 dict(zip(args.slices, [round(x, 5) for x in losses]))

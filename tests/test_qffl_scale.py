@@ -108,3 +108,19 @@ def test_validator_refuses_a_tampered_L(monkeypatch, tmp_path):
     path.write_text(json.dumps(forged))
     with pytest.raises(E0ValidationError):
         validate_run_directory(tmp_path)
+
+
+def test_loss_estimate_batch_size_is_its_own_setting(monkeypatch, tmp_path):
+    driver_harness.install_mocks(monkeypatch, example_counts=COUNTS,
+                                 step_counts=STEPS, losses=LOSSES)
+    seen = []
+    monkeypatch.setattr(
+        driver, "estimate_client_losses",
+        lambda model, state, data, slices, q_prefix, d_prefix, sample,
+               batch_size, rng_seed:
+            seen.append(batch_size) or [LOSSES[s] for s in slices])
+    monkeypatch.setattr(sys, "argv", driver_harness.build_argv(
+        tmp_path, "trainable-ab", "qffl",
+        extra=("--eval_batch_size", "64", "--loss_batch_size", "4")))
+    driver.main()
+    assert seen == [4]

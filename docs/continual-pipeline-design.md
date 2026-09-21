@@ -1,8 +1,9 @@
 # Continual pipeline: design
 
-Written 2026-09-21 for the WWW 2027 line of work. Status: proposed, awaiting approval.
-Nothing here is registered; the pilot is registered in `registration/E3_PREREGISTRATION.md`
-section 14 once the manifests exist and before any training run.
+Written 2026-09-21 for the WWW 2027 line of work; amended the same day after review.
+Status: approved for implementation with the amendments below. Nothing here is
+registered; the pilot is registered in `registration/E3_PREREGISTRATION.md` section 14
+once the manifests exist and before any deciding run.
 
 ## 1. Question and scope
 
@@ -10,162 +11,190 @@ One shared dense retriever is trained by K organisations whose information needs
 over time. The question is whether learning a client's new information need degrades what
 the shared model already retrieved well for that client or another one, measured per client
 and per earlier experience on queries never used for training or selection, and whether
-ordinary shared training with replay already controls that regression.
+ordinary shared training with replay, or replay with distillation, already controls it.
 
-This design covers the problem-validation pilot only: the data construction, the driver,
-the measurements, four baseline arms and a registered gate. Method arms come after the gate
-and get their own design and registration.
+This design covers the problem-validation pilot: data construction, driver, memory,
+measurements, validator, five baseline arms, a calibration stream and a registered gate.
+Method arms come after the gate and get their own design and registration.
 
 Out of scope for the pilot: corpus growth, changed relevance, stale indexes, answer
 generation, the measured-response arm, and any claim about privacy.
 
-## 2. Data: an MS-Shift stream
+## 2. Data: a constructed semantic-shift stream from MS-Shift
 
-Source files. MS MARCO passage collection (8.84 M passages), the training queries and
-qrels, and MS-Shift's `TRAIN/queries_clustering.tsv`, which labels 398,793 training queries
-with a topic cluster (0 to 4, plus 5 for "other") and a question-intent group. MS-Shift also
-releases, per topic cluster, 5,868 to 6,595 dev-set queries with qrels (`EVAL/`), which
-serve as an untouched per-client check. Licence CC BY-NC-SA 4.0; research use.
+Source files. MS MARCO passage collection (8.84 M passages), training queries and qrels;
+MS-Shift `TRAIN/queries_clustering.tsv` (398,793 training queries with a topic cluster 0 to
+4, 5 for "other", and an intent group) and `EVAL/` (per topic cluster, 5,868 to 6,595
+dev-set queries with qrels). Licence CC BY-NC-SA 4.0; research use.
 
-Clients. Five, one per MS-Shift topic cluster 0 to 4 (30,782 to 35,766 training queries
-each). The "other" cluster is not used.
+Clients. Five, one per MS-Shift topic cluster 0 to 4. The "other" cluster is excluded from
+the primary experiment and reserved for the calibration stream (section 6).
 
-Experiences. Four per client. Within a topic cluster the queries are partitioned into four
-sub-topics by k-means (k = 4) on TF-IDF unigram and bigram features reduced by truncated
-SVD to 100 dimensions, seed recorded. The construction is independent of any retriever.
-If a sub-cluster holds fewer than 2,700 queries the clustering is rerun with the seed
-incremented, at most five times, and otherwise the build fails. Alternative considered:
-MS-Shift's released intent labels (what, how, who/when/where, other) as experiences. They
-need no clustering but describe query form rather than information need, and the smallest
-topic-by-intent cell has 1,177 queries; kept as a secondary axis.
+Experiences. Four per client, a constructed semantic-shift stream, not chronology. Within
+a topic cluster the TRAIN queries are partitioned by k-means (k = 4) on TF-IDF unigram and
+bigram features reduced by truncated SVD to 100 dimensions. The vocabulary, IDF weights,
+SVD and centroids are fitted on eligible TRAIN query text only; EVAL queries are assigned
+to the frozen centroids afterwards. Recorded in the manifest: the TF-IDF parameters,
+vocabulary digest, SVD and k-means seeds, restarts, centroid digests and the assignment of
+every query. If a sub-cluster is too small for the chosen counts the clustering is rerun
+with the seed incremented, at most five times, otherwise the build fails.
 
-Splits per (client, experience), sampled with the manifest seed, disjoint: 2,000 training
-queries, 200 guard queries, 500 test queries. Guard queries are the ones a future method may
-consult repeatedly; test queries are never used for training, selection or a gate on their
-own values before the registered gate is evaluated. The pilot arms use neither guard nor
-test queries for anything but measurement.
+Order schedules. Two predeclared schedules, A and B, each giving every client its own
+permutation of its four experiences, fixed in the manifest before any training run and
+never chosen after looking at forgetting. Schedule A: client 0 (0,1,2,3), client 1
+(2,0,3,1), client 2 (1,3,0,2), client 3 (3,2,1,0), client 4 (0,3,1,2). Schedule B: client 0
+(3,1,0,2), client 1 (1,3,2,0), client 2 (2,0,1,3), client 3 (0,2,3,1), client 4 (1,0,2,3).
 
-Order. Every client receives its four experiences in the same order in the pilot,
-sub-cluster index 0 to 3 as returned by the seeded k-means. Per-client permuted orders are
-a campaign axis, not a pilot axis.
+Splits per (client, experience). Training and guard queries come from TRAIN; test queries
+come from the official EVAL queries assigned to that sub-cluster. The counts are not fixed
+here: the builder first reports a feasibility table, client by experience, of eligible TRAIN
+queries, eligible EVAL queries and relevant-passage counts, and the largest uniform counts
+that every cell supports are then chosen and recorded. Test queries are never manufactured
+from training queries. Guard queries are the ones a future method may consult online; the
+pilot arms use guard and test queries for measurement only.
 
-Corpus per client. Fixed for the whole run: every passage judged relevant for any of the
-client's selected queries (all four experiences, all three splits, plus that topic's
-MS-Shift dev queries), filled up with passages sampled uniformly from the collection to
-60,000 passages, seed recorded. This follows the size of CREAM's per-topic MS MARCO
-collections. It is a pilot protocol, not a claim that the reduced pool preserves the
-original task; the paper says so.
+Retained unit. One query id together with all its relevance pairs. Pairs of one query
+never cross a split boundary.
 
-Manifest. `experiences.py build` writes one JSON per stream: seeds, cluster assignment
-per query id, split membership, corpus passage ids per client, and sha256 digests of each
-list. The registration records the manifest digest. The manifest is built on the Mac; the
-GPU machine only trains and evaluates.
+Corpus per client. Fixed for the whole run and identical across experiences: every passage
+judged relevant for any of the client's selected queries, plus deterministic hard
+distractors (the top passages retrieved for the client's training and test queries by the
+frozen Contriever backbone, decided before any training and never by a method under test),
+plus passages sampled uniformly from the collection, to 60,000 passages in all. The full
+passage-id list per client is recorded with its digest. This pool size follows CREAM's
+per-topic MS MARCO collections; it is a pilot protocol, and decisive comparisons are to be
+repeated on a much larger pool when compute allows.
 
-Sizes for cost. Training pairs per (client, experience) about 2,100 (MS MARCO has one
-judged passage for most queries); 60,000 passages per client to encode per evaluation.
+Manifest. `experiences.py` writes one JSON per stream and schedule: seeds, feature and
+clustering records, split membership, corpus ids, chosen counts and the digest of every
+list. Section 14 records the manifest digests. Manifests are built on the Mac; the GPU
+machine only trains and evaluates.
 
 ## 3. Training protocol
 
-Backbone `facebook/contriever` (unsupervised; it has never seen MS MARCO labels, so the
-stream is new capability), LoRA rank 16, both factors trainable, learning rate 2e-5, batch
-32, in-batch negatives, one local epoch per round, mixed precision, the E1 recipe.
+Backbone `facebook/contriever` (unsupervised; it has never seen MS MARCO labels), LoRA
+rank 16, both factors trainable, in-batch negatives, one local epoch per round, mixed
+precision. Learning rate and rounds per experience are calibrated on the calibration
+stream (section 6) and frozen before the deciding runs; the E1 values (2e-5, four rounds)
+are the starting grid, not a commitment.
 
-An experience is R = 4 communication rounds. In each round every client trains from the
-broadcast state on its current experience's training queries plus its replay memory, and
-the server averages the adapters with equal weights. Four experiences give 16 rounds.
+An experience is R communication rounds. In each round every client trains from the
+broadcast state on its current experience's training queries plus its memory, and the
+server averages the adapters with equal weights.
 
-Replay memory. Per client, at most 256 query families (a query with its judged passages)
-drawn from earlier experiences, an equal share per earlier experience, seeded; refilled at
-each experience boundary. Arms without replay have an empty memory.
+Memory (`memory.py`). Per client one budget of at most 256 retained query ids in total,
+covering replay and any guard queries a method consults online, so no arm holds hidden
+retained information beyond the budget. Replay is deterministic seeded reservoir sampling
+over the training queries of earlier experiences, an equal share per earlier experience,
+refilled at each experience boundary. Arms without replay hold an empty memory. The module
+owns capacity accounting, insertion and eviction, serialisation and restore, and reports
+the budget used in every round record.
 
-Acquisition reference. For client i and experience s, the shared model at the end of the
-last round of experience s. It is stored (adapter state and hash), together with the
-per-query scores it obtains on the guard and test queries of (i, s).
+Acquisition reference. For client i and experience u, the shared model at the end of the
+last round of experience u, stored as an adapter state with its hash, together with its
+per-query scores on the guard and test queries of (i, u).
+
+Distillation (arm E only). The teacher is the acquisition reference of the previous
+experience, fixed for the whole experience. For replay rows in a batch the loss adds
+lambda times the mean squared difference between the student's and the teacher's scaled
+cosine scores over the batch passages; current-experience rows use the contrastive loss
+alone. lambda is 1.0 unless the calibration stream, under the rule in section 6, picks
+another value from {0.5, 1.0, 2.0}.
 
 ## 4. Measurements
 
-After the last round of each experience s the shared model is evaluated on the guard and
-test queries of every (i, s') with s' <= s, against client i's fixed corpus. The corpus is
-encoded once per client per evaluation; the query sets are cheap.
+After the last round of each experience v the shared model is evaluated on the guard and
+test queries of every (i, u) with u <= v against client i's fixed corpus. The corpus is
+encoded once per client per evaluation. Recorded per (i, u, v): nDCG@10, recall@100 and the
+per-query nDCG@10 of every query. Also recorded: the frozen backbone's per-query scores
+(round 0) and, at the end, each client's full official EVAL set for its topic.
 
-Recorded per (i, s', s): nDCG@10 and recall@100, and the per-query nDCG@10 of every query
-(so paired tests and any later re-analysis need no re-run). Also recorded: the frozen
-backbone's per-query scores (round 0) and, at the end, each client's MS-Shift dev queries.
+Regression r(i, u, v), v > u: the positive part, per query, of the acquisition reference's
+nDCG@10 minus the current model's, averaged over the split; gains on some queries cannot
+cancel losses on others. This is the primary retention measure. Reported beside it, with
+their definitions: signed backward transfer, peak forgetting, absolute final nDCG@10, the
+full client-by-experience matrix, the worst cell, and the fraction of historical cells with
+r >= 0.010.
 
-Regression of (i, s') at time s: the positive part, per query, of the acquisition
-reference's nDCG@10 minus the current model's nDCG@10, averaged over the split. Gains on
-some queries cannot cancel losses on others. Backward transfer and peak forgetting are
-reported beside it with their definitions; the positive-part risk is primary.
-
-Acquisition of (i, s) at time s: the current model's nDCG@10 minus the frozen backbone's
-on the test queries of (i, s).
+Acquisition a(i, u): the current model's nDCG@10 minus the frozen backbone's on the test
+queries of (i, u) at v = u.
 
 ## 5. Pilot arms, seeds and gate
 
-Arms: (A) frozen backbone; (B) local-only continual, each client alone with the same
-replay budget and the same number of optimiser steps; (C) uniform FedAvg without replay;
-(D) uniform FedAvg with replay. Seeds 123, 2024 and 42, so three seeds. Nine trained runs
-plus one frozen evaluation.
+Arms: (A) frozen backbone; (B) local-only continual, each client alone, five independent
+models per seed, same memory budget and the same number of optimiser steps; (C) uniform
+FedAvg without replay; (D) uniform FedAvg with replay; (E) uniform FedAvg with replay and
+reference distillation. Seeds 123, 2024 and 3407, fixed now. Both schedules. Four trained
+arms times three seeds times two schedules is 24 runs, plus the frozen evaluation per
+schedule.
 
-Gate, to be written into section 14 before the first run and evaluated on test queries
-only after every run has finished and validated:
+Gate scalars, on test queries, computed only after every run has validated:
 
-- G2 (adaptation is useful): under D, acquisition averaged over clients and experiences is
-  at least 0.020 nDCG@10 at every seed.
-- G1 (a problem remains): under D, the regression averaged over clients and earlier
-  experiences at the end of the stream is at least 0.010 nDCG@10 at every seed. The
-  threshold is about four times the largest seed half-range seen in the thesis's paired
-  E1 runs (0.0027).
-- G3 (collaboration has value): under D, acquisition is at least that of B, averaged.
+- A = mean over (i, u) of a(i, u).
+- G = mean over historical cells (i, u, v), v > u, of r(i, u, v) under arm D.
+
+Thresholds 0.020 for A and 0.010 for G are practical effect sizes, not confidence bounds.
+Consistency rule: a criterion passes if the mean of its scalar over the six runs (three
+seeds by two schedules) clears the threshold and the scalar clears half the threshold in at
+least five of the six runs. G2 (adaptation is useful) is A under arm D; G1 (a problem
+remains) is G under arm D; G3 (collaboration has value, reported, not a go criterion) is A
+under D at least A under B. Arm E is reported beside D: if E's G falls below half of D's G
+while its A stays within 0.005 of D's, distillation already controls the regression and
+the framing says so.
 
 Outcomes. G2 fails: the recipe or the stream is at fault; fix and rerun before anything
-else. G1 fails with G2 passing: replay controls the regression here; the method work is
-not motivated by this stream, and the paper's temporal evidence moves to LoTTE or to a
-report that replay suffices. G1 and G2 pass: the method arms are designed and registered.
-G3 is reported either way and shapes the framing, not the go decision.
+else. G1 fails with G2 passing: replay controls the regression here, the method work is
+not motivated by this stream, and the temporal evidence moves to LoTTE or to a report that
+replay suffices. G1 and G2 pass: the method arms are designed and registered.
 
-## 6. Cost
+## 6. Calibration stream and cost
 
-Per trained run on an L4: about 16 rounds times 5 clients times 70 steps of LoRA training,
-under an hour, plus four evaluations of 300,000 passage encodes and 5 clients' query sets,
-about 20 minutes. Nine runs fit in one day of one L4. Manifest building runs on the Mac
-(MS MARCO collection 1.0 GB compressed).
+Calibration stream: the same construction applied to MS-Shift's "other" cluster, two
+pseudo-clients by k-means (k = 2) and four experiences each, its own manifest. On it, rounds
+per experience in {2, 4, 8} and learning rate in {2e-5, 5e-5} are compared under arm D and
+the pair with the highest mean acquisition is frozen; lambda in {0.5, 1.0, 2.0} is chosen
+under arm E as the value with the lowest G whose A is within 0.005 of the best. No deciding
+run starts before this is recorded.
 
-## 7. Code
+Cost: one realistic unit (one client, one experience, one round of training plus one full
+retained evaluation pass) is profiled on the L4 first; the pilot's total is extrapolated
+from that measurement and written into section 14. The earlier "one L4 day" figure is a
+guess and is not registered.
 
-Three new top-level modules and their tests; `federated_forgetting.py` is not changed.
+## 7. Code and records
 
-- `experiences.py`: loads MS MARCO and MS-Shift, builds and verifies a manifest, and
-  materialises per-(client, experience) data in the shape `client_train` already consumes
-  (`corpus`, `train_q`, `train_qrels`, plus `guard_*` and `test_*`).
-- `continual_driver.py`: the experience loop over rounds, replay memory, reference
-  snapshots, the evaluation matrix, per-query outputs, result JSON with provenance in the
-  same form as the static driver (commit, source hashes, data digests, arguments).
-  Reuses `client_train`, `fedavg`, `get_adapter_state`/`set_adapter_state` and the
-  metric code.
-- `regression.py`: per-query nDCG@10 from rankings, positive-part regression against a
-  reference, acquisition, and the matrix summaries.
+Four new top-level modules and their tests; `federated_forgetting.py` is not changed.
 
-Dependency added: scikit-learn, for TF-IDF, truncated SVD and k-means in the manifest
-build only.
+- `experiences.py`: loads MS MARCO and MS-Shift, reports the feasibility table, builds and
+  verifies manifests, and materialises per-(client, experience) data in the shape
+  `client_train` consumes.
+- `memory.py`: the retained-query budget and seeded reservoir replay.
+- `regression.py`: per-query nDCG@10 from rankings, positive-part regression, acquisition,
+  signed backward transfer, peak forgetting and the matrix summaries.
+- `continual_driver.py`: the experience loop over rounds and schedules, the five arms,
+  reference snapshots, the evaluation matrix, per-query outputs and a result JSON with the
+  same provenance record as the static driver.
+- `validate_continual.py`: exists before the first real run. It checks checkpoint-chain
+  continuity, the experience sequence against the manifest, source and data digests,
+  memory capacity in every round, that no test id appears in any training, replay or guard
+  set, acquisition-reference hashes, the recorded client models of local-only runs, and
+  seed and configuration identity. A two-client, two-experience synthetic end-to-end test
+  runs the driver and the validator together before the calibration stream is launched.
 
-Records. Per round: the same state payload as the static driver (clients, broadcast,
-global, hashes), so the aggregate can be recomputed from the persisted states. Extending
-`validate_e0.py` to the continual record is the first task after the pilot runs are
-launched, before any result is quoted.
+Per round the driver persists the same state payload as the static driver (clients,
+broadcast, global, hashes) so the aggregate can be recomputed from the persisted states.
 
-Tests, one behaviour each: manifest determinism under the same seed and difference under
-another; the sub-cluster size rule; disjointness of the three splits; the corpus rule;
-positive-part regression on a hand-built example; the driver loop on the synthetic
-encoder of `tests/driver_harness.py` (reference stored at each experience end, matrix
-shape, replay budget respected, no test query in any training batch).
+Dependency added: scikit-learn, for the manifest build only.
 
 ## 8. Beyond the pilot
 
-LoTTE (3.6 GB, corpora of 0.39 to 2.04 M passages per domain, about 5,200 to 5,600
-queries per domain) replicates the pilot with a different query style and several
-relevant passages per query; its corpora are capped by the same rule. LongEval-Retrieval
-2023 English (three snapshots, June to September 2022, click-model labels) is a
-robustness evaluation of trained models, not a training stream; its download requires a
-LINDAT/CLARIN account, which the author must create. FreshStack is optional. Each
-dataset gets a readiness table built from the actual files before it enters a run.
+LoTTE (3.6 GB; corpora of 0.39 to 2.04 M passages per domain; about 5,200 to 5,600 queries
+per domain; several relevant passages per query) replicates the pilot with a different
+query style; corpora capped by the same rule. LongEval-Retrieval 2023 English (June, July
+and September 2022 snapshots, click-model labels in three grades, document time metadata)
+is a chronological robustness evaluation of trained models, not a training stream; the
+author downloads it from LINDAT/CLARIN into `beir_data/longeval-2023/` with the raw layout
+and checksums, and its July and September labels stay sealed from method development. Any
+later training on July feedback is a derived protocol and is labelled as such. FreshStack
+is optional. Each dataset gets a readiness table built from the actual files before it
+enters a run.

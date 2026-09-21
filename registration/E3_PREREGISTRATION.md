@@ -772,3 +772,77 @@ alters a recorded result; each has a regression test.
 
 The prospective temporal protocol will be registered in a section of its own before any
 run of it.
+
+
+### 14 Block T1: the temporal pilot on a constructed MS-Shift stream (registered 2026-09-21 16:36 UTC, the clock of the commit that adds it; before any run of the continual driver)
+
+Design: docs/continual-pipeline-design.md at this commit. Code: experiences.py, memory.py,
+regression.py, continual_driver.py, validate_continual.py (commits fccc848 to 8652bee).
+Every run is validated by validate_continual.py before it counts; test-query values are
+not read before every run of the block has validated.
+
+Construction, all fixed here. Clients 0 to 4 are MS-Shift topic clusters 0 to 4. Within a
+client, TRAIN queries with judgements are partitioned into four experiences by k-means
+(k = 4, ten restarts, seed 1, rerun with the next seed at most five times if a sub-cluster
+falls below the training-plus-guard count) on TF-IDF unigram and bigram features (min_df 2,
+sublinear tf) reduced by truncated SVD to 50 dimensions and unit-normalised; the fit uses
+training-side text only, and the official EVAL queries of the topic are assigned to the
+frozen centroids. Splits per (client, experience), sampled with the manifest seed and
+disjoint: 1,674 training, 167 guard and 350 test queries, the largest uniform counts every
+cell of the feasibility table supports (smallest cells: 1,841 training-eligible and 350
+evaluation-eligible queries). Test queries come only from the official EVAL queries. A
+retained unit is one query id with all its judgements.
+
+Schedules. A: client 0 (0,1,2,3), 1 (2,0,3,1), 2 (1,3,0,2), 3 (3,2,1,0), 4 (0,3,1,2).
+B: client 0 (3,1,0,2), 1 (1,3,2,0), 2 (2,0,1,3), 3 (0,2,3,1), 4 (1,0,2,3).
+
+Corpus per client, fixed across experiences: every passage judged relevant for any selected
+query or any official EVAL query of the topic, plus the top-10 BM25 passages (bm25s, English
+stopwords, over the full 8.84 M collection) of every selected training, guard and test
+query, plus passages sampled uniformly to 60,000 in all.
+
+Calibration stream: topic 5 ("other"), which has no official EVAL queries, split by k-means
+(k = 2) into clients 50 and 51; its evaluation pool is a seeded 15 percent of its training
+queries held out before clustering; counts 2,000 / 200 / 500; order client 50 (0,1,2,3),
+client 51 (2,0,3,1). Recipe grid on it, arm D (uniform FedAvg with replay), seed 123, budget
+256: rounds per experience in {2, 4, 8} by learning rate in {2e-5, 5e-5}; the pair with the
+highest mean acquisition A is frozen. Then lambda in {0.5, 1.0, 2.0} under arm E at that
+pair: the value with the lowest G among those whose A is within 0.005 of the best A. The
+frozen recipe is written into 14.1 before the pilot starts. Fixed regardless: Contriever
+(facebook/contriever, unsupervised), LoRA rank 16, alpha 32, dropout 0.1, both factors
+trainable, batch 32, one local epoch per round, in-batch negatives, mixed precision,
+gradient checkpointing, evaluation batch 256.
+
+Pilot. Arms: (A) frozen; (B) local-only continual, one model per client, same budget and
+steps; (C) uniform FedAvg without replay; (D) uniform FedAvg with replay; (E) D with
+distillation from the previous experience's acquisition reference on replay rows. Seeds
+123, 2024 and 3407. Both schedules. 24 trained runs and two frozen evaluations, all on one
+L4 with the frozen recipe.
+
+Measurements. After each experience, per-query nDCG@10 and recall@100 on the guard and test
+queries of every experience learned so far, against the client's fixed corpus; the
+acquisition reference of (client, experience) is the shared model (the client's own model
+under B) at the end of that experience. Primary retention: the positive-part regression
+against the reference, per query, averaged over the split. Also reported: signed backward
+transfer, peak forgetting, absolute nDCG@10, the full client-by-experience matrix, the
+worst cell, the fraction of historical cells at or above 0.010, and each client's whole
+evaluation pool at the end.
+
+Gate, on test queries, evaluated once every run has validated. A = mean over (client,
+experience) of acquisition against the frozen backbone; G = mean over historical cells
+(u < v) of the positive-part regression. Thresholds 0.020 for A and 0.010 for G are
+practical effect sizes. A criterion passes if the mean of its scalar over the six runs
+(three seeds by two schedules) clears the threshold and the scalar clears half the
+threshold in at least five of the six. G2 (adaptation is useful): A under D. G1 (a problem
+remains): G under D. G3 (collaboration has value, reported, not a go criterion): A under D
+at least A under B. Arm E is reported beside D: if E's G is below half of D's G while E's A
+is within 0.005 of D's, distillation already controls the regression and the paper says so.
+
+Outcomes. G2 fails: the recipe or the stream is at fault; fix, re-register and rerun. G1
+fails with G2 passing: replay controls the regression on this stream; no method is
+motivated by it, and the temporal evidence moves to LoTTE or to that finding. G1 and G2
+pass: method arms are designed and registered separately.
+
+To be appended as 14.1 before the pilot: the manifest digests (schedules A and B and the
+calibration stream) with the commit that built them, the measured cost of one unit on the
+L4 and the extrapolated pilot cost, and the frozen recipe with the calibration outcomes.

@@ -59,15 +59,12 @@ bootstrap() {
 
 manifests() {
   say "manifests"
-  for name in A B; do
-    sched=$SCHEDULE_A; [ "$name" = B ] && sched=$SCHEDULE_B
-    [ -f "$MANIFESTS/primary_$name.json" ] || "$PY" experiences.py build --data_root "$DATA" --seed 1 \
-      --clients 0 1 2 3 4 --experiences 4 --schedule "$sched" --counts "$COUNTS_PRIMARY" \
-      --corpus_size 60000 --hard_k 10 --out "$MANIFESTS/primary_$name.json"
-  done
-  [ -f "$MANIFESTS/calibration.json" ] || "$PY" experiences.py build --data_root "$DATA" --seed 1 \
-    --clients 5 --pseudo_clients 2 --experiences 4 --schedule "$SCHEDULE_CAL" --counts "$COUNTS_CAL" \
-    --corpus_size 60000 --hard_k 10 --out "$MANIFESTS/calibration.json"
+  [ -f "$MANIFESTS/primary_B.json" ] || "$PY" experiences.py build --data_root "$DATA" --seed 1 \
+    --clients 0 1 2 3 4 --experiences 4 --schedules "{\"A\":$SCHEDULE_A,\"B\":$SCHEDULE_B}" \
+    --counts "$COUNTS_PRIMARY" --corpus_size 60000 --hard_k 10 --name primary --out "$MANIFESTS"
+  [ -f "$MANIFESTS/calibration_cal.json" ] || "$PY" experiences.py build --data_root "$DATA" --seed 1 \
+    --clients 5 --pseudo_clients 2 --experiences 4 --schedules "{\"cal\":$SCHEDULE_CAL}" \
+    --counts "$COUNTS_CAL" --corpus_size 60000 --hard_k 10 --name calibration --out "$MANIFESTS"
   for m in "$MANIFESTS"/*.json; do "$PY" experiences.py verify --seed 1 --out "$m"; done
   ( cd "$MANIFESTS" && sha256sum *.json > SHA256SUMS && cat SHA256SUMS | tee -a "$LOG" )
 }
@@ -89,7 +86,7 @@ run_one() {  # name manifest arm seed rounds [extra args]
 
 profile() {
   say "profile"
-  run_one profile-cal-r1 "$MANIFESTS/calibration.json" fedavg-replay 123 1
+  run_one profile-cal-r1 "$MANIFESTS/calibration_cal.json" fedavg-replay 123 1
   "$PY" - "$OUT/profile-cal-r1" <<'PYEOF'
 import glob, json, sys
 d = sys.argv[1]; r = json.load(open(glob.glob(d + "/continual_*.json")[0]))
@@ -102,7 +99,7 @@ PYEOF
 calibrate() {
   say "calibrate"
   for rounds in 2 4 8; do for lr in 2e-5 5e-5; do
-    run_one "cal-D-r${rounds}-lr${lr}" "$MANIFESTS/calibration.json" fedavg-replay 123 "$rounds" --lr "$lr"
+    run_one "cal-D-r${rounds}-lr${lr}" "$MANIFESTS/calibration_cal.json" fedavg-replay 123 "$rounds" --lr "$lr"
   done; done
   choice=$("$PY" - "$OUT" <<'PYEOF'
 import glob, json, sys
@@ -118,7 +115,7 @@ PYEOF
   rounds=$(echo "$choice" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["rounds"])')
   lr=$(echo "$choice" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["lr"])')
   for lam in 0.5 1.0 2.0; do
-    run_one "cal-E-lam${lam}" "$MANIFESTS/calibration.json" fedavg-replay-distill 123 "$rounds" --lr "$lr" --lambda_distill "$lam"
+    run_one "cal-E-lam${lam}" "$MANIFESTS/calibration_cal.json" fedavg-replay-distill 123 "$rounds" --lr "$lr" --lambda_distill "$lam"
   done
   "$PY" - "$OUT" <<'PYEOF' | tee "$OUT/calibration_lambda.json"
 import glob, json, sys

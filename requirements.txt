@@ -16,3 +16,4 @@ pytest
 openai
 scikit-learn
 bm25s
+numba

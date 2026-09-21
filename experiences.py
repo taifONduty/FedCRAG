@@ -1,6 +1,7 @@
 """A constructed semantic-shift stream over MS MARCO and MS-Shift: feasibility, manifests
 and the per-(client, experience) data the trainer consumes."""
 import argparse
+import copy
 import csv
 import hashlib
 import json
@@ -360,11 +361,33 @@ def bm25_retriever(root):
         index.save(index_dir)
         with open(ids_path, "w") as handle:
             json.dump(ids, handle)
+    try:
+        index.activate_numba_scorer()
+    except ImportError:
+        pass
 
     def retrieve(query_texts, k):
-        hits, _ = index.retrieve(bm25s.tokenize(query_texts, stopwords="en"), k=k)
+        hits, _ = index.retrieve(bm25s.tokenize(query_texts, stopwords="en"), k=k,
+                                 n_threads=-1)
         return [[ids[j] for j in row] for row in hits]
     return retrieve
+
+
+def build_manifests(root, clients, experiences_per_client, schedules, counts, corpus_size,
+                    hard_k, seed, retriever, source_digests=None, pseudo_clients=1):
+    """One build shared by several order schedules: the splits and corpora are identical,
+    only each client's order differs. Returns {schedule name: manifest}."""
+    names = list(schedules)
+    base = build_manifest(root, clients, experiences_per_client, schedules[names[0]], counts,
+                          corpus_size, hard_k, seed, retriever, source_digests, pseudo_clients)
+    manifests = {}
+    for name in names:
+        manifest = copy.deepcopy(base)
+        manifest["schedule"] = name
+        for client, entry in manifest["clients"].items():
+            entry["order"] = list(schedules[name][int(client)])
+        manifests[name] = manifest
+    return manifests
 
 
 def main():
@@ -374,13 +397,14 @@ def main():
     ap.add_argument("--clients", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     ap.add_argument("--experiences", type=int, default=4)
     ap.add_argument("--seed", type=int, required=True)
-    ap.add_argument("--schedule", help="JSON {client: [experience order]} (build)")
+    ap.add_argument("--schedules", help="JSON {name: {client: [experience order]}} (build)")
+    ap.add_argument("--name", default="primary", help="manifest file prefix (build)")
     ap.add_argument("--counts", help="JSON {train, guard, test} (build)")
     ap.add_argument("--corpus_size", type=int, default=60000)
     ap.add_argument("--hard_k", type=int, default=10)
     ap.add_argument("--pseudo_clients", type=int, default=1,
                     help="split each topic into this many clients (calibration stream)")
-    ap.add_argument("--out", help="manifest path (build) or manifest to verify")
+    ap.add_argument("--out", help="output directory (build) or manifest to verify")
     args = ap.parse_args()
     if args.command == "feasibility":
         table = feasibility(args.data_root, args.clients, args.experiences, args.seed,
@@ -395,18 +419,22 @@ def main():
             verify_manifest(json.load(handle))
         print("manifest verified")
         return
-    schedule = {int(c): tuple(order) for c, order in json.loads(args.schedule).items()}
+    schedules = {name: {int(c): tuple(order) for c, order in schedule.items()}
+                 for name, schedule in json.loads(args.schedules).items()}
     sources = {name: _file_digest(os.path.join(args.data_root, name)) for name in (
         "msmarco-passage/collection.tsv", "msmarco-passage/queries.train.tsv",
         "msmarco-passage/qrels.train.tsv", "ms-marco-shift/TRAIN/queries_clustering.tsv")}
-    manifest = build_manifest(args.data_root, args.clients, args.experiences, schedule,
-                              json.loads(args.counts), args.corpus_size, args.hard_k,
-                              args.seed, bm25_retriever(args.data_root), sources,
-                              args.pseudo_clients)
-    verify_manifest(manifest)
-    with open(args.out, "w") as handle:
-        json.dump(manifest, handle)
-    print(f"wrote {args.out}")
+    manifests = build_manifests(args.data_root, args.clients, args.experiences, schedules,
+                                json.loads(args.counts), args.corpus_size, args.hard_k,
+                                args.seed, bm25_retriever(args.data_root), sources,
+                                args.pseudo_clients)
+    os.makedirs(args.out, exist_ok=True)
+    for name, manifest in manifests.items():
+        verify_manifest(manifest)
+        path = os.path.join(args.out, f"{args.name}_{name}.json")
+        with open(path, "w") as handle:
+            json.dump(manifest, handle)
+        print(f"wrote {path}")
 
 
 if __name__ == "__main__":

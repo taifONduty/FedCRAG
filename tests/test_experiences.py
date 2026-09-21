@@ -137,3 +137,19 @@ def test_bm25_index_is_built_once_and_reloaded(tmp_path):
     queries = ["passage about apples", "passage about physics"]
     assert first(queries, 3) == second(queries, 3)
     assert all(len(hits) == 3 for hits in second(queries, 3))
+
+
+def test_schedules_share_one_build_and_differ_only_in_order(tmp_path):
+    root = synthetic_msmarco(tmp_path)
+    manifests = experiences.build_manifests(
+        root, clients=(0, 1), experiences_per_client=2,
+        schedules={"A": {0: (0, 1), 1: (1, 0)}, "B": {0: (1, 0), 1: (0, 1)}},
+        counts={"train": 20, "guard": 4, "test": 3}, corpus_size=120, hard_k=2, seed=5,
+        retriever=fake_bm25)
+    a, b = manifests["A"], manifests["B"]
+    assert a["schedule"] == "A" and b["schedule"] == "B"
+    assert a["clients"]["0"]["order"] == [0, 1] and b["clients"]["0"]["order"] == [1, 0]
+    for client in ("0", "1"):
+        assert a["clients"][client]["digests"] == b["clients"][client]["digests"]
+        assert a["clients"][client]["corpus"] == b["clients"][client]["corpus"]
+    experiences.verify_manifest(b)

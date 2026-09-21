@@ -852,3 +852,21 @@ the commit that adds it). The first manifest build, at commit 793ce22 on the L4,
 because client 0 had 79,169 relevant and top-10 BM25 passages, more than the 60,000-passage
 pool. The construction therefore uses the top-5 BM25 passages per selected query instead of
 the top-10; everything else in 14 is unchanged. No training run had started.
+
+Second amendment to 14, before any run of the continual driver (2026-09-22 20:57 UTC, the clock
+of the commit that adds it). The manifest build at commit 89ad9f1 completed its retrieval and
+was then refused by its own verifier with "client 0: splits overlap". The cause is a property
+of the release: every MS-Shift EVAL query id is also in MS MARCO's queries.train.tsv (6,595 of
+6,595 for topic 0, and all of topics 1 to 4), because MS-Shift draws its evaluation queries
+from the training pool rather than from the official dev set. The builder had therefore placed
+some ids in an experience's training or guard split and the same ids in another experience's
+test split. No training run had started, and no such manifest was written.
+
+Correction: a topic's official EVAL query ids are removed from the training-side pool before
+the clustering, so they can only ever be test queries. The registered rule for the counts is
+unchanged; re-deriving it from the corrected feasibility table (smallest cells 1,489
+training-eligible and 350 evaluation-eligible queries) gives 1,354 training, 135 guard and
+350 test queries per client-experience, replacing 1,674 / 167 / 350 in section 14. The
+calibration stream is unaffected at 2,000 / 200 / 500; its evaluation pool is a held-out
+fifteen percent of its own training queries, which the builder already removed from training.
+Everything else in 14 and its first amendment stands.

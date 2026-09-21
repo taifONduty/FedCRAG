@@ -186,3 +186,26 @@ def test_every_client_corpus_comes_from_one_pass_over_the_collection(tmp_path, m
     for client, corpus in corpora.items():
         assert list(corpus) == manifest["clients"][client]["corpus"]
         assert all("text" in doc for doc in corpus.values())
+
+
+def test_official_evaluation_queries_are_kept_out_of_the_training_side(tmp_path):
+    """MS-Shift draws its EVAL queries from the MS MARCO training pool, so the same id can
+    appear in queries.train.tsv; it must never become a training or guard query."""
+    root = synthetic_msmarco(tmp_path)
+    ev = root / "ms-marco-shift" / "EVAL"
+    shared = [f"{100 + i}" for i in range(0, 40, 2)]          # ids that are also train queries
+    (ev / "queries" / "queries_0.tsv").write_text(
+        "".join(f"{q}\t{TEXTS[int(q) - 100]}\n" for q in shared))
+    (ev / "qrel" / "qrel_0.json").write_text(
+        json.dumps({q: {str(int(q) - 100): 1} for q in shared}))
+    manifest = experiences.build_manifest(
+        root, clients=(0,), experiences_per_client=1, schedule={0: (0,)},
+        counts={"train": 10, "guard": 2, "test": 3}, corpus_size=120, hard_k=2, seed=5,
+        retriever=fake_bm25)
+    client = manifest["clients"]["0"]
+    trained = {q for cell in client["experiences"].values()
+               for q in cell["train"] + cell["guard"]}
+    tested = {q for cell in client["experiences"].values() for q in cell["test"]}
+    assert tested and tested <= set(shared)
+    assert not (trained & set(shared))
+    experiences.verify_manifest(manifest)

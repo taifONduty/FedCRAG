@@ -200,6 +200,9 @@ def _cells(root, clients, k, seed, minimum, pseudo_clients=1):
             source = "official"
             eval_q, eval_qrels = load_eval(root, topic)
             topic_eval = sorted((q for q in eval_q if q in eval_qrels), key=int)
+            # MS-Shift draws its evaluation queries from the MS MARCO training pool, so the
+            # same ids appear in queries.train.tsv; they are never trained on.
+            topic_ids = [q for q in topic_ids if q not in set(topic_eval)]
         else:
             source = "train-holdout"
             rng = np.random.default_rng([seed, topic, 99])

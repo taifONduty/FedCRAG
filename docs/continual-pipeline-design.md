@@ -49,7 +49,9 @@ never chosen after looking at forgetting. Schedule A: client 0 (0,1,2,3), client
 (3,1,0,2), client 1 (1,3,2,0), client 2 (2,0,1,3), client 3 (0,2,3,1), client 4 (1,0,2,3).
 
 Splits per (client, experience). Training and guard queries come from TRAIN; test queries
-come from the official EVAL queries assigned to that sub-cluster. The counts are not fixed
+come from the official EVAL queries assigned to that sub-cluster. MS-Shift draws those
+evaluation queries from the MS MARCO training pool, so their ids are removed from the
+training side before the clustering and can only ever be test queries. The counts are not fixed
 here: the builder first reports a feasibility table, client by experience, of eligible TRAIN
 queries, eligible EVAL queries and relevant-passage counts, and the largest uniform counts
 that every cell supports are then chosen and recorded. Test queries are never manufactured

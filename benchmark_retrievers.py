@@ -6,7 +6,8 @@ import numpy as np
 import torch
 from fedcrag_common import (LOCAL_MODELS, API_MODELS, MODEL_SETS, resolve_local,
                             load_slice, doc_text, evaluate_metrics,
-                            load_local_model, encode_texts, APIEmbedder)
+                            load_local_model, encode_texts, encode_cached,
+                            APIEmbedder)
 
 
 def benchmark_local(model_name, slice_data, slices, metrics, out_dir,
@@ -48,18 +49,9 @@ def benchmark_api(model_name, slice_data, slices, metrics, out_dir,
         cids = list(corpus.keys())
         safe = f"{model_name}__{API_MODELS[model_name]['model']}".replace("/", "_")
         cache = os.path.join(cache_dir, f"{safe}__{s}.npy")
-        c_emb = None
-        if os.path.exists(cache):
-            c_emb = np.load(cache)
-            if c_emb.shape[0] != len(cids) or c_emb.shape[1] != embedder.dim:
-                print(f"  WARNING: stale embedding cache {cache} "
-                      f"(shape {c_emb.shape}, expected {len(cids)} x "
-                      f"{embedder.dim}); re-encoding")
-                c_emb = None
-        if c_emb is None:
-            c_emb = embedder.encode([doc_text(corpus[c]) for c in cids],
-                                    batch_size=corpus_batch)
-            np.save(cache, c_emb)
+        texts = [doc_text(corpus[c]) for c in cids]
+        c_emb = encode_cached(cache, "", texts,
+                              lambda: embedder.encode(texts, batch_size=corpus_batch))
         qids = [q for q in queries if q in qrels and qrels[q]]
         q_emb = embedder.encode([queries[q] for q in qids], batch_size=query_batch)
         res[s] = evaluate_metrics(cids, c_emb, qids, q_emb, qrels, metrics)

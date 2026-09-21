@@ -1,3 +1,4 @@
+import hashlib
 import os
 import json
 import time
@@ -139,21 +140,20 @@ def load_slice_with_train(name, data_root):
     url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{name}.zip"
     path = beir_util.download_and_unzip(url, data_root)
     corpus, test_q, test_qrels = GenericDataLoader(path).load(split="test")
-    split_fallback = False
-    try:
-        _, train_q, train_qrels = GenericDataLoader(path).load(split="train")
-    except Exception:
-        split_fallback = True
+    split_fallback = not os.path.exists(os.path.join(path, "qrels", "train.tsv"))
+    if split_fallback:
         print(f"  WARNING: slice '{name}' has no train split; deterministically "
               f"halving its test queries (sorted qids) into train/eval. "
               f"Recorded as split_fallback in the output JSON.")
-        qids = sorted(test_qrels.keys())
+        qids = sorted(test_qrels)
         half = len(qids) // 2
-        tr, ev = set(qids[:half]), set(qids[half:])
-        train_q = {q: test_q[q] for q in tr if q in test_q}
-        train_qrels = {q: test_qrels[q] for q in tr}
-        test_q = {q: test_q[q] for q in ev if q in test_q}
-        test_qrels = {q: test_qrels[q] for q in ev}
+        train_ids, eval_ids = qids[:half], qids[half:]
+        train_q = {q: test_q[q] for q in train_ids if q in test_q}
+        train_qrels = {q: test_qrels[q] for q in train_ids}
+        test_q = {q: test_q[q] for q in eval_ids if q in test_q}
+        test_qrels = {q: test_qrels[q] for q in eval_ids}
+    else:
+        _, train_q, train_qrels = GenericDataLoader(path).load(split="train")
     return {"corpus": corpus, "train_q": train_q, "train_qrels": train_qrels,
             "eval_q": test_q, "eval_qrels": test_qrels,
             "split_fallback": split_fallback}
@@ -244,24 +244,32 @@ def load_local_model(name):
     return model, q_prefix, d_prefix, fp16
 
 
-def encode_texts(model, texts, prefix, batch_size, cache_path=None):
-    expected_dim = None
-    get_dim = getattr(model, "get_sentence_embedding_dimension", None)
-    if callable(get_dim):
-        expected_dim = get_dim()
-    if cache_path and os.path.exists(cache_path):
-        emb = np.load(cache_path)
-        if emb.shape[0] == len(texts) and (expected_dim is None
-                                           or emb.shape[1] == expected_dim):
-            return emb
-        print(f"  WARNING: stale embedding cache {cache_path} "
-              f"(shape {emb.shape}, expected {len(texts)} x {expected_dim}); re-encoding")
-    emb = model.encode([prefix + t for t in texts], batch_size=batch_size,
-                       convert_to_numpy=True, normalize_embeddings=True,
-                       show_progress_bar=False)
-    if cache_path:
-        np.save(cache_path, emb)
+def encode_cached(cache_path, prefix, texts, encode):
+    """Run ``encode()`` unless ``cache_path`` holds embeddings stamped with the
+    same prefix and ordered texts. The caller keys the path by model."""
+    if not cache_path:
+        return encode()
+    digest = hashlib.sha256(prefix.encode("utf-8") + b"\0")
+    for text in texts:
+        digest.update(text.encode("utf-8") + b"\0")
+    identity = digest.hexdigest()
+    stamp = cache_path + ".sha256"
+    if os.path.exists(cache_path) and os.path.exists(stamp):
+        with open(stamp) as f:
+            if f.read().strip() == identity:
+                return np.load(cache_path)
+    emb = encode()
+    np.save(cache_path, emb)
+    with open(stamp, "w") as f:
+        f.write(identity + "\n")
     return emb
+
+
+def encode_texts(model, texts, prefix, batch_size, cache_path=None):
+    return encode_cached(cache_path, prefix, texts, lambda: model.encode(
+        [prefix + t for t in texts], batch_size=batch_size,
+        convert_to_numpy=True, normalize_embeddings=True,
+        show_progress_bar=False))
 
 
 class APIEmbedder:

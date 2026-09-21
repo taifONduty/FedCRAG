@@ -19,11 +19,9 @@ class ReplayMemory:
         return len(self._reserved) + len(self._replay)
 
     def reserve(self, qids):
-        """Count guard queries consulted online against the budget; call before refill."""
-        if self._replay:
-            raise ValueError("reserve guard queries before refilling the replay memory")
+        """Count guard queries consulted online against the budget."""
         new = [q for q in qids if q not in self._reserved]
-        if len(self._reserved) + len(new) > self.budget:
+        if self.used + len(new) > self.budget:
             raise ValueError(f"reserving {len(new)} more guard queries exceeds the "
                              f"budget of {self.budget}")
         self._reserved.extend(new)

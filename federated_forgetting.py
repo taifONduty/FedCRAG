@@ -162,11 +162,14 @@ def _data_fingerprints(data):
     return fingerprints
 
 
+PROVENANCE_SOURCE_FILES = ("federated_forgetting.py", "aggregation_schemes.py",
+                           "fedcrag_common.py", "response_arm.py",
+                           "response_aggregation.py", "requirements.txt")
+
+
 def _runtime_provenance(commit, requested_model, model_path, model,
                         module_scales, data_root, data_sha256):
     root = os.path.dirname(os.path.abspath(__file__))
-    source_files = ("federated_forgetting.py", "aggregation_schemes.py",
-                    "fedcrag_common.py", "requirements.txt")
     versions = {}
     for package in ("torch", "sentence-transformers", "peft", "scipy",
                     "numpy"):
@@ -190,7 +193,7 @@ def _runtime_provenance(commit, requested_model, model_path, model,
         "git_commit": commit,
         "source_sha256": {
             name: _sha256_file(os.path.join(root, name))
-            for name in source_files
+            for name in PROVENANCE_SOURCE_FILES
         },
         "python": sys.version,
         "platform": platform.platform(),

@@ -187,3 +187,39 @@ def test_driver_still_accepts_distinct_slices(monkeypatch, tmp_path):
     result, _ = driver_harness.run_driver(
         monkeypatch, tmp_path, "trainable-ab", "uniform")
     assert result["slices"] == list(driver_harness.SLICES)
+
+
+# ------------------------------------------------------------ run identity
+
+
+def test_an_existing_result_file_is_never_overwritten(monkeypatch, tmp_path):
+    driver_harness.run_driver(monkeypatch, tmp_path, "trainable-ab", "uniform")
+    with pytest.raises(SystemExit, match="refusing to overwrite"):
+        driver_harness.run_driver(monkeypatch, tmp_path, "trainable-ab", "uniform")
+
+
+def test_response_arm_sources_are_part_of_the_provenance():
+    assert {"response_arm.py", "response_aggregation.py"} <= set(
+        driver.PROVENANCE_SOURCE_FILES)
+    for name in driver.PROVENANCE_SOURCE_FILES:
+        assert (Path(driver.__file__).parent / name).is_file(), name
+
+
+def test_round_drift_is_recorded_under_its_own_name(monkeypatch, tmp_path):
+    driver_harness.install_mocks(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        driver, "eval_global",
+        lambda model, state, data, slices, q_prefix, d_prefix, metrics, batch_size:
+            calls.append(1) or {s: {m: 0.1 * len(calls) for m in metrics}
+                                for s in slices})
+    monkeypatch.setattr(sys, "argv", driver_harness.build_argv(
+        tmp_path, "trainable-ab", "uniform", num_rounds=2))
+    driver.main()
+    result = load_result(tmp_path)
+    r1, r2 = result["R_matrix"]["round_1"], result["R_matrix"]["round_2"]
+    slices = result["slices"]
+    expected = sum(r2[s]["ndcg@10"] - r1[s]["ndcg@10"] for s in slices) / len(slices)
+    assert expected > 0
+    assert result["round1_to_final_drift"]["ndcg@10"] == pytest.approx(expected)
+    assert "BWT" not in result

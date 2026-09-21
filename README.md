@@ -64,6 +64,11 @@ registrations or replace the paper draft.
   experiment, generated from a manifest and gated on a round-1 geometry check
 - `validate_e0.py` - independent validator that recomputes every round's
   aggregate from the persisted client states and refuses mismatches
+- `experiences.py`, `memory.py`, `regression.py`, `continual_driver.py`,
+  `validate_continual.py`, `run_continual.sh` - the continual pipeline: a
+  constructed semantic-shift stream over MS MARCO and MS-Shift, the retained-query
+  budget, the retention measures, the experience loop with its baseline arms, its
+  validator and the GPU-machine chain (design in `docs/continual-pipeline-design.md`)
 - `tests/` - unit, integration, mutation and tamper tests
 - `registration/` - the signed pre-registration for the experiment program,
   with predictions and decision rules committed before the data existed

@@ -67,8 +67,9 @@ repeated on a much larger pool when compute allows.
 
 Manifest. `experiences.py` writes one JSON per stream and schedule: seeds, feature and
 clustering records, split membership, corpus ids, chosen counts and the digest of every
-list. Section 14 records the manifest digests. Manifests are built on the Mac; the GPU
-machine only trains and evaluates.
+list. Section 14 records the manifest digests. The feasibility table and the clustering run
+on the laptop; the manifest build itself runs on the GPU machine's CPU, because BM25 over
+the full collection needs more than the laptop's 8 GiB of memory.
 
 ## 3. Training protocol
 

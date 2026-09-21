@@ -5,6 +5,7 @@
 #   bash run_continual.sh profile      # one short run, timed
 #   bash run_continual.sh calibrate    # the recipe grid on the calibration stream
 #   bash run_continual.sh stage1       # all of the above, then power off if POWEROFF=1
+#   bash run_continual.sh pilot        # the registered pilot (after 14.1), then power off
 # Every run is validated before the chain continues; markers record how it ended.
 set -Euo pipefail
 cd "$(dirname "$0")"
@@ -132,11 +133,30 @@ print(json.dumps({"lambda": lam, "runs": runs}))
 PYEOF
 }
 
+pilot() {  # the registered pilot with the frozen recipe (14.1 must exist before this runs)
+  say "pilot"
+  rounds=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["rounds"])' "$OUT/calibration_recipe.json")
+  lr=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["lr"])' "$OUT/calibration_recipe.json")
+  lam=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["lambda"])' "$OUT/calibration_lambda.json")
+  for sched in A B; do
+    run_one "pilot-frozen-$sched-s123" "$MANIFESTS/primary_$sched.json" frozen 123 "$rounds"
+    for seed in 123 2024 3407; do
+      for arm in local fedavg fedavg-replay; do
+        run_one "pilot-$arm-$sched-s$seed" "$MANIFESTS/primary_$sched.json" "$arm" "$seed" "$rounds" --lr "$lr"
+      done
+      run_one "pilot-fedavg-replay-distill-$sched-s$seed" "$MANIFESTS/primary_$sched.json" \
+        fedavg-replay-distill "$seed" "$rounds" --lr "$lr" --lambda_distill "$lam"
+    done
+  done
+  "$PY" t1_gate.py "$OUT" | tee "$OUT/gate.json"
+}
+
 case "$MODE" in
   bootstrap) bootstrap ;;
   manifests) manifests ;;
   profile) profile ;;
   calibrate) calibrate ;;
   stage1) bootstrap; manifests; profile; calibrate; finish DONE ;;
+  pilot) pilot; finish DONE ;;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

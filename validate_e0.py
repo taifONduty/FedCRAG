@@ -1194,6 +1194,9 @@ def validate_run_directory(run_directory, manifest_row=None):
         f"expected {num_rounds} state files, found {len(state_paths)}")
 
     contract = result.get("method_contract") or {}
+    expected_broadcast = contract.get("initial_adapter_state_sha256")
+    _require(isinstance(expected_broadcast, str) and expected_broadcast != "",
+             "result does not record the initial adapter state hash")
     if result["lora_mode"] == "frozen-a":
         # An implicit 'unit' default silently reintroduces the ~1.73x B->dW
         # rescale the frozen-A coordinate axis exists to isolate.
@@ -1231,6 +1234,12 @@ def validate_run_directory(run_directory, manifest_row=None):
             state_dict_sha256(payload["global"])
             == payload["global_state_sha256"],
             f"{round_label}: persisted global hash is invalid")
+        _require(
+            payload["broadcast_state_sha256"] == expected_broadcast,
+            f"{round_label}: broadcast state is not "
+            + ("the recorded initial adapter state" if round_number == 1
+               else f"round_{round_number - 1}'s global state"))
+        expected_broadcast = payload["global_state_sha256"]
 
         _validate_finite_states(payload, round_label)
         _validate_scheme_round(result, round_label)

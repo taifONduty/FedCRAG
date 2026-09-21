@@ -727,3 +727,36 @@ def test_examples_arm_recomputation_actually_uses_the_counts(
     path.write_text(json.dumps(forged))
     with pytest.raises(E0ValidationError):
         validate_run_directory(tmp_path)
+
+
+# ------------------------------------------------- continuity between rounds
+
+
+def shift_every_tensor(payload, delta):
+    """Move broadcast, clients and global by the same constant: every
+    per-round check still holds, but the round no longer connects to its
+    neighbours."""
+    states = [payload["broadcast"], payload["global"], *payload["clients"].values()]
+    for state in states:
+        for tensor in state.values():
+            tensor.add_(delta)
+
+
+def test_round_two_broadcast_must_be_round_one_global(monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "trainable-ab", "uniform", num_rounds=2)
+    validate_run_directory(tmp_path)
+    payload = load_states(tmp_path, 2)
+    shift_every_tensor(payload, 1.0)
+    resave_states(tmp_path, payload, 2, repair_hashes=True)
+    with pytest.raises(E0ValidationError, match="round_2: broadcast"):
+        validate_run_directory(tmp_path)
+
+
+def test_first_broadcast_must_be_the_recorded_initial_state(monkeypatch, tmp_path):
+    build_run(monkeypatch, tmp_path, "trainable-ab", "uniform")
+    validate_run_directory(tmp_path)
+    payload = load_states(tmp_path, 1)
+    shift_every_tensor(payload, 1.0)
+    resave_states(tmp_path, payload, 1, repair_hashes=True)
+    with pytest.raises(E0ValidationError, match="round_1: broadcast"):
+        validate_run_directory(tmp_path)

@@ -126,3 +126,14 @@ def test_a_topic_without_official_evaluation_queries_holds_out_training_queries(
     assert not (set(client["eval_pool"]) & set(client["experiences"]["0"]["train"]))
     queries, qrels = experiences.eval_queries(manifest, root, "1")
     assert set(queries) == set(client["eval_pool"]) == set(qrels)
+
+
+def test_bm25_index_is_built_once_and_reloaded(tmp_path):
+    pytest.importorskip("bm25s")
+    root = synthetic_msmarco(tmp_path)
+    first = experiences.bm25_retriever(root)
+    assert (root / "msmarco-passage" / "bm25s_index" / "ids.json").exists()
+    second = experiences.bm25_retriever(root)
+    queries = ["passage about apples", "passage about physics"]
+    assert first(queries, 3) == second(queries, 3)
+    assert all(len(hits) == 3 for hits in second(queries, 3))

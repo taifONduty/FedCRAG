@@ -341,15 +341,25 @@ def materialise(manifest, root, client, experience, corpus=None):
 
 def bm25_retriever(root):
     """Hard distractors from BM25 over the full collection (needs the memory of the GPU
-    machine, not the laptop)."""
+    machine, not the laptop). The index is built once and saved beside the collection."""
     import bm25s
-    ids, texts = [], []
-    with open(os.path.join(root, "msmarco-passage", "collection.tsv"), newline="") as handle:
-        for row in csv.reader(handle, delimiter="\t"):
-            ids.append(row[0])
-            texts.append(row[1])
-    index = bm25s.BM25()
-    index.index(bm25s.tokenize(texts, stopwords="en"))
+    index_dir = os.path.join(root, "msmarco-passage", "bm25s_index")
+    ids_path = os.path.join(index_dir, "ids.json")
+    if os.path.exists(ids_path):
+        index = bm25s.BM25.load(index_dir)
+        with open(ids_path) as handle:
+            ids = json.load(handle)
+    else:
+        ids, texts = [], []
+        with open(os.path.join(root, "msmarco-passage", "collection.tsv"), newline="") as handle:
+            for row in csv.reader(handle, delimiter="\t"):
+                ids.append(row[0])
+                texts.append(row[1])
+        index = bm25s.BM25()
+        index.index(bm25s.tokenize(texts, stopwords="en"))
+        index.save(index_dir)
+        with open(ids_path, "w") as handle:
+            json.dump(ids, handle)
 
     def retrieve(query_texts, k):
         hits, _ = index.retrieve(bm25s.tokenize(query_texts, stopwords="en"), k=k)

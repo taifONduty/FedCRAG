@@ -884,3 +884,12 @@ client, near the size of an official pool, and the calibration split counts are 
 primary stream (1,354 / 135 / 350) rather than 2,000 / 200 / 500, so the recipe is chosen on
 a stream shaped like the pilot. Neither change touches the official-evaluation path or the
 two primary manifests, which stand as built. No training run had started.
+
+Correction to the third amendment, before any run (2026-09-22 23:55 UTC). The cap of 3,000 was
+too small in the other direction: it left the calibration stream's smallest cell with 171
+evaluation queries, fewer than the 350 a test split needs, and the build refused it. The cap
+is a property of the topic, not of a client, and the four candidate values were evaluated on
+the real counts before rerunning: 3,000 gives a smallest cell of 118, 6,000 gives 247, 8,000
+gives 342 and 12,000 gives 501. The cap is 12,000, the smallest of these that leaves every
+cell above its test count; the corpus then has an upper bound of about 50,600 passages
+against the 60,000 limit. The primary stream does not use this path and its manifests stand.

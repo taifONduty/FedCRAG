@@ -158,7 +158,8 @@ replay suffices. G1 and G2 pass: the method arms are designed and registered.
 Calibration stream: the same construction applied to MS-Shift's "other" cluster, two
 pseudo-clients by k-means (k = 2) and four experiences each, its own manifest. That cluster
 has no official evaluation queries, so its pool is a seeded fifteen percent of its training
-queries, capped at 3,000 per client because every pool passage must fit the fixed corpus;
+queries, capped at 12,000 per topic because every pool passage must fit the fixed corpus, the
+smallest cap that still leaves every cell more evaluation queries than it needs;
 its split counts are those of the primary stream, so the recipe is chosen on a stream shaped
 like the pilot. On it, rounds
 per experience in {2, 4, 8} and learning rate in {2e-5, 5e-5} are compared under arm D and

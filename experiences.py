@@ -126,7 +126,7 @@ def load_eval(root, topic):
 HOLDOUT_FRACTION = 0.15
 # Every pool passage must fit in the client's fixed corpus, so the held-out pool of a topic
 # without official evaluation queries is capped near the size of an official one.
-HOLDOUT_MAX = 3000
+HOLDOUT_MAX = 12000
 
 
 def eval_queries(manifest, root, client):

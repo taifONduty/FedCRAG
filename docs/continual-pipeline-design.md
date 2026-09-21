@@ -58,9 +58,9 @@ never cross a split boundary.
 
 Corpus per client. Fixed for the whole run and identical across experiences: every passage
 judged relevant for any of the client's selected queries, plus deterministic hard
-distractors (the top passages retrieved for the client's training and test queries by the
-frozen Contriever backbone, decided before any training and never by a method under test),
-plus passages sampled uniformly from the collection, to 60,000 passages in all. The full
+distractors (the top BM25 passages for the client's training, guard and test queries over
+the full collection, a frozen lexical process fixed before any training and never a method
+under test), plus passages sampled uniformly from the collection, to 60,000 passages in all. The full
 passage-id list per client is recorded with its digest. This pool size follows CREAM's
 per-topic MS MARCO collections; it is a pilot protocol, and decisive comparisons are to be
 repeated on a much larger pool when compute allows.
@@ -184,7 +184,8 @@ Four new top-level modules and their tests; `federated_forgetting.py` is not cha
 Per round the driver persists the same state payload as the static driver (clients,
 broadcast, global, hashes) so the aggregate can be recomputed from the persisted states.
 
-Dependency added: scikit-learn, for the manifest build only.
+Dependencies added for the manifest build only: scikit-learn (clustering) and bm25s (hard
+distractors).
 
 ## 8. Beyond the pilot
 

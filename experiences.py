@@ -124,6 +124,9 @@ def load_eval(root, topic):
 
 
 HOLDOUT_FRACTION = 0.15
+# Every pool passage must fit in the client's fixed corpus, so the held-out pool of a topic
+# without official evaluation queries is capped near the size of an official one.
+HOLDOUT_MAX = 3000
 
 
 def eval_queries(manifest, root, client):
@@ -206,7 +209,8 @@ def _cells(root, clients, k, seed, minimum, pseudo_clients=1):
         else:
             source = "train-holdout"
             rng = np.random.default_rng([seed, topic, 99])
-            held = rng.choice(len(topic_ids), size=int(HOLDOUT_FRACTION * len(topic_ids)),
+            held = rng.choice(len(topic_ids),
+                              size=min(int(HOLDOUT_FRACTION * len(topic_ids)), HOLDOUT_MAX),
                               replace=False)
             topic_eval = sorted((topic_ids[i] for i in held), key=int)
             eval_q = {q: side[q][0] for q in topic_eval}

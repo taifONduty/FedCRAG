@@ -870,3 +870,17 @@ training-eligible and 350 evaluation-eligible queries) gives 1,354 training, 135
 calibration stream is unaffected at 2,000 / 200 / 500; its evaluation pool is a held-out
 fifteen percent of its own training queries, which the builder already removed from training.
 Everything else in 14 and its first amendment stands.
+
+Third amendment to 14, before any run of the continual driver (2026-09-22 23:44 UTC, the clock
+of the commit that adds it). The two primary manifests (schedules A and B) were built and
+verified at commit e8f98d2. The calibration manifest was then refused by the corpus rule:
+client 50 needed 92,653 relevant and hard passages against a 60,000-passage pool. The cause
+is the size of that stream's evaluation pool. MS-Shift's "other" cluster has 234,037 training
+queries and no official evaluation queries, so a fifteen percent held-out pool is tens of
+thousands of queries, and every pool passage must be in the client's fixed corpus.
+
+Correction, in the calibration stream only: the held-out pool is capped at 3,000 queries per
+client, near the size of an official pool, and the calibration split counts are those of the
+primary stream (1,354 / 135 / 350) rather than 2,000 / 200 / 500, so the recipe is chosen on
+a stream shaped like the pilot. Neither change touches the official-evaluation path or the
+two primary manifests, which stand as built. No training run had started.

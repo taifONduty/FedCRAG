@@ -156,7 +156,11 @@ replay suffices. G1 and G2 pass: the method arms are designed and registered.
 ## 6. Calibration stream and cost
 
 Calibration stream: the same construction applied to MS-Shift's "other" cluster, two
-pseudo-clients by k-means (k = 2) and four experiences each, its own manifest. On it, rounds
+pseudo-clients by k-means (k = 2) and four experiences each, its own manifest. That cluster
+has no official evaluation queries, so its pool is a seeded fifteen percent of its training
+queries, capped at 3,000 per client because every pool passage must fit the fixed corpus;
+its split counts are those of the primary stream, so the recipe is chosen on a stream shaped
+like the pilot. On it, rounds
 per experience in {2, 4, 8} and learning rate in {2e-5, 5e-5} are compared under arm D and
 the pair with the highest mean acquisition is frozen; lambda in {0.5, 1.0, 2.0} is chosen
 under arm E as the value with the lowest G whose A is within 0.005 of the best. No deciding

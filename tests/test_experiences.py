@@ -122,6 +122,7 @@ def test_a_topic_without_official_evaluation_queries_holds_out_training_queries(
         retriever=fake_bm25)
     client = manifest["clients"]["1"]
     assert client["eval_source"] == "train-holdout" and len(client["eval_pool"]) == 9
+    assert experiences.HOLDOUT_MAX > 0
     assert set(client["experiences"]["0"]["test"]) <= set(client["eval_pool"])
     assert not (set(client["eval_pool"]) & set(client["experiences"]["0"]["train"]))
     queries, qrels = experiences.eval_queries(manifest, root, "1")
@@ -209,3 +210,19 @@ def test_official_evaluation_queries_are_kept_out_of_the_training_side(tmp_path)
     assert tested and tested <= set(shared)
     assert not (trained & set(shared))
     experiences.verify_manifest(manifest)
+
+
+def test_a_held_out_pool_is_capped_so_the_corpus_rule_stays_reachable(tmp_path, monkeypatch):
+    """A topic without official evaluation queries can be very large; its held-out pool is
+    capped, because every pool passage must fit in the client's fixed corpus."""
+    root = synthetic_msmarco(tmp_path)
+    for name in ("queries/queries_1.tsv", "qrel/qrel_1.json"):
+        (root / "ms-marco-shift" / "EVAL" / name).unlink()
+    monkeypatch.setattr(experiences, "HOLDOUT_MAX", 4)
+    manifest = experiences.build_manifest(
+        root, clients=(1,), experiences_per_client=1, schedule={1: (0,)},
+        counts={"train": 20, "guard": 4, "test": 3}, corpus_size=120, hard_k=2, seed=5,
+        retriever=fake_bm25)
+    client = manifest["clients"]["1"]
+    assert len(client["eval_pool"]) == 4
+    assert set(client["experiences"]["0"]["test"]) <= set(client["eval_pool"])

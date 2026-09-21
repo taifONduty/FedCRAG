@@ -1092,6 +1092,9 @@ def main():
     model_safe = args.model.replace("/", "_")
     jpath = os.path.join(args.out,
                          f"federated_{model_safe}_seed{args.seed}_{tag}.json")
+    if os.path.exists(jpath):
+        raise SystemExit(f"refusing to overwrite the existing result {jpath}; "
+                         "move it aside or choose another --out")
 
     out = {"seed": args.seed, "slices": args.slices, "model": args.model,
            "metrics": args.metrics, "num_rounds": args.num_rounds,

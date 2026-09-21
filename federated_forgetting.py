@@ -1132,7 +1132,7 @@ def main():
            "provenance": _runtime_provenance(
                commit, args.model, model_path, model, module_scales,
                args.data_root, data_sha256),
-           "args": vars(args), "clients": {}, "R_matrix": {}, "BWT": None}
+           "args": vars(args), "clients": {}, "R_matrix": {}, "round1_to_final_drift": None}
     if dev_data is not None:
         out["dev_split"] = split_record
     if shard_manifest is not None:
@@ -1407,15 +1407,15 @@ def main():
         dump_json(out, jpath)
         torch.cuda.empty_cache()
 
-    bwt = {}
+    drift = {}
     anchor = "round_1"
     final = f"round_{args.num_rounds}"
     for m in args.metrics:
         terms = [R[final][s][m] - R[anchor][s][m] for s in args.slices]
-        bwt[m] = float(np.mean(terms))
-        print(f">>> Federated BWT[{m}] (round1->final) = {bwt[m]:+.4f}")
+        drift[m] = float(np.mean(terms))
+        print(f">>> round1->final drift[{m}] = {drift[m]:+.4f}")
 
-    out["BWT"] = bwt
+    out["round1_to_final_drift"] = drift
     dump_json(out, jpath)
     print(f"saved {jpath}")
 

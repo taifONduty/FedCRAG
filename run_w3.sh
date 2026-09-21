@@ -26,7 +26,7 @@ bwt_of() {  # $1 = result json -> primary-metric BWT or "-"
     "$PYTHON" - "$1" 2>/dev/null <<'EOF' || echo "-"
 import json, sys
 d = json.load(open(sys.argv[1]))
-b = d.get("BWT") or {}
+b = d.get("round1_to_final_drift") or {}
 v = b.get("ndcg@10")
 print(f"{v:+.4f}" if isinstance(v, (int, float)) else "-")
 EOF

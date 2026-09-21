@@ -147,8 +147,9 @@ def _data_fingerprints(data):
     fingerprints = {}
     for slice_name, payload in sorted(data.items()):
         digest = hashlib.sha256()
-        for section in ("corpus", "train_q", "train_qrels",
-                        "eval_q", "eval_qrels"):
+        sections = ["corpus", "train_q", "train_qrels", "eval_q", "eval_qrels"]
+        sections += [s for s in ("dev_q", "dev_qrels") if s in payload]
+        for section in sections:
             digest.update(section.encode("utf-8") + b"\0")
             values = payload.get(section, {})
             for key in sorted(values, key=str):

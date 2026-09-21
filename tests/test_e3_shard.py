@@ -619,3 +619,12 @@ def test_seed_inert_payloads_are_detectable_before_the_gpu_spend():
         nfcorpus_shaped_payload(), "nfcorpus", 3, seeds)
     assert varied > 1, "a tie-rich payload must actually vary with the seed"
     assert len(signatures) == len(seeds)
+
+
+def test_held_out_dev_queries_are_part_of_the_data_fingerprint():
+    def payload(dev_text):
+        return {"corpus": {"d0": {"text": "doc"}},
+                "train_q": {"q0": "train"}, "train_qrels": {"q0": {"d0": 1}},
+                "eval_q": {"q1": "eval"}, "eval_qrels": {"q1": {"d0": 1}},
+                "dev_q": {"q2": dev_text}, "dev_qrels": {"q2": {"d0": 1}}}
+    assert fingerprint(payload("held out")) != fingerprint(payload("changed"))

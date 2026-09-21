@@ -1,3 +1,5 @@
+> Historical (August 2026): planning notes for the FedSpan step policy as implemented then; not current guidance.
+
 # FedSpan E0 Step-Norm Policy Design
 
 **Date:** 2026-08-23  

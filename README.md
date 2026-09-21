@@ -67,7 +67,10 @@ registrations or replace the paper draft.
 - `tests/` - unit, integration, mutation and tamper tests
 - `registration/` - the signed pre-registration for the experiment program,
   with predictions and decision rules committed before the data existed
-- `paper_draft/` - LaTeX source of the paper in progress
+- `paper_draft/` - historical LaTeX draft (August 2026), superseded by
+  `docs/research-status.md`; kept for the record
+- `docs/superpowers/` - historical planning notes for the FedSpan step policy
+  (August 2026)
 
 ## Running
 

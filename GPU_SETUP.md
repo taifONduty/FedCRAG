@@ -43,7 +43,7 @@ PRIMARY=contriever bash run_w3.sh rt     # sequential forgetting, 3 seeds
 PRIMARY=contriever bash run_w3.sh rs     # federated matrix: 3 seeds x 3 weightings, R=15, states saved
 ```
 
-Every finished run auto-appends a row to `runs.tsv` (status, BWT, file paths).
+Every finished run auto-appends a row to `runs.tsv` (status, round drift, file paths).
 Disk: `rs` saves adapter states every round — budget ~10 GB free.
 
 ## 4. Ship results back

@@ -5,7 +5,7 @@
 #
 # E0 ATTRIBUTES CORRECTNESS; IT DOES NOT PRODUCE PAPER NUMBERS.
 # ROUNDS=5 here, while the paper-scale federated matrix in run_w3.sh uses
-# ROUNDS=15 at the same 500-step cap. Drift/BWT/forgetting accumulate with the
+# ROUNDS=15 at the same 500-step cap. Drift and forgetting accumulate with the
 # round count, so an E0 drift number and a paper cell are different quantities
 # and must not be compared or quoted as one another.
 #

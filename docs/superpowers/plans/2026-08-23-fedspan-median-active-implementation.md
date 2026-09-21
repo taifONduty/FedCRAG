@@ -1,3 +1,5 @@
+> Historical (August 2026): planning notes for the FedSpan step policy as implemented then; not current guidance.
+
 # FedSpan Median-Active Step Policy Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

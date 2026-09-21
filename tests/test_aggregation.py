@@ -506,8 +506,8 @@ def test_fedspan_contract_with_real_peft_state_keys():
         task_type=TaskType.FEATURE_EXTRACTION, r=2, lora_alpha=6,
         lora_dropout=0.0, target_modules=["query", "value"]))
     scales = configure_frozen_lora_a(peft_model)
-    with pytest.warns(UserWarning, match="Could not find a config file"):
-        peft_state = get_peft_model_state_dict(peft_model)
+    # peft < 0.21 warns about a missing config file here; the warning is not the subject.
+    peft_state = get_peft_model_state_dict(peft_model)
     broadcast = {k: v.detach().cpu().clone()
                  for k, v in peft_state.items()}
     clients = []

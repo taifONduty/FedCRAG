@@ -151,28 +151,46 @@ def _training_side(root):
 
 # ----------------------------------------------------------------- manifests
 
-def _cells(root, clients, k, seed, minimum):
+def _pseudo_clients(topic, qids, texts, eval_ids, eval_texts, pseudo_clients, seed):
+    """Split one topic into ``pseudo_clients`` clients by a first clustering, fitted on
+    the training text; client id = 10 * topic + index."""
+    if pseudo_clients == 1:
+        return {topic: (qids, eval_ids)}
+    model = cluster_queries(texts, pseudo_clients, seed)
+    eval_assignment = assign_queries(model, eval_texts)
+    return {10 * topic + i: ([q for q, a in zip(qids, model["assignment"]) if a == i],
+                             [q for q, a in zip(eval_ids, eval_assignment) if a == i])
+            for i in range(pseudo_clients)}
+
+
+def _cells(root, clients, k, seed, minimum, pseudo_clients=1):
     """Per client: the clustering model (every sub-cluster at least ``minimum`` training
     queries), its training-side queries by sub-cluster and its evaluation queries by
     sub-cluster."""
     side, train_qrels = _training_side(root)
     cells = {}
     for topic in clients:
-        qids = sorted((q for q, (_, t) in side.items() if t == topic), key=int)
-        model = cluster_with_minimum([side[q][0] for q in qids], k, seed, minimum)
+        topic_ids = sorted((q for q, (_, t) in side.items() if t == topic), key=int)
         eval_q, eval_qrels = load_eval(root, topic)
-        eval_ids = sorted((q for q in eval_q if q in eval_qrels), key=int)
-        eval_assignment = assign_queries(model, [eval_q[q] for q in eval_ids])
-        cells[topic] = {
-            "model": model,
-            "train": {e: [q for q, a in zip(qids, model["assignment"]) if a == e] for e in range(k)},
-            "eval": {e: [q for q, a in zip(eval_ids, eval_assignment) if a == e] for e in range(k)},
-            "eval_qrels": eval_qrels, "eval_q": eval_q}
+        topic_eval = sorted((q for q in eval_q if q in eval_qrels), key=int)
+        split = _pseudo_clients(topic, topic_ids, [side[q][0] for q in topic_ids],
+                                topic_eval, [eval_q[q] for q in topic_eval],
+                                pseudo_clients, seed)
+        for client, (qids, eval_ids) in split.items():
+            model = cluster_with_minimum([side[q][0] for q in qids], k, seed, minimum)
+            eval_assignment = assign_queries(model, [eval_q[q] for q in eval_ids])
+            cells[client] = {
+                "topic": topic, "model": model,
+                "train": {e: [q for q, a in zip(qids, model["assignment"]) if a == e]
+                          for e in range(k)},
+                "eval": {e: [q for q, a in zip(eval_ids, eval_assignment) if a == e]
+                         for e in range(k)},
+                "eval_qrels": eval_qrels, "eval_q": eval_q}
     return cells, side, train_qrels
 
 
-def feasibility(root, clients, k, seed):
-    cells, _, train_qrels = _cells(root, clients, k, seed, minimum=1)
+def feasibility(root, clients, k, seed, pseudo_clients=1):
+    cells, _, train_qrels = _cells(root, clients, k, seed, 1, pseudo_clients)
     table = {}
     for topic, cell in cells.items():
         for e in range(k):
@@ -185,19 +203,19 @@ def feasibility(root, clients, k, seed):
 
 
 def build_manifest(root, clients, experiences_per_client, schedule, counts, corpus_size,
-                   hard_k, seed, retriever, source_digests=None):
+                   hard_k, seed, retriever, source_digests=None, pseudo_clients=1):
     """Sample the splits, assemble each client's fixed corpus and record every list with
     its digest. ``retriever(texts, k)`` returns hard-distractor passage ids per text."""
     k = experiences_per_client
     minimum = counts["train"] + counts["guard"]
-    cells, side, train_qrels = _cells(root, clients, k, seed, minimum)
+    cells, side, train_qrels = _cells(root, clients, k, seed, minimum, pseudo_clients)
     universe = collection_ids(root)
     manifest = {"version": 1, "seed": seed, "counts": dict(counts), "corpus_size": corpus_size,
-                "hard_k": hard_k, "experiences_per_client": k,
+                "hard_k": hard_k, "experiences_per_client": k, "pseudo_clients": pseudo_clients,
                 "source_sha256": source_digests or {}, "clients": {}}
-    for topic in clients:
+    for topic in sorted(cells):
         cell = cells[topic]
-        client = {"topic": topic, "order": list(schedule[topic]),
+        client = {"topic": cell["topic"], "order": list(schedule[topic]),
                   "clustering": cell["model"]["record"], "experiences": {}}
         relevant, queries_for_hard = set(), []
         for e in range(k):
@@ -314,10 +332,13 @@ def main():
     ap.add_argument("--counts", help="JSON {train, guard, test} (build)")
     ap.add_argument("--corpus_size", type=int, default=60000)
     ap.add_argument("--hard_k", type=int, default=10)
+    ap.add_argument("--pseudo_clients", type=int, default=1,
+                    help="split each topic into this many clients (calibration stream)")
     ap.add_argument("--out", help="manifest path (build) or manifest to verify")
     args = ap.parse_args()
     if args.command == "feasibility":
-        table = feasibility(args.data_root, args.clients, args.experiences, args.seed)
+        table = feasibility(args.data_root, args.clients, args.experiences, args.seed,
+                            args.pseudo_clients)
         print("client\texperience\ttrain_eligible\teval_eligible\trelevant_passages")
         for (topic, e), cell in sorted(table.items()):
             print(f"{topic}\t{e}\t{cell['train_eligible']}\t{cell['eval_eligible']}"
@@ -334,7 +355,8 @@ def main():
         "msmarco-passage/qrels.train.tsv", "ms-marco-shift/TRAIN/queries_clustering.tsv")}
     manifest = build_manifest(args.data_root, args.clients, args.experiences, schedule,
                               json.loads(args.counts), args.corpus_size, args.hard_k,
-                              args.seed, bm25_retriever(args.data_root), sources)
+                              args.seed, bm25_retriever(args.data_root), sources,
+                              args.pseudo_clients)
     verify_manifest(manifest)
     with open(args.out, "w") as handle:
         json.dump(manifest, handle)

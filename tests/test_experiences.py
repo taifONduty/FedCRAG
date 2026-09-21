@@ -98,3 +98,17 @@ def test_materialised_cell_has_the_shape_the_trainer_consumes(tmp_path):
     assert len(data["corpus"]) == 120 and set(data["train_q"]) == set(data["train_qrels"])
     assert all(pid in data["corpus"] for rels in data["train_qrels"].values() for pid in rels)
     assert all("text" in doc for doc in data["corpus"].values())
+
+
+def test_a_topic_can_be_split_into_pseudo_clients(tmp_path):
+    root = synthetic_msmarco(tmp_path)
+    manifest = experiences.build_manifest(
+        root, clients=(0,), experiences_per_client=2, schedule={0: (0, 1), 1: (1, 0)},
+        counts={"train": 8, "guard": 2, "test": 1}, corpus_size=120, hard_k=2, seed=5,
+        retriever=fake_bm25, pseudo_clients=2)
+    assert set(manifest["clients"]) == {"0", "1"}
+    assert all(client["topic"] == 0 for client in manifest["clients"].values())
+    assert manifest["clients"]["1"]["order"] == [1, 0]
+    train = [set(cell["train"]) for client in manifest["clients"].values()
+             for cell in client["experiences"].values()]
+    assert not (train[0] & train[2]) and not (train[1] & train[3])

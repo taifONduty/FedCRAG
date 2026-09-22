@@ -1001,3 +1001,15 @@ interrupted part way is never silently resumed. The frozen recipe, the run list,
 manifests and the source commit are fixed before the first run and are not changed in
 response to early scores; a pause is warranted by an implementation or data fault, not by a
 disappointing seed.
+
+Deviation during the pilot (recorded 2026-09-22 21:43 UTC). Section 14 states that test-query
+values are not read before every run of the block has validated. After the first run,
+pilot-frozen-A-s123, validated at 19:36 UTC, its per-client nDCG@10 on the evaluation pools
+(0.6508, 0.5921, 0.5523, 0.4488, 0.4842 for clients 0 to 4) was read and reported. These are
+the untrained backbone's scores; the recipe had been frozen in 14.1 and no run, setting or
+decision was changed in response. The rule is otherwise kept: until all 26 runs validate,
+only wall time, exit status and validation state are read.
+
+Measured cost so far, replacing the projections: pilot-frozen-A-s123 8,248 s, and
+pilot-local-A-s123 7,510 s with 32 rounds validated. The campaign is projected from these
+two measurements at about 57 hours; the distillation arm's own cost is not yet measured.

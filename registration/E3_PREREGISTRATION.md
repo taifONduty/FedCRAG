@@ -893,3 +893,60 @@ the real counts before rerunning: 3,000 gives a smallest cell of 118, 6,000 give
 gives 342 and 12,000 gives 501. The cap is 12,000, the smallest of these that leaves every
 cell above its test count; the corpus then has an upper bound of about 50,600 passages
 against the 60,000 limit. The primary stream does not use this path and its manifests stand.
+
+### 14.1 Manifests, measured cost and the frozen recipe (written 2026-09-22 08:51 UTC, the clock of
+the commit that adds it; stage 1 complete, before any pilot run)
+
+Manifests, built on the L4 at commit e8f98d2 (primary) and c83162e (calibration), each
+verified by experiences.verify_manifest before it was written. Local copy:
+research_workspace/results_vm/T1_20260921/manifests.
+
+    primary_A.json        9bd8a61b7f08c30542de6cca58999b021df8b133f72065f7fa38d54ce451c5b1
+    primary_B.json        989b666ad274c1325c20c4a584cbff637d6df869f172b78db8e9647b86862a9d
+    calibration_cal.json  03e1d9ff15600531fed0ed445d116e6acc02ae77f4b7a488b2d54f60f9d52827
+
+Counts 1,354 / 135 / 350 in all three. Each client's corpus is 60,000 passages: for the five
+primary clients about 13,000 relevant, 31,000 BM25-hard and 15,000 random; for the two
+calibration clients about 18,800, 32,700 and 8,400. Schedules A and B share every split and
+corpus and differ only in each client's order, as designed. Evaluation pools are the whole
+official MS-Shift set per topic (5,868 to 6,595) for the primary clients and 9,254 and 2,746
+held-out training queries for the calibration clients.
+
+Measured cost. The profile run (calibration manifest, two clients, four experiences, one
+round each) took 2,105 s and validated four rounds. Evaluation dominates: about 480,000
+passage encodes at roughly 240 per second. Calibration wall times, two clients: 2,248 and
+2,243 s at two rounds, 2,540 and 2,539 s at four, 3,139 and 3,125 s at eight, and 3,573,
+3,569 and 3,571 s for the three arm-E runs. Extrapolated to five clients at eight rounds,
+about 7,700 s per pilot run, so about 54 hours for the 24 pilot runs and the two frozen
+evaluations on one L4. This replaces the guess of one L4 day in section 6 of the design.
+
+Calibration outcome, arm D, seed 123, acquisition A and regression G:
+
+    rounds  lr      A        G
+    2       2e-5    0.0552   0.01920
+    2       5e-5    0.0719   0.02847
+    4       2e-5    0.0688   0.02632
+    4       5e-5    0.0841   0.02640
+    8       2e-5    0.0825   0.02697
+    8       5e-5    0.0939   0.03788
+
+The registered rule, highest acquisition, selects eight rounds per experience at learning
+rate 5e-5. Acquisition was still rising at both edges of the grid, so this is a boundary
+choice rather than an interior optimum; the grid was fixed before the runs and is not
+widened after seeing them.
+
+Arm E at that recipe, lambda and its A and G: 0.5 gives 0.09109 and 0.01851; 1.0 gives
+0.09144 and 0.01855; 2.0 gives 0.09073 and 0.01830. The registered rule, lowest G among
+those within 0.005 of the best A, selects lambda 2.0.
+
+Frozen recipe for the pilot: eight rounds per experience, learning rate 5e-5, lambda 2.0,
+with the fixed settings of section 14.
+
+Observation to carry into the report, not a gate outcome. On this calibration stream the
+condition stated in section 14 for arm E is met: E's regression 0.01830 is below half of D's
+0.03788, while E's acquisition 0.09073 is within 0.005 of D's 0.09393. Reference
+distillation therefore halves the regression at no measurable cost in acquisition here. This
+is one seed on the two-client calibration stream and is not the gate, which is evaluated on
+the primary stream over three seeds and two schedules; but if it recurs there, the framing
+required by section 14 applies and the paper must position any new mechanism against
+distillation rather than against replay alone.

@@ -950,3 +950,54 @@ is one seed on the two-client calibration stream and is not the gate, which is e
 the primary stream over three seeds and two schedules; but if it recurs there, the framing
 required by section 14 applies and the paper must position any new mechanism against
 distillation rather than against replay alone.
+
+Correction to 14.1 and specification of the distillation arm, before the pilot
+(2026-09-22 17:16 UTC, the clock of the commit that adds it).
+
+The sentence in 14.1 reading "halves the regression at no measurable cost in acquisition" is
+withdrawn as an overstatement. The accurate statement of the same numbers: on the
+single-seed, two-client calibration stream, reference distillation reduces mean positive-part
+regression from 0.03788 to 0.01830, a reduction of 51.7 percent, while acquisition falls from
+0.09393 to 0.09073, a loss of 0.0032, about 3.4 percent of the replay arm's acquisition gain.
+No statistical test was performed and none is claimed; the word "significant" is not used of
+this result. The residual regression of 0.01830 is still 1.83 times the 0.010 practical
+threshold, so distillation reduces the regression substantially and does not eliminate it.
+Whether a further mechanism has a useful role is an open question the pilot exists to
+inform, not a question these two numbers settle.
+
+Specification of arm E, so the arm is reproducible from the record. Teacher: the acquisition
+reference of the immediately preceding experience, that is the shared model at the end of
+experience u - 1, fixed for the whole of experience u and not refreshed within it; at the
+first experience there is no teacher and the arm trains exactly as arm D. Scope: the
+distillation term applies only to replay rows, that is the retained queries of earlier
+experiences, never to rows of the current experience. Loss: for each training batch, scores
+are 20.0 times the cosine between the unit-normalised query and passage embeddings of that
+batch, the same scale and similarity the contrastive loss uses; the term is lambda times the
+mean squared difference between the student's and the teacher's scores over the replay rows
+of the batch, taken over the batch's own passages as candidates. There is no temperature and
+no separate candidate pool. At lambda zero the loss is exactly the contrastive loss, which is
+asserted against the library implementation in tests/test_continual_driver.py, so arms D and E
+differ only by the added term. The teacher's extra forward pass and its stored state are
+recorded as arm E's additional cost and are not charged against the retained-query budget,
+because the teacher is a model, not retained queries.
+
+Retained-query budget, restated because it governs any later method. One budget of 256 query
+ids per client covers replay and any guard queries a method consults online. The pilot's arms
+consult no guard queries, so their whole budget is replay; validate_continual refuses a run
+whose replay holds a guard or test id, whose reserved set holds a test id, or whose training
+ids are anything other than the current experience's training queries together with the
+replay. Guard queries cannot become a second, unaccounted memory.
+
+Reporting. Because regression is measured against each arm's own acquisition reference, an
+arm can show less regression by acquiring less. Every result table therefore reports, beside
+acquisition and positive-part regression, the absolute nDCG@10 on the earlier experiences'
+test queries, the reference's score on the same queries, the per-client and per-experience
+cells, the worst cell and the fraction of cells at or above 0.010.
+
+Launch conditions. The pilot runs only from an approved commit: run_continual.sh refuses
+unless the repository is at EXPECT_COMMIT with a clean working tree and the three manifest
+digests match their recorded SHA256SUMS. Each run records its driver exit status, and a run
+interrupted part way is never silently resumed. The frozen recipe, the run list, the
+manifests and the source commit are fixed before the first run and are not changed in
+response to early scores; a pause is warranted by an implementation or data fault, not by a
+disappointing seed.

@@ -100,11 +100,16 @@ Acquisition reference. For client i and experience u, the shared model at the en
 last round of experience u, stored as an adapter state with its hash, together with its
 per-query scores on the guard and test queries of (i, u).
 
-Distillation (arm E only). The teacher is the acquisition reference of the previous
-experience, fixed for the whole experience. For replay rows in a batch the loss adds
-lambda times the mean squared difference between the student's and the teacher's scaled
-cosine scores over the batch passages; current-experience rows use the contrastive loss
-alone. lambda is 1.0 unless the calibration stream, under the rule in section 6, picks
+Distillation (arm E only). The teacher is the acquisition reference of the immediately
+preceding experience, fixed for the whole experience and not refreshed within it; the first
+experience has no teacher and trains as arm D. For replay rows only, the loss adds lambda
+times the mean squared difference between the student's and the teacher's scores, where a
+score is 20.0 times the cosine between unit-normalised query and passage embeddings over
+the batch's own passages, the same scale the contrastive loss uses. No temperature, no
+separate candidate pool. At lambda zero the loss is exactly the contrastive loss, asserted
+against the library implementation in the tests, so arms D and E differ only by the added
+term. The teacher's forward pass and stored state are arm E's extra cost and are not
+charged against the retained-query budget, which counts queries, not models. lambda is 1.0 unless the calibration stream, under the rule in section 6, picks
 another value from {0.5, 1.0, 2.0}.
 
 ## 4. Measurements

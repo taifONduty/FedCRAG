@@ -108,7 +108,15 @@ def test_fedavg_replay_records_matrix_references_and_memory(stream, tmp_path):
     payloads = [torch.load(path.parent / r["state_file"], weights_only=True) for r in result["rounds"]]
     assert state_dict_sha256(payloads[2]["broadcast"]) == state_dict_sha256(payloads[1]["global"])
     assert result["references"]["0"][str(manifest["clients"]["0"]["order"][0])]["sha256"] == state_dict_sha256(payloads[1]["global"])
-    assert "acquisition" in result["summary"] and "regression" in result["summary"]
+    summary = result["summary"]
+    assert "acquisition" in summary and "regression" in summary
+    # regression is measured against each arm's own reference, so the absolute score on the
+    # same old queries has to be reported beside it
+    cell = next(iter(summary["regression"]["cells"].values()))
+    assert {"regression", "bwt", "peak_forgetting", "final_ndcg", "reference_ndcg"} <= set(cell)
+    assert summary["final_ndcg_on_earlier_experiences"] == pytest.approx(
+        sum(c["final_ndcg"] for c in summary["regression"]["cells"].values())
+        / len(summary["regression"]["cells"]))
 
 
 def test_local_arm_keeps_one_model_per_client(stream, tmp_path):
@@ -151,3 +159,42 @@ def test_validator_refuses_replay_that_holds_a_test_query(stream, tmp_path):
     path.write_text(json.dumps(result))
     with pytest.raises(validate_continual.ContinualValidationError, match="test"):
         validate_continual.validate_run(tmp_path / "out")
+
+
+# ------------------------------------------- the distillation loss at lambda = 0
+
+
+class StubEncoder(torch.nn.Module):
+    """Returns the embeddings it is given, so a loss can be compared exactly."""
+
+    def forward(self, feature):
+        return {"sentence_embedding": feature["embedding"]}
+
+
+def test_zero_lambda_reproduces_the_contrastive_loss_exactly():
+    from sentence_transformers.losses import MultipleNegativesRankingLoss
+    torch.manual_seed(0)
+    features = [{"embedding": torch.randn(6, 8)}, {"embedding": torch.randn(6, 8)}]
+    labels = torch.tensor([1.0, 0.0, 1.0, 1.0, 0.0, 1.0])
+    student, teacher = StubEncoder(), StubEncoder()
+    reference = MultipleNegativesRankingLoss(student)(features, labels)
+    at_zero = driver.ReplayDistillLoss(student, teacher, lam=0.0)(features, labels)
+    assert torch.allclose(at_zero, reference, atol=1e-6)
+    positive = driver.ReplayDistillLoss(student, teacher, lam=2.0)(features, labels)
+    assert positive.item() == pytest.approx(reference.item(), abs=1e-6)
+
+
+def test_the_distillation_term_penalises_moving_away_from_the_teacher():
+    torch.manual_seed(1)
+    features = [{"embedding": torch.randn(4, 8)}, {"embedding": torch.randn(4, 8)}]
+    labels = torch.tensor([1.0, 1.0, 0.0, 0.0])
+    student, teacher = StubEncoder(), StubEncoder()
+    same = driver.ReplayDistillLoss(student, teacher, lam=2.0)(features, labels)
+    reference = driver.ReplayDistillLoss(student, teacher, lam=0.0)(features, labels)
+    assert same.item() == pytest.approx(reference.item(), abs=1e-6)
+
+    class Shifted(StubEncoder):
+        def forward(self, feature):
+            return {"sentence_embedding": feature["embedding"] + 0.5}
+    moved = driver.ReplayDistillLoss(student, Shifted(), lam=2.0)(features, labels)
+    assert moved.item() > reference.item()

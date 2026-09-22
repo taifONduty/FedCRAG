@@ -140,7 +140,12 @@ def summarise(out):
                 cells[f"{c}:{e}:{offset}"] = {
                     "regression": regression.positive_regression(reference, later),
                     "bwt": regression.mean_difference(later, reference),
-                    "peak_forgetting": regression.peak_forgetting(history[:offset - t + 1])}
+                    "peak_forgetting": regression.peak_forgetting(history[:offset - t + 1]),
+                    # regression is relative to each arm's own reference, so the absolute
+                    # score on the same queries is reported beside it: an arm can regress
+                    # less because it acquired less
+                    "final_ndcg": float(np.mean(list(later.values()))),
+                    "reference_ndcg": float(np.mean(list(reference.values())))}
     summary = {"acquisition": acquisition,
                "A": float(np.mean([a for by in acquisition.values() for a in by.values()])),
                "regression": {"cells": cells}}
@@ -148,6 +153,8 @@ def summarise(out):
         by_cell = {tuple(k.split(":")): v["regression"] for k, v in cells.items()}
         summary["regression"].update(regression.cell_summary(by_cell, threshold=0.010))
         summary["G"] = summary["regression"]["mean"]
+        summary["final_ndcg_on_earlier_experiences"] = float(
+            np.mean([v["final_ndcg"] for v in cells.values()]))
     return summary
 
 

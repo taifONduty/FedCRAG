@@ -5,7 +5,10 @@
 #   bash run_continual.sh profile      # one short run, timed
 #   bash run_continual.sh calibrate    # the recipe grid on the calibration stream
 #   bash run_continual.sh stage1       # all of the above, then power off if POWEROFF=1
-#   bash run_continual.sh pilot        # the registered pilot (after 14.1), then power off
+#   EXPECT_COMMIT=<sha> bash run_continual.sh pilot   # the registered pilot (after 14.1)
+# The pilot refuses to start unless the repository is at EXPECT_COMMIT with a clean tree and
+# the manifest digests match; every run records its exit status, and an interrupted run is
+# never silently resumed.
 # Every run is validated before the chain continues; markers record how it ended.
 set -Euo pipefail
 cd "$(dirname "$0")"
@@ -73,13 +76,23 @@ run_one() {  # name manifest arm seed rounds [extra args]
   local name=$1 manifest=$2 arm=$3 seed=$4 rounds=$5; shift 5
   local dir="$OUT/$name"
   if [ -f "$dir/.validated" ]; then say "SKIP $name"; return 0; fi
+  if [ -f "$dir/.running" ]; then
+    say "$name was interrupted on $(cat "$dir/.running"); move it aside before resuming"
+    finish REFUSED
+  fi
   mkdir -p "$dir"
   say "START $name"
+  date -u +%FT%TZ > "$dir/.running"
   local t0=$(date +%s)
+  local rc=0
   "$PY" continual_driver.py --manifest "$manifest" --data_root "$DATA" --arm "$arm" \
-    --seed "$seed" --rounds "$rounds" --out "$dir" "$@" > "$dir/run.log" 2>&1
+    --seed "$seed" --rounds "$rounds" --out "$dir" "$@" > "$dir/run.log" 2>&1 || rc=$?
   echo "$(( $(date +%s) - t0 ))" > "$dir/wall_seconds"
-  "$PY" validate_continual.py "$dir" > "$dir/validation.json"
+  echo "$rc" > "$dir/exit_status"
+  [ "$rc" = "0" ] || { say "FAILED $name (driver exit $rc)"; finish FAILED; }
+  "$PY" validate_continual.py "$dir" > "$dir/validation.json" || {
+    say "FAILED $name (validation)"; finish FAILED; }
+  rm -f "$dir/.running"
   echo ok > "$dir/.validated"
   say "DONE $name ($(cat "$dir/wall_seconds") s)"
 }
@@ -130,8 +143,30 @@ print(json.dumps({"lambda": lam, "runs": runs}))
 PYEOF
 }
 
+require_approved_commit() {
+  [ -n "${EXPECT_COMMIT:-}" ] || {
+    say "EXPECT_COMMIT is not set: the pilot runs only from the approved commit"; finish REFUSED; }
+  local have; have=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+  [ "$have" = "$EXPECT_COMMIT" ] || {
+    say "repository is at $have, not the approved $EXPECT_COMMIT"; finish REFUSED; }
+  git diff --quiet HEAD 2>/dev/null || { say "working tree is dirty"; finish REFUSED; }
+  say "running at approved commit $have"
+}
+
+require_manifests() {
+  [ -f "$MANIFESTS/SHA256SUMS" ] || { say "no manifest digests to check"; finish REFUSED; }
+  ( cd "$MANIFESTS" && sha256sum -c SHA256SUMS ) >> "$LOG" 2>&1 || {
+    say "manifest digests do not match SHA256SUMS"; finish REFUSED; }
+  say "manifest digests verified"
+}
+
 pilot() {  # the registered pilot with the frozen recipe (14.1 must exist before this runs)
   say "pilot"
+  require_approved_commit
+  require_manifests
+  for f in calibration_recipe.json calibration_lambda.json; do
+    [ -f "$OUT/$f" ] || { say "missing $f: the recipe is not frozen"; finish REFUSED; }
+  done
   rounds=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["rounds"])' "$OUT/calibration_recipe.json")
   lr=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["lr"])' "$OUT/calibration_recipe.json")
   lam=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["lambda"])' "$OUT/calibration_lambda.json")

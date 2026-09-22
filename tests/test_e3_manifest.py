@@ -142,3 +142,24 @@ def test_launcher_exits_nonzero_when_a_step_fails(tmp_path):
                           capture_output=True, text=True)
     assert (tmp_path / "FAILED.marker").exists()
     assert proc.returncode != 0
+
+
+def run_continual(tmp_path, mode, **env_extra):
+    env = dict(os.environ, CONTINUAL_OUT=str(tmp_path), **env_extra)
+    return subprocess.run(["bash", "run_continual.sh", mode], env=env,
+                          cwd=Path(__file__).resolve().parents[1],
+                          capture_output=True, text=True)
+
+
+def test_the_pilot_refuses_to_run_from_an_unapproved_commit(tmp_path):
+    proc = run_continual(tmp_path, "pilot", EXPECT_COMMIT="0" * 40)
+    assert proc.returncode != 0
+    assert (tmp_path / "REFUSED.marker").exists()
+    assert "not the approved" in (proc.stdout + proc.stderr)
+
+
+def test_the_pilot_refuses_without_an_approved_commit(tmp_path):
+    proc = run_continual(tmp_path, "pilot")
+    assert proc.returncode != 0
+    assert (tmp_path / "REFUSED.marker").exists()
+    assert "EXPECT_COMMIT" in (proc.stdout + proc.stderr)

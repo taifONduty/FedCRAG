@@ -1272,3 +1272,25 @@ and 36 with it. H4 stands as written, with this B. A fifth hypothesis is added:
 - H5, federation against local training, neither with retained queries: G under C is lower
   than under B0 in at least five of the six runs paired by schedule and seed, and the mean
   nDCG@10 on the earlier experience at the end of the stream is higher under C than under B0.
+
+Second amendment to 16, before any LoTTE run (recorded 2026-09-25 07:42 UTC, the clock of the
+commit that adds it). A no-shift control is added, so that regression caused by learning a new
+experience can be told apart from the per-query churn of continued training, which retrains
+with other seeds already show in nearby work. Control stream (lotte.py no-shift, seed 1): for
+each client, the 4,986 queries selected in lotte_A.json across both experiences are re-split
+at random into two experiences of the same sizes, 1,949 training, 194 guard and 350 test
+queries, with the same corpus and the same judgement rule, so each experience mixes both forum
+groups; schedules A and B order the two as in the LoTTE stream. Arm D runs on it with seeds
+123, 2024 and 3407 under both schedules, six runs: the block has 36 runs without F and 42 with
+it.
+
+- H6, regression beyond churn: G under D on the LoTTE stream is higher than under D on the
+  control in at least five of the six runs paired by schedule and seed, and the share of
+  (query, evaluation) pairs of the earlier experience that lose at least 0.010, pooled over
+  the six runs, is higher on the LoTTE stream.
+
+Also reported, for T1 and for this block, without a pass or fail rule: seed churn. For each
+arm and order, over every pair of seeds, half the mean absolute difference between the two
+seeds' acquisition-reference scores per test query, and half the share of those differences at
+or above 0.010; for two interchangeable models these are on the scale of G and of the loss
+share (seed_churn.py).

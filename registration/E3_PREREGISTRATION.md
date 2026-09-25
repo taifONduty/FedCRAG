@@ -1294,3 +1294,66 @@ arm and order, over every pair of seeds, half the mean absolute difference betwe
 seeds' acquisition-reference scores per test query, and half the share of those differences at
 or above 0.010; for two interchangeable models these are on the scale of G and of the loss
 share (seed_churn.py).
+
+### 15.2 Development study outcome (written 2026-09-25 18:52 UTC, the clock of the commit that adds it; after all five runs validated)
+
+All five runs exited 0 and passed validate_continual; the chain wrote DONE at 17:03:58 UTC on
+2026-09-25. Wall times: D-r4 5,750 s, D-r2 4,841 s, E-0.25 8,436 s, E-0.1 8,403 s, F 8,169 s.
+Results on test queries, recomputed with t1_report.py (no sanity problem), beside the T1
+anchors of the same seed and schedule; development evidence, one seed and one order:
+
+| run | A | G | reference nDCG@10 | nDCG@10 on earlier experiences at the end | pairs losing at least 0.010 |
+|---|---:|---:|---:|---:|---:|
+| D, 2 rounds | 0.0799 | 0.0218 | 0.4754 | 0.4954 | 13.9% |
+| D, 4 rounds | 0.0928 | 0.0189 | 0.4869 | 0.5150 | 12.7% |
+| D, 8 rounds (T1 anchor) | 0.1055 | 0.0238 | 0.4980 | 0.5273 | 14.8% |
+| E, lambda 0.1 | 0.1011 | 0.0164 | 0.4948 | 0.5168 | 11.5% |
+| E, lambda 0.25 | 0.0989 | 0.0157 | 0.4937 | 0.5100 | 11.1% |
+| E, lambda 2.0 (T1 anchor) | 0.0930 | 0.0147 | 0.4905 | 0.4999 | 11.1% |
+| F | 0.0980 | 0.0128 | 0.4953 | 0.5084 | 9.6% |
+
+F kept the full step in 6 of its 24 checked rounds, half a step in 2, a quarter in 2, and the
+broadcast model in 14; the full step's guard regression lay between 0.0083 and 0.0119 in every
+checked round.
+
+Rules of 15, applied by l1_settings.py (output l1_settings.json, sha256
+7a33ca83d65bda804109af328028f23203c790aa5a2ffb19f551bb44da7878d9). Mean nDCG@10 on the guard
+queries of the first three experiences after the last: 0.5224 at lambda 0.1, 0.5172 at 0.25
+and 0.5045 at 2.0, so arm E uses lambda 0.1 on LoTTE. Arm F validated at 17:03:58 UTC on
+2026-09-25, before the deadline of 15, so it enters the LoTTE block. The development records
+are archived with their checksums in gs://fedcrag-t1-archive/D15_20260925.
+
+### 16.1 Launch record for block L1 (written 2026-09-25 18:52 UTC, the clock of the commit that adds it; before its first run)
+
+Manifests, on the L4 in ~/L1_20260925/manifests and archived in
+gs://fedcrag-t1-archive/L1_20260925: lotte_A.json sha256
+d9356cdac79e00fdca36ed58b41cfdbd7af85765e422f55ad25a2d40ef47870e and lotte_B.json sha256
+987f8845ee8f093a11f990dd6b50dd842c379856f414cff44757421489d19442, built by lotte.py at 13eee3e
+in 18 min 54 s with the top-5 hard passages for every client (the top-3 fallback was not
+needed); lotte_iid_A.json sha256
+c56eb7257d05fee55918bffbee4668abd1465b3c0a81a662d7286da781d25557 and lotte_iid_B.json sha256
+d5e8121e8f65ca91b42f348c2389ad57736578db28e5d4d869d8d6b4cf4af22a, built by lotte.py no-shift
+at 49eadcc with seed 1, over the same corpora, with 170 to 191 of each experience's 350 test
+queries from the dev forums. Corpus parts (answer, hard and random passages): lifestyle
+24,248, 16,997 and 18,755; recreation 20,652, 16,984 and 22,364; science 28,805, 19,368 and
+11,827; technology 31,984, 20,525 and 7,491; writing 28,152, 15,740 and 16,108.
+
+Settings from 15.2: arm E with lambda 0.1, and arm F. The block has 42 runs: arms B0 (local),
+B (local-replay), C, D, E, F and the no-shift control of D, each with seeds 123, 2024 and 3407
+under schedules A and B.
+
+Measured cost. A profile run (arm D, one round per experience, lotte_A, seed 123, at 49eadcc)
+took 5,658 s. From its checkpoint times, one evaluation pass over the five 60,000- passage
+corpora takes 1,639 s, three per run, and one training round over the five clients takes 336 s
+without retained queries (60 steps per client) and 381 s with them (68 steps). A full run is
+therefore about 10,300 s for arms without retained queries and 10,700 s with them, before the
+teacher's cost in E and the pool checks in F, which are not yet measured on LoTTE. The block
+takes at least about 124 hours on the L4, a projection that the recorded wall times will
+replace.
+
+Launch. From the commit that adds this section, in ~/L1_20260925: schedule A, then B; within
+each, seeds 123, 2024 and 3407; within each seed, local, local-replay, fedavg, fedavg-replay,
+fedavg-replay-distill, fedavg-replay-accept and the no-shift control, each validated before
+the next starts. The launcher refuses unless the repository is at this commit with a clean
+tree and the four manifest digests match; the machine powers off when the chain ends. Until
+all 42 runs validate, only wall time, exit status and validation state are read.

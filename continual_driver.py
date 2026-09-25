@@ -12,6 +12,7 @@ from sentence_transformers.datasets import NoDuplicatesDataLoader
 from torch.nn import functional as F
 
 import acceptance
+import anchors as rank
 import experiences
 import regression
 from aggregation_schemes import state_dict_sha256
@@ -23,11 +24,12 @@ from federated_forgetting import (_runtime_provenance, _sha256_file, amp_enabled
 from memory import ReplayMemory
 
 ARMS = ("frozen", "local", "local-replay", "fedavg", "fedavg-replay", "fedavg-replay-distill",
-        "fedavg-replay-accept")
+        "fedavg-replay-accept", "fedavg-replay-anchor")
 LOCAL_ARMS = ("local", "local-replay")
-REPLAY_ARMS = ("local-replay", "fedavg-replay", "fedavg-replay-distill", "fedavg-replay-accept")
+REPLAY_ARMS = ("local-replay", "fedavg-replay", "fedavg-replay-distill", "fedavg-replay-accept",
+               "fedavg-replay-anchor")
 SOURCE_FILES = ("continual_driver.py", "experiences.py", "memory.py", "regression.py",
-                "validate_continual.py", "acceptance.py")
+                "validate_continual.py", "acceptance.py", "anchors.py")
 SPLITS = ("guard", "test")
 
 
@@ -113,12 +115,17 @@ def _summarise(scores):
     return {"per_query": per_query, **means}
 
 
-def evaluate(model, state, corpus, cells, experience_ids, q_prefix, d_prefix, batch_size):
-    """Per-query scores of ``state`` on the guard and test queries of the given experiences
-    of one client, against its fixed corpus encoded once."""
+def encode_corpus(model, state, corpus, d_prefix, batch_size):
     cids = list(corpus)
-    c_emb = _encode(model, state, [d_prefix + doc_text(corpus[c]) for c in cids],
-                    batch_size)
+    return cids, _encode(model, state, [d_prefix + doc_text(corpus[c]) for c in cids],
+                         batch_size)
+
+
+def evaluate(model, state, corpus, cells, experience_ids, q_prefix, d_prefix, batch_size,
+             encoded=None):
+    """Per-query scores of ``state`` on the guard and test queries of the given experiences
+    of one client, against its fixed corpus encoded once (or as ``encoded``)."""
+    cids, c_emb = encoded or encode_corpus(model, state, corpus, d_prefix, batch_size)
     out = {}
     for e in experience_ids:
         cell = cells[e]
@@ -228,6 +235,9 @@ def parse_args():
     ap.add_argument("--memory_budget", type=int, default=256)
     ap.add_argument("--lambda_distill", type=float, default=1.0)
     ap.add_argument("--guard_hits", help="per-query BM25 hits of the guard queries (arm F)")
+    ap.add_argument("--lambda_anchor", type=float, default=1.0)
+    ap.add_argument("--anchor_k", type=int, default=10)
+    ap.add_argument("--retention", choices=("random", "fragile"), default="random")
     ap.add_argument("--no_grad_ckpt", action="store_true")
     ap.add_argument("--out", required=True)
     return ap.parse_args()
@@ -236,6 +246,7 @@ def parse_args():
 def main():
     args = parse_args()
     accept = args.arm == "fedavg-replay-accept"
+    anchor = args.arm == "fedavg-replay-anchor"
     if accept and not args.guard_hits:
         raise SystemExit("arm fedavg-replay-accept needs --guard_hits")
     torch.manual_seed(args.seed)
@@ -293,6 +304,9 @@ def main():
     states = {c: _clone(initial) for c in clients} if local else None
     global_state = None if local else _clone(initial)
     teacher_state, reference_states = None, []
+    anchors = {c: {} for c in clients}
+    if anchor:
+        out["anchors_sha256"] = {c: {} for c in clients}
     for t in range(T):
         current = {c: orders[c][t] for c in clients}
         guards = {}
@@ -303,8 +317,12 @@ def main():
                                               corpora[c], hits[c], reference_states,
                                               [args.seed, int(c), t], q_prefix, d_prefix,
                                               args.eval_batch_size)
-                memories[c].refill({str(orders[c][s]): list(cells[c][orders[c][s]]["train_q"])
-                                    for s in range(t)})
+                past = {str(orders[c][s]): list(cells[c][orders[c][s]]["train_q"])
+                        for s in range(t)}
+                if anchor and args.retention == "fragile":
+                    past = {e: sorted(ids, key=lambda q: (anchors[c][q]["margin"], q))
+                            for e, ids in past.items()}
+                memories[c].refill(past, ranked=anchor and args.retention == "fragile")
             for r in range(R):
                 record = {"position": t, "round": r, "experience": current,
                           "memory": {c: {**memories[c].record(), "used": memories[c].used}
@@ -316,7 +334,15 @@ def main():
                     data = training_data(cells[c], current[c], memories[c].ids)
                     record["training_ids_sha256"][c] = _digest(sorted(data["train_q"]))
                     start = states[c] if local else broadcast
-                    if args.arm == "fedavg-replay-distill" and teacher_state is not None:
+                    if anchor and t > 0:
+                        anchored = [(q_prefix + data["train_q"][q],
+                                     [d_prefix + doc_text(corpora[c][p])
+                                      for p in anchors[c][q]["pids"]],
+                                     anchors[c][q]["scores"]) for q in memories[c].ids]
+                        new, n_examples, n_steps = rank.client_train_anchor(
+                            model, start, data, anchored, q_prefix, d_prefix, args.batch_size,
+                            args.lr, args.lambda_anchor, [args.seed, int(c), t, r])
+                    elif args.arm == "fedavg-replay-distill" and teacher_state is not None:
                         new, n_examples, n_steps = client_train_distill(
                             model, teacher, start, teacher_state, data, memories[c].ids,
                             q_prefix, d_prefix, args.batch_size, args.lr, c,
@@ -350,9 +376,20 @@ def main():
         out["matrix"][str(t)] = {}
         for c in clients:
             state = initial if args.arm == "frozen" else (states[c] if local else global_state)
+            encoded = encode_corpus(model, state, corpora[c], d_prefix, args.eval_batch_size)
             scored = evaluate(model, state, corpora[c], cells[c],
                               [orders[c][s] for s in range(t + 1)],
-                              q_prefix, d_prefix, args.eval_batch_size)
+                              q_prefix, d_prefix, args.eval_batch_size, encoded)
+            if anchor and t < T - 1:
+                cell = cells[c][current[c]]
+                qids = list(cell["train_q"])
+                q_emb = _encode(model, state, [q_prefix + cell["train_q"][q] for q in qids],
+                                args.eval_batch_size)
+                made = rank.rank_anchors(q_emb, qids, cell["train_qrels"], encoded[1],
+                                         encoded[0], args.anchor_k)
+                anchors[c].update(made)
+                out["anchors_sha256"][c][str(current[c])] = _digest(
+                    [json.dumps(made[q], sort_keys=True) for q in sorted(made)])
             out["matrix"][str(t)][c] = scored
             out["references"][c][str(current[c])] = {
                 "position": t, "sha256": state_dict_sha256(state),

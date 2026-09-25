@@ -10,6 +10,8 @@
 #     bash run_continual.sh dev                        # the development study (section 15)
 #   CONTINUAL_OUT=<dir> EXPECT_COMMIT=<sha> bash run_continual.sh lotte-profile   # one short LoTTE run, timed
 #   CONTINUAL_OUT=<dir> EXPECT_COMMIT=<sha> bash run_continual.sh lotte  # the LoTTE block (after 16.1)
+#   CONTINUAL_OUT=<dir> CONTINUAL_MANIFESTS=<T1 manifests> EXPECT_COMMIT=<sha> \
+#     bash run_continual.sh rar-dev                    # rank-anchored replay development (section 17)
 # The pilot refuses to start unless the repository is at EXPECT_COMMIT with a clean tree and
 # the manifest digests match; every run records its exit status, and an interrupted run is
 # never silently resumed.
@@ -249,6 +251,21 @@ lotte() {  # the LoTTE confirmation block (section 16; 16.1 must exist before th
   done
 }
 
+rar_dev() {  # rank-anchored replay development (section 17): schedule A, seed 123
+  say "rar-dev"
+  require_approved_commit
+  require_manifests
+  local m="$MANIFESTS/primary_A.json"
+  run_one rar-fedavg-replay-A-s123 "$m" fedavg-replay 123 8 --lr 5e-5
+  for retention in random fragile; do
+    for lam in 0.5 2.0; do
+      run_one "rar-anchor-lam$lam-$retention-A-s123" "$m" fedavg-replay-anchor 123 8 \
+        --lr 5e-5 --lambda_anchor "$lam" --anchor_k 10 --retention "$retention"
+    done
+  done
+  "$PY" rar_settings.py "$OUT" | tee "$OUT/rar_settings.json"
+}
+
 case "$MODE" in
   bootstrap) bootstrap ;;
   manifests) manifests ;;
@@ -259,5 +276,6 @@ case "$MODE" in
   dev) dev; finish DONE ;;
   lotte-profile) lotte_profile; finish DONE ;;
   lotte) lotte; finish DONE ;;
+  rar-dev) rar_dev; finish DONE ;;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

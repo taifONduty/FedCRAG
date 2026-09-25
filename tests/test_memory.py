@@ -56,3 +56,9 @@ def test_guard_redraw_replaces_the_guard_and_leaves_replay_the_rest_of_the_budge
     plain = ReplayMemory(budget=6, seed=7)
     plain.refill(PAST)
     assert memory.ids == plain.ids
+
+
+def test_ranked_refill_keeps_the_first_of_each_list_in_the_same_shares():
+    ranked = ReplayMemory(budget=10, seed=7)
+    ranked.refill({"e0": [f"q{i}" for i in range(50)], "e1": ["a", "b"]}, ranked=True)
+    assert ranked.ids == [f"q{i}" for i in range(8)] + ["a", "b"]

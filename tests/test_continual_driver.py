@@ -229,3 +229,26 @@ def test_acceptance_arm_keeps_a_ruled_step_that_the_validator_checks(stream, tmp
     path.write_text(json.dumps(result))
     with pytest.raises(validate_continual.ContinualValidationError, match="acceptance rule"):
         validate_continual.validate_run(tmp_path / "out")
+
+
+def test_anchor_arm_anchors_every_replayed_query_and_validates(stream, tmp_path, monkeypatch):
+    calls = []
+
+    def fake_anchor(model, start, data, anchored, q_prefix, d_prefix, batch_size, lr, lam, seed):
+        calls.append(anchored)
+        new = {k: v.clone() for k, v in start.items()}
+        new["lora_B"] = new["lora_B"] + 0.1
+        return new, len(data["train_q"]), 3
+
+    monkeypatch.setattr(driver.rank, "client_train_anchor", fake_anchor)
+    random_run, _, _ = run(stream, "fedavg-replay-anchor", tmp_path / "random", ["--anchor_k", "3"])
+    fragile_run, _, _ = run(stream, "fedavg-replay-anchor", tmp_path / "fragile",
+                            ["--anchor_k", "3", "--retention", "fragile"])
+    for out in ("random", "fragile"):
+        validate_continual.validate_run(tmp_path / out)
+    assert calls and all(len(texts) == 3 and len(scores) == 3
+                         for anchored in calls for _, texts, scores in anchored)
+    assert all(set(r["anchors_sha256"]["0"]) == {str(stream[1]["clients"]["0"]["order"][0])}
+               for r in (random_run, fragile_run))
+    replayed = lambda result: [r["memory"]["0"]["replay"] for r in result["rounds"][2:]]
+    assert replayed(random_run) != replayed(fragile_run)

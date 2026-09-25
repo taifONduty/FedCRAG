@@ -78,6 +78,8 @@ registrations or replace the paper draft.
   clients, each topic's dev and test forums as its two experiences
 - `acceptance.py` - arm F of the development study (registration section 15): a
   reference-based acceptance check on the server's update
+- `l1_settings.py` - the rules of registration section 15 that fix the LoTTE block's
+  distillation weight and whether the acceptance arm enters
 - `t1_gate.py`, `t1_report.py` - the pilot's registered gate, and its report
   recomputed from the per-query records without the production metric code
 - `tests/` - unit, integration, mutation and tamper tests

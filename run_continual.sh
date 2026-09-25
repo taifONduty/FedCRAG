@@ -8,6 +8,8 @@
 #   EXPECT_COMMIT=<sha> bash run_continual.sh pilot   # the registered pilot (after 14.1)
 #   CONTINUAL_OUT=<dir> CONTINUAL_MANIFESTS=<T1 manifests> EXPECT_COMMIT=<sha> \
 #     bash run_continual.sh dev                        # the development study (section 15)
+#   CONTINUAL_OUT=<dir> EXPECT_COMMIT=<sha> bash run_continual.sh lotte-profile   # one short LoTTE run, timed
+#   CONTINUAL_OUT=<dir> EXPECT_COMMIT=<sha> bash run_continual.sh lotte  # the LoTTE block (after 16.1)
 # The pilot refuses to start unless the repository is at EXPECT_COMMIT with a clean tree and
 # the manifest digests match; every run records its exit status, and an interrupted run is
 # never silently resumed.
@@ -204,6 +206,47 @@ dev() {  # the development study (section 15): schedule A, seed 123
     --guard_hits "$hits"
 }
 
+lotte_profile() {
+  say "lotte-profile"
+  require_approved_commit
+  require_manifests
+  run_one l1-profile-r1 "$MANIFESTS/lotte_A.json" fedavg-replay 123 1 --lr 5e-5
+  "$PY" - "$OUT/l1-profile-r1" <<'PYEOF'
+import glob, json, sys
+d = sys.argv[1]; r = json.load(open(glob.glob(d + "/continual_*.json")[0]))
+print(json.dumps({"wall_seconds": int(open(d + "/wall_seconds").read()),
+                  "steps": [rec["steps"] for rec in r["rounds"]]}, indent=1))
+PYEOF
+}
+
+lotte() {  # the LoTTE confirmation block (section 16; 16.1 must exist before this runs)
+  say "lotte"
+  require_approved_commit
+  require_manifests
+  local settings="$OUT/l1_settings.json"
+  [ -f "$settings" ] || { say "missing $settings: the settings of 15 are not fixed"; finish REFUSED; }
+  local lam accept
+  lam=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["lambda"])' "$settings")
+  accept=$("$PY" -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["accept"]))' "$settings")
+  for sched in A B; do
+    local m="$MANIFESTS/lotte_$sched.json" hits="$OUT/guard_hits_lotte_$sched.json"
+    if [ "$accept" = 1 ] && [ ! -f "$hits" ]; then
+      "$PY" lotte.py guard-hits --manifest "$m" --out "$hits"
+    fi
+    for seed in 123 2024 3407; do
+      for arm in local local-replay fedavg fedavg-replay; do
+        run_one "l1-$arm-$sched-s$seed" "$m" "$arm" "$seed" 8 --lr 5e-5
+      done
+      run_one "l1-fedavg-replay-distill-$sched-s$seed" "$m" fedavg-replay-distill "$seed" 8 \
+        --lr 5e-5 --lambda_distill "$lam"
+      if [ "$accept" = 1 ]; then
+        run_one "l1-fedavg-replay-accept-$sched-s$seed" "$m" fedavg-replay-accept "$seed" 8 \
+          --lr 5e-5 --guard_hits "$hits"
+      fi
+    done
+  done
+}
+
 case "$MODE" in
   bootstrap) bootstrap ;;
   manifests) manifests ;;
@@ -212,5 +255,7 @@ case "$MODE" in
   stage1) bootstrap; manifests; profile; calibrate; finish DONE ;;
   pilot) pilot; finish DONE ;;
   dev) dev; finish DONE ;;
+  lotte-profile) lotte_profile; finish DONE ;;
+  lotte) lotte; finish DONE ;;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

@@ -1112,3 +1112,62 @@ process, the final state again reproduces all 1,940 recorded scores, and the unt
 backbone gives the five changed scores that 14.2 measured after a training call. T1's
 trained-state scores, G, backward transfer and absolute scores are unaffected; its A carries
 the difference measured in 14.2.
+
+### 15 Development study on the T1 streams (registered 2026-09-25 06:49 UTC, the clock of the commit that adds it; before any of its runs)
+
+Status. Development. These runs characterise the trade-off between acquisition and
+regression on the streams read in 14.2, and fix, by the rules below, three settings of the
+LoTTE confirmation block, which is registered separately before any LoTTE run. No result here
+is a confirmatory claim.
+
+Fixed. Manifest primary_A (schedule A, digest 9bd8a61b), seed 123, and the recipe of 14.1
+except where a run below changes it: learning rate 5e-5, LoRA rank 16, batch 32, one local
+epoch per round, a retained-query budget of 256, scoring under explicit fp16 autocast. The
+runs start from the commit that implements arm F with its tests passing; 15.1 records that
+commit and the digests before the first run.
+
+Runs, each validated by validate_continual:
+1. D-r4: arm D, 4 rounds per experience.
+2. D-r2: arm D, 2 rounds per experience.
+3. E-0.25: arm E, lambda 0.25, 8 rounds per experience.
+4. E-0.1: arm E, lambda 0.1, 8 rounds per experience.
+5. F: arm F below, 8 rounds per experience.
+T1's pilot-fedavg-replay-A-s123 (arm D, 8 rounds) and pilot-fedavg-replay-distill-A-s123
+(arm E, lambda 2.0) are the anchors.
+
+Arm F, fedavg-replay-accept: arm D with a reference-based acceptance check on the server's
+update, inside the same budget. From the second experience on, each client's 256 retained
+queries are 64 guard queries and 192 replay queries. The guard queries are drawn from the
+guard splits of the client's earlier experiences by the equal-share, seeded rule that draws
+replay, and are redrawn at the start of each experience; replay fills the other 192 slots as
+in arm D. Check pool, per client and experience: the relevant passages of its guard queries,
+the top-5 BM25 passages of each guard query, and 1,000 passages drawn from the client's corpus
+with a fixed seed. The top-5 passages come from the saved BM25 index of the manifest build and
+the same query texts; the build cached only the union of each client's hits, so they are
+computed once into a side file whose digest every F run records. A guard query's score is its
+nDCG@10 ranked within the pool. At the start of each experience every guard query is scored
+within the pool under the acquisition reference of the experience it belongs to. In every
+round, with g the model broadcast at the start of the round and c the uniform average of the
+clients' trained states, the server tries the step sizes 1, 1/2 and 1/4 in that order on
+g + s(c - g) and keeps the first whose mean positive-part regression over all clients' guard
+queries (reference score minus candidate score, floored at zero) is at most 0.010; if none
+qualifies, g is kept for the round. Each round records the steps tried, their regressions and
+the step kept. validate_continual recomputes the kept model from the persisted states and
+checks the recorded choice against the rule. Guard scores use the same fp16 autocast as every
+other score.
+
+Rules fixed now for the LoTTE block:
+- Arm D keeps 8 rounds per experience. D-r4 and D-r2 only characterise the trade-off.
+- Arm E uses the lambda among 0.1, 0.25 and 2.0 with the highest mean nDCG@10 on the guard
+  queries of the first three experiences after the last experience; a tie goes to the smaller
+  lambda.
+- Arm F enters the LoTTE block only if it is implemented, tested and its run here has
+  validated by 2026-09-30 23:59 UTC; otherwise it is left to the method study.
+
+Reported for every run: A, G, backward transfer, the absolute nDCG@10 on earlier experiences
+beside the reference nDCG@10, the per-client and per-experience cells, and for arm F the step
+kept in every round. The (A, G) points of arm D at 2, 4 and 8 rounds and of arm E at each
+lambda are shown together.
+
+Cost at T1's measured run times: at most 7,955 s for each D run, about 9,137 s for each E run,
+and for F the time of a D run plus its pool checks, at most about 0.6 million passage encodes.

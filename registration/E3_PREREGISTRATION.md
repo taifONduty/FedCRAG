@@ -1357,3 +1357,52 @@ fedavg-replay-distill, fedavg-replay-accept and the no-shift control, each valid
 the next starts. The launcher refuses unless the repository is at this commit with a clean
 tree and the four manifest digests match; the machine powers off when the chain ends. Until
 all 42 runs validate, only wall time, exit status and validation state are read.
+
+Corrections to 15.2 and 16.1 (recorded 2026-09-25 19:09 UTC, the clock of the commit that adds
+them; the L4 block runs from 372b62b, which contains both sections as written). In 15.2, the
+full step's guard regression under F did not lie between 0.0083 and 0.0119 in every checked
+round: across the 24 checked rounds it ranged from 0.0023 to 0.0119, below 0.010 in the first
+rounds of each later stage and between 0.0101 and 0.0119 in most later rounds. In 16.1,
+"60,000- passage corpora" should read "60,000-passage corpora". Neither changes a setting, a
+rule or a result.
+
+### 17 Method development: rank-anchored replay (registered 2026-09-25 19:09 UTC, the clock of the commit that adds it; before any of its runs)
+
+Status. Development. These runs decide, by the rule below, whether rank-anchored replay (RAR)
+is confirmed on LoTTE and in which configuration. The LoTTE method block is registered
+separately as 18 before any score of block L1 is read.
+
+Method (anchors.py, driver arm fedavg-replay-anchor, commit 0699c8c). Arm D, plus rank
+anchors. When a client finishes an experience, each training query of that experience keeps
+the ten passages of the client's corpus that the experience's acquisition reference ranks
+highest, with their scores (20 times the cosine), taken from the reference's own evaluation
+pass. In every later round, the loss adds lambda times the KL divergence from the stored
+softmax distribution over those ten passages to the current one, for the client's retained
+queries, each retained query once per round: at every step, the next ceil(256 / steps)
+retained queries in a seeded order. The anchors are kept for every training query of a
+finished experience because replay draws from all of them, as in D; no teacher model is kept.
+Retention is either random, as in D, or fragile: each earlier experience's share of the budget
+goes to its training queries with the smallest margin under their reference, the score of the
+best relevant passage minus the score of the best non-relevant one. The first experience
+trains exactly as D. Rationale, from the development evidence in 14.2 and 15.2: distillation
+constrains a replayed query's scores against the passages of a random batch and pays for it in
+acquisition, whereas nDCG@10 is decided by the passages at the top of the query's own ranking;
+and each query is anchored to the model that acquired it, not to the previous one.
+
+Runs, on the Azure T4 (NC4as_T4_v3) in ~/R17_20260925, all with manifest primary_A.json
+(sha256 9bd8a61b7f08c30542de6cca58999b021df8b133f72065f7fa38d54ce451c5b1), seed 123, the
+recipe of 14.1 and anchors of depth 10, in this order: D, the same-hardware baseline; then RAR
+with lambda 0.5 and 2.0 under random retention; then the same under fragile retention: five
+runs. The T4's MS MARCO files and MS-Shift commit are identical to the L4's (the digests
+match).
+
+Rule (rar_settings.py). Among the four RAR runs whose A is at least D's A on the T4 minus
+0.005, the one with the highest mean nDCG@10 on the guard queries of the first three
+experiences after the last experience; a tie goes to the smaller lambda and then to random
+retention. That configuration enters block 18 only if its guard score is higher than D's on
+the T4. Otherwise RAR is reported as a negative development result and no method block runs.
+
+Reported for every run: A, G, backward transfer, the absolute nDCG@10 on earlier experiences
+beside the reference nDCG@10, the per-client and per-experience cells, and the wall time on
+the T4, which is not comparable with the L4's. Test scores of these runs are read only after
+all five validate.

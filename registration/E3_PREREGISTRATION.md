@@ -1099,15 +1099,16 @@ of 0.020. G, backward transfer and the trained states' absolute scores are each 
 within one condition.
 
 Scoring precision (recorded 2026-09-25 06:45 UTC, the clock of the commit that adds it).
-The difference left unexplained in 14.2 has a cause. With mixed precision on CUDA, sentence-
-transformers' training call leaves the model's forward wrapped in fp16 autocast, and the
-wrapper stays after training. In block T1 every trained state was therefore scored under fp16
-autocast, and the untrained backbone, scored at the start of each run before any training, in
-fp32. In a fresh process, scoring the restored final state of pilot-fedavg-replay-A-s123 under
-explicit fp16 autocast reproduces all 1,940 recorded scores on client 0, and the wrapper is
-present on the model after one training call and absent before it. From the commit that adds
-this note, continual_driver scores every state, the untrained backbone included, under
-explicit fp16 autocast. With that code and no training in the process, the final state again
-reproduces all 1,940 recorded scores, and the untrained backbone gives the five changed scores
-that 14.2 measured after a training call. T1's trained-state scores, G, backward transfer and
-absolute scores are unaffected; its A carries the difference measured in 14.2.
+The difference left unexplained in 14.2 has a cause. With mixed precision on CUDA,
+sentence-transformers' training call leaves the model's forward wrapped in fp16 autocast, and
+the wrapper stays after training. In block T1 every trained state was therefore scored under
+fp16 autocast, and the untrained backbone, scored at the start of each run before any
+training, in fp32. In a fresh process, scoring the restored final state of
+pilot-fedavg-replay-A-s123 under explicit fp16 autocast reproduces all 1,940 recorded scores
+on client 0, and the wrapper is present on the model after one training call and absent before
+it. From the commit that adds this note, continual_driver scores every state, the untrained
+backbone included, under explicit fp16 autocast. With that code and no training in the
+process, the final state again reproduces all 1,940 recorded scores, and the untrained
+backbone gives the five changed scores that 14.2 measured after a training call. T1's
+trained-state scores, G, backward transfer and absolute scores are unaffected; its A carries
+the difference measured in 14.2.

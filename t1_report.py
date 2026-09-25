@@ -19,12 +19,12 @@ PAIRS = [("fedavg-replay-distill", "fedavg-replay"), ("fedavg-replay", "local"),
 TOL = 1e-12
 
 
-def load(out_dir):
+def load(out_dir, prefix="pilot"):
     runs = {}
-    for path in sorted(glob.glob(os.path.join(out_dir, "pilot-*", "continual_*.json"))):
+    for path in sorted(glob.glob(os.path.join(out_dir, f"{prefix}-*", "continual_*.json"))):
         name = os.path.basename(os.path.dirname(path))
         rest, seed = name.rsplit("-s", 1)
-        arm, schedule = rest[len("pilot-"):].rsplit("-", 1)
+        arm, schedule = rest[len(prefix) + 1:].rsplit("-", 1)
         with open(path) as f:
             record = json.load(f)
         with open(os.path.join(os.path.dirname(path), "wall_seconds")) as f:
@@ -115,7 +115,8 @@ def run_summary(r, acq, hist):
         "end_ndcg_earlier": np.mean([h["current_ndcg"] for h in final]),
         "end_ndcg_all": np.mean([mean_score(r["matrix"][end][c][str(e)])
                                  for c in r["clients"] for e in r["order"][c]]),
-        "pool_ndcg": np.mean([r["eval_pool"][c]["ndcg@10"] for c in r["clients"]]),
+        "pool_ndcg": (np.mean([r["eval_pool"][c]["ndcg@10"] for c in r["clients"]])
+                      if r["eval_pool"] else float("nan")),
         "query_loss_rate": float(np.mean(losses >= LOSS)),
         "severe_loss_rate": float(np.mean(losses >= SEVERE_LOSS)),
         "cells_over": int(sum(h["regression"] >= G_THRESHOLD for h in hist)),
@@ -163,16 +164,17 @@ def gate_section(per_run):
             f" A_E {ae:.6f} >= A_D - 0.005 {ad - 0.005:.6f}: {ae >= ad - 0.005}", ""]
 
 
-def arms_section(per_run):
+def arms_section(per_run, arms=ARMS,
+                 title="All arms (mean over runs; frozen is one seed per schedule)"):
     cols = [("A", "A"), ("G", "G"), ("bwt", "BWT"), ("peak_forgetting", "peak forg."),
             ("reference_ndcg", "ref nDCG"), ("current_ndcg_earlier", "nDCG earlier"),
             ("end_ndcg_earlier", "end nDCG earlier"), ("end_ndcg_all", "end nDCG all"),
             ("pool_ndcg", "pool nDCG"), ("query_loss_rate", "q loss>=.01"),
             ("severe_loss_rate", "q loss>=.1"), ("wall", "wall s")]
-    lines = ["## All arms (mean over runs; frozen is one seed per schedule)", "",
+    lines = [f"## {title}", "",
              "| arm | runs | " + " | ".join(c[1] for c in cols) + " |",
              "|---|---:|" + "---:|" * len(cols)]
-    for arm in ARMS:
+    for arm in arms:
         means = {k: np.mean(arm_values(per_run, arm, k)) for k, _ in cols}
         lines.append(f"| {arm} | {len(arm_values(per_run, arm, 'A'))} | " + " | ".join(
             f"{means[k]:.0f}" if k == "wall" else fmt(means[k]) for k, _ in cols) + " |")
@@ -182,11 +184,11 @@ def arms_section(per_run):
                     " end. Pool nDCG: final model on the client's eval pool.", ""]
 
 
-def runs_section(per_run):
+def runs_section(per_run, arms=ARMS):
     lines = ["## Six runs", "", "| arm | schedule | seed | A | G | A guard | G guard |"
              " end nDCG earlier | cells G>=.01 | worst cell |",
              "|---|---|---:|" + "---:|" * 6 + "---|"]
-    for k in sorted(per_run, key=lambda k: (ARMS.index(k[0]), k[1], k[2])):
+    for k in sorted(per_run, key=lambda k: (arms.index(k[0]), k[1], k[2])):
         p = per_run[k]
         lines.append(f"| {k[0]} | {k[1]} | {k[2]} | {fmt(p['A'])} | {fmt(p['G'])} |"
                      f" {fmt(p['A_guard'])} | {fmt(p['G_guard'])} | {fmt(p['end_ndcg_earlier'])} |"
@@ -194,12 +196,12 @@ def runs_section(per_run):
     return lines
 
 
-def paired_section(per_run):
+def paired_section(per_run, pairs=PAIRS):
     measures = ("A", "G", "end_ndcg_earlier", "end_ndcg_all", "pool_ndcg")
     lines = ["", "## Paired differences, same schedule and seed", "",
              "| pair | dA | dG | d end nDCG earlier | d end nDCG all | d pool nDCG |"
              " runs with dG<0 |", "|---|---:|---:|---:|---:|---:|---:|"]
-    for x, y in PAIRS:
+    for x, y in pairs:
         keys = [k for k in per_run if k[0] == x]
         diffs = {m: [per_run[k][m] - per_run[(y,) + k[1:]][m] for k in keys] for m in measures}
         lines.append(f"| {x} - {y} | " + " | ".join(fmt(np.mean(v)) for v in diffs.values())
@@ -207,9 +209,9 @@ def paired_section(per_run):
     return lines
 
 
-def client_age_section(cell_rows):
+def client_age_section(cell_rows, arms=TRAINED_ARMS):
     lines = ["", "## Regression by client and experience age (test, mean over the six runs)", ""]
-    for arm in TRAINED_ARMS:
+    for arm in arms:
         rows = [c for c in cell_rows if c["arm"] == arm]
         ages = sorted({c["age"] for c in rows})
         lines += [f"### {arm}", "", "| client | " + " | ".join(f"age {a}" for a in ages)

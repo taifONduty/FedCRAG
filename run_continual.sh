@@ -6,6 +6,8 @@
 #   bash run_continual.sh calibrate    # the recipe grid on the calibration stream
 #   bash run_continual.sh stage1       # all of the above, then power off if POWEROFF=1
 #   EXPECT_COMMIT=<sha> bash run_continual.sh pilot   # the registered pilot (after 14.1)
+#   CONTINUAL_OUT=<dir> CONTINUAL_MANIFESTS=<T1 manifests> EXPECT_COMMIT=<sha> \
+#     bash run_continual.sh dev                        # the development study (section 15)
 # The pilot refuses to start unless the repository is at EXPECT_COMMIT with a clean tree and
 # the manifest digests match; every run records its exit status, and an interrupted run is
 # never silently resumed.
@@ -15,7 +17,7 @@ cd "$(dirname "$0")"
 PY="${CONTINUAL_PYTHON:-$PWD/.venv/bin/python}"
 DATA="${CONTINUAL_DATA_ROOT:-$PWD/beir_data}"
 OUT="${CONTINUAL_OUT:-$HOME/T1_20260921}"
-MANIFESTS="$OUT/manifests"
+MANIFESTS="${CONTINUAL_MANIFESTS:-$OUT/manifests}"
 MSSHIFT_COMMIT=07e873ce1da65ad5a42a092d4c87217e31f80518
 MODE="${1:-stage1}"
 mkdir -p "$OUT" "$MANIFESTS"
@@ -183,6 +185,25 @@ pilot() {  # the registered pilot with the frozen recipe (14.1 must exist before
   "$PY" t1_gate.py "$OUT" | tee "$OUT/gate.json"
 }
 
+dev() {  # the development study (section 15): schedule A, seed 123
+  say "dev"
+  require_approved_commit
+  require_manifests
+  local m="$MANIFESTS/primary_A.json" hits="$OUT/guard_hits_primary_A.json"
+  [ -f "$hits" ] || "$PY" experiences.py guard-hits --data_root "$DATA" --seed 1 \
+    --manifest "$m" --hard_k 5 --out "$hits"
+  sha256sum "$hits" | tee -a "$LOG"
+  for rounds in 4 2; do
+    run_one "dev-fedavg-replay-r$rounds-A-s123" "$m" fedavg-replay 123 "$rounds" --lr 5e-5
+  done
+  for lam in 0.25 0.1; do
+    run_one "dev-fedavg-replay-distill-lam$lam-A-s123" "$m" fedavg-replay-distill 123 8 \
+      --lr 5e-5 --lambda_distill "$lam"
+  done
+  run_one dev-fedavg-replay-accept-A-s123 "$m" fedavg-replay-accept 123 8 --lr 5e-5 \
+    --guard_hits "$hits"
+}
+
 case "$MODE" in
   bootstrap) bootstrap ;;
   manifests) manifests ;;
@@ -190,5 +211,6 @@ case "$MODE" in
   calibrate) calibrate ;;
   stage1) bootstrap; manifests; profile; calibrate; finish DONE ;;
   pilot) pilot; finish DONE ;;
+  dev) dev; finish DONE ;;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

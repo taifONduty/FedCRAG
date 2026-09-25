@@ -198,3 +198,24 @@ def test_the_distillation_term_penalises_moving_away_from_the_teacher():
             return {"sentence_embedding": feature["embedding"] + 0.5}
     moved = driver.ReplayDistillLoss(student, Shifted(), lam=2.0)(features, labels)
     assert moved.item() > reference.item()
+
+
+def test_acceptance_arm_keeps_a_ruled_step_that_the_validator_checks(stream, tmp_path,
+                                                                     monkeypatch):
+    monkeypatch.setattr(driver.acceptance, "GUARD_SLOTS", 2)
+    manifest = stream[1]
+    hits = {c: {q: [] for cell in m["experiences"].values() for q in cell["guard"]}
+            for c, m in manifest["clients"].items()}
+    hits_path = tmp_path / "hits.json"
+    hits_path.write_text(json.dumps(hits))
+    result, path, _ = run(stream, "fedavg-replay-accept", tmp_path / "out",
+                          ["--guard_hits", str(hits_path)])
+    first, later = result["rounds"][:2], result["rounds"][2:]
+    assert all("acceptance" not in r for r in first) and all("acceptance" in r for r in later)
+    assert all(len(r["memory"][c]["reserved"]) == 2 for r in later for c in ("0", "1"))
+    validate_continual.validate_run(tmp_path / "out")
+    kept = later[0]["acceptance"]["step"]
+    later[0]["acceptance"]["step"] = 0.5 if kept != 0.5 else 1.0
+    path.write_text(json.dumps(result))
+    with pytest.raises(validate_continual.ContinualValidationError, match="acceptance rule"):
+        validate_continual.validate_run(tmp_path / "out")

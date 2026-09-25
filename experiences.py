@@ -315,6 +315,17 @@ def _hard_hits(root, client, query_texts, hard_k, retriever):
     return hits
 
 
+def guard_hits(manifest, root, hard_k, retriever):
+    """Each guard query's top ``hard_k`` BM25 passages, per client, for the check pool of
+    arm F (registration section 15): the stripped texts the manifest build retrieved with."""
+    queries = load_queries(os.path.join(root, "msmarco-passage", "queries.train.tsv"))
+    hits = {}
+    for c, client in manifest["clients"].items():
+        ids = [q for cell in client["experiences"].values() for q in cell["guard"]]
+        hits[c] = dict(zip(ids, retriever([queries[q].strip() for q in ids], hard_k)))
+    return hits
+
+
 def _client_digests(client):
     cells = client["experiences"]
     return {"corpus": _digest(client["corpus"]),
@@ -418,7 +429,7 @@ def build_manifests(root, clients, experiences_per_client, schedules, counts, co
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["feasibility", "build", "verify"])
+    ap.add_argument("command", choices=["feasibility", "build", "verify", "guard-hits"])
     ap.add_argument("--data_root", default="./beir_data")
     ap.add_argument("--clients", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     ap.add_argument("--experiences", type=int, default=4)
@@ -430,7 +441,8 @@ def main():
     ap.add_argument("--hard_k", type=int, default=10)
     ap.add_argument("--pseudo_clients", type=int, default=1,
                     help="split each topic into this many clients (calibration stream)")
-    ap.add_argument("--out", help="output directory (build) or manifest to verify")
+    ap.add_argument("--manifest", help="manifest whose guard queries to retrieve for (guard-hits)")
+    ap.add_argument("--out", help="output directory (build), manifest to verify, or hits file")
     args = ap.parse_args()
     if args.command == "feasibility":
         table = feasibility(args.data_root, args.clients, args.experiences, args.seed,
@@ -439,6 +451,14 @@ def main():
         for (topic, e), cell in sorted(table.items()):
             print(f"{topic}\t{e}\t{cell['train_eligible']}\t{cell['eval_eligible']}"
                   f"\t{cell['relevant_passages']}")
+        return
+    if args.command == "guard-hits":
+        with open(args.manifest) as handle:
+            manifest = json.load(handle)
+        hits = guard_hits(manifest, args.data_root, args.hard_k, bm25_retriever(args.data_root))
+        with open(args.out, "w") as handle:
+            json.dump(hits, handle)
+        print(f"wrote {args.out}")
         return
     if args.command == "verify":
         with open(args.out) as handle:

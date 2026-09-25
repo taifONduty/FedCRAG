@@ -226,3 +226,16 @@ def test_a_held_out_pool_is_capped_so_the_corpus_rule_stays_reachable(tmp_path, 
     client = manifest["clients"]["1"]
     assert len(client["eval_pool"]) == 4
     assert set(client["experiences"]["0"]["test"]) <= set(client["eval_pool"])
+
+
+def test_guard_hits_reproduce_the_build_retrieval_inside_each_corpus(tmp_path):
+    root = synthetic_msmarco(tmp_path)
+    manifest = experiences.build_manifest(
+        root, clients=(0, 1), experiences_per_client=2, schedule={0: (0, 1), 1: (1, 0)},
+        counts={"train": 20, "guard": 4, "test": 3}, corpus_size=120, hard_k=2, seed=5,
+        retriever=fake_bm25)
+    hits = experiences.guard_hits(manifest, root, 2, fake_bm25)
+    for c, client in manifest["clients"].items():
+        guard = [q for cell in client["experiences"].values() for q in cell["guard"]]
+        assert sorted(hits[c]) == sorted(guard)
+        assert {p for row in hits[c].values() for p in row} <= set(client["corpus"])

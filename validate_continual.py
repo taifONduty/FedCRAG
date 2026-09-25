@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 
+import acceptance
 import experiences
 from aggregation_schemes import state_dict_sha256
 from continual_driver import REPLAY_ARMS, _digest
@@ -35,10 +36,11 @@ def _check_memory(record, client, index, manifest_client, budget, position):
     replay, reserved = set(memory["replay"]), set(memory["reserved"])
     _require(not (replay & held_out) and not (reserved & test_ids),
              f"round {index}: client {client} retains a test or guard query")
-    earlier = {q for s in range(position)
-               for q in cells[str(manifest_client["order"][s])]["train"]}
-    _require(replay <= earlier,
+    earlier = [cells[str(manifest_client["order"][s])] for s in range(position)]
+    _require(replay <= {q for cell in earlier for q in cell["train"]},
              f"round {index}: client {client} replays a query outside its earlier experiences")
+    _require(reserved <= {q for cell in earlier for q in cell["guard"]},
+             f"round {index}: client {client} guards a query outside its earlier experiences")
     _require(memory["budget"] == budget and memory["used"] <= budget
              and memory["used"] == len(replay) + len(reserved),
              f"round {index}: client {client}'s memory record breaks its budget")
@@ -99,11 +101,25 @@ def validate_run(run_directory, manifest_path=None):
                      f"round {index}: the broadcast does not connect to the previous "
                      "global state")
             recomputed = fedavg([payload["clients"][c] for c in clients])
+            checked = arm == "fedavg-replay-accept" and position > 0
+            _require(("acceptance" in record) == checked,
+                     f"round {index}: an acceptance record where none belongs, or none where "
+                     "one does")
+            if checked:
+                choice = record["acceptance"]
+                _require(acceptance.rule_holds(choice["step"], choice["tried"]),
+                         f"round {index}: the kept step does not follow the acceptance rule")
+                _require(all(len(record["memory"][c]["reserved"]) == acceptance.GUARD_SLOTS
+                             for c in clients),
+                         f"round {index}: a client does not hold {acceptance.GUARD_SLOTS} "
+                         "guard queries")
+                recomputed = acceptance.step_state(payload["broadcast"], recomputed,
+                                                   choice["step"])
             for key, tensor in recomputed.items():
                 _require(torch.allclose(tensor, payload["global"][key].float(),
                                         rtol=1e-6, atol=1e-7),
-                         f"round {index}: the persisted global is not the uniform average of "
-                         "the persisted client states")
+                         f"round {index}: the persisted global is not the kept step toward the "
+                         "uniform average of the persisted client states")
             previous = state_dict_sha256(payload["global"])
         if r == R - 1:
             for c in clients:

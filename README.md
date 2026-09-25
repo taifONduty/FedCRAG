@@ -74,6 +74,8 @@ registrations or replace the paper draft.
   constructed semantic-shift stream over MS MARCO and MS-Shift, the retained-query
   budget, the retention measures, the experience loop with its baseline arms, its
   validator and the GPU-machine chain (design in `docs/continual-pipeline-design.md`)
+- `acceptance.py` - arm F of the development study (registration section 15): a
+  reference-based acceptance check on the server's update
 - `t1_gate.py`, `t1_report.py` - the pilot's registered gate, and its report
   recomputed from the per-query records without the production metric code
 - `tests/` - unit, integration, mutation and tamper tests

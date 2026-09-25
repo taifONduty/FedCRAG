@@ -43,3 +43,16 @@ def test_record_round_trips():
     restored = ReplayMemory.from_record(memory.record())
     assert restored.ids == memory.ids and restored.used == memory.used
     assert restored.record() == memory.record()
+
+
+def test_guard_redraw_replaces_the_guard_and_leaves_replay_the_rest_of_the_budget():
+    memory = ReplayMemory(budget=10, seed=7)
+    memory.redraw_guard({"e0": [f"g{i}" for i in range(20)]}, 4)
+    first = memory.reserved
+    memory.redraw_guard({"e0": [f"g{i}" for i in range(20)], "e1": [f"h{i}" for i in range(20)]}, 4)
+    memory.refill(PAST)
+    assert sum(q.startswith("g") for q in memory.reserved) == 2 and memory.reserved != first
+    assert len(memory.ids) == 6 and memory.used == 10
+    plain = ReplayMemory(budget=6, seed=7)
+    plain.refill(PAST)
+    assert memory.ids == plain.ids

@@ -11,6 +11,7 @@ from sentence_transformers import InputExample
 from sentence_transformers.datasets import NoDuplicatesDataLoader
 from torch.nn import functional as F
 
+import acceptance
 import experiences
 import regression
 from aggregation_schemes import state_dict_sha256
@@ -21,10 +22,11 @@ from federated_forgetting import (_runtime_provenance, _sha256_file, amp_enabled
                                   response_encode, set_adapter_state)
 from memory import ReplayMemory
 
-ARMS = ("frozen", "local", "fedavg", "fedavg-replay", "fedavg-replay-distill")
-REPLAY_ARMS = ("fedavg-replay", "fedavg-replay-distill")
+ARMS = ("frozen", "local", "fedavg", "fedavg-replay", "fedavg-replay-distill",
+        "fedavg-replay-accept")
+REPLAY_ARMS = ("fedavg-replay", "fedavg-replay-distill", "fedavg-replay-accept")
 SOURCE_FILES = ("continual_driver.py", "experiences.py", "memory.py", "regression.py",
-                "validate_continual.py")
+                "validate_continual.py", "acceptance.py")
 SPLITS = ("guard", "test")
 
 
@@ -129,6 +131,44 @@ def evaluate(model, state, corpus, cells, experience_ids, q_prefix, d_prefix, ba
     return out
 
 
+def guard_scores(model, state, pool, corpus, queries, qrels, q_prefix, d_prefix, batch_size):
+    """nDCG@10 of each guard query ranked within ``pool``."""
+    p_emb = _encode(model, state, [d_prefix + doc_text(corpus[p]) for p in pool], batch_size)
+    qids = list(queries)
+    q_emb = _encode(model, state, [q_prefix + queries[q] for q in qids], batch_size)
+    return {q: v["ndcg@10"]
+            for q, v in regression.per_query_scores(pool, p_emb, qids, q_emb, qrels).items()}
+
+
+def prepare_guard(model, memory, cells, order, t, corpus, hits, reference_states, seed,
+                  q_prefix, d_prefix, batch_size):
+    """Redraw one client's guard queries at experience position ``t`` and score each within
+    the client's check pool under the acquisition reference of its own experience."""
+    memory.redraw_guard({str(order[s]): list(cells[order[s]]["guard_q"]) for s in range(t)},
+                        acceptance.GUARD_SLOTS)
+    position = {q: s for s in range(t) for q in cells[order[s]]["guard_q"]}
+    queries = {q: cells[order[position[q]]]["guard_q"][q] for q in memory.reserved}
+    qrels = {q: cells[order[position[q]]]["guard_qrels"][q] for q in memory.reserved}
+    pool = acceptance.check_pool(list(corpus), qrels, hits, seed)
+    reference = {}
+    for s in sorted({position[q] for q in queries}):
+        mine = {q: text for q, text in queries.items() if position[q] == s}
+        reference.update(guard_scores(model, reference_states[s], pool, corpus, mine, qrels,
+                                      q_prefix, d_prefix, batch_size))
+    return {"pool": pool, "queries": queries, "qrels": qrels, "reference": reference}
+
+
+def guard_regression(model, candidate, guards, corpora, q_prefix, d_prefix, batch_size):
+    """Mean positive-part regression of ``candidate`` over every client's guard queries."""
+    reference, current = {}, {}
+    for c, guard in guards.items():
+        scores = guard_scores(model, candidate, guard["pool"], corpora[c], guard["queries"],
+                              guard["qrels"], q_prefix, d_prefix, batch_size)
+        reference.update({f"{c}:{q}": v for q, v in guard["reference"].items()})
+        current.update({f"{c}:{q}": v for q, v in scores.items()})
+    return regression.positive_regression(reference, current)
+
+
 def summarise(out):
     """Acquisition per (client, experience), positive-part regression, backward transfer
     and peak forgetting per historical cell, and the gate scalars A and G."""
@@ -186,6 +226,7 @@ def parse_args():
     ap.add_argument("--lora_rank", type=int, default=16)
     ap.add_argument("--memory_budget", type=int, default=256)
     ap.add_argument("--lambda_distill", type=float, default=1.0)
+    ap.add_argument("--guard_hits", help="per-query BM25 hits of the guard queries (arm F)")
     ap.add_argument("--no_grad_ckpt", action="store_true")
     ap.add_argument("--out", required=True)
     return ap.parse_args()
@@ -193,6 +234,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    accept = args.arm == "fedavg-replay-accept"
+    if accept and not args.guard_hits:
+        raise SystemExit("arm fedavg-replay-accept needs --guard_hits")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     with open(args.manifest) as handle:
@@ -232,6 +276,10 @@ def main():
                                        for n in SOURCE_FILES},
            "rounds": [], "references": {c: {} for c in clients}, "matrix": {},
            "frozen": {}, "eval_pool": {}, "summary": {}}
+    if accept:
+        with open(args.guard_hits) as handle:
+            hits = json.load(handle)
+        out["guard_hits_sha256"] = _sha256_file(args.guard_hits)
     for c in clients:
         out["frozen"][c] = evaluate(model, initial, corpora[c], cells[c], range(T),
                                     q_prefix, d_prefix, args.eval_batch_size)
@@ -243,11 +291,17 @@ def main():
                 for c in clients}
     states = {c: _clone(initial) for c in clients} if local else None
     global_state = None if local else _clone(initial)
-    teacher_state = None
+    teacher_state, reference_states = None, []
     for t in range(T):
         current = {c: orders[c][t] for c in clients}
+        guards = {}
         if args.arm != "frozen":
             for c in clients:
+                if accept and t > 0:
+                    guards[c] = prepare_guard(model, memories[c], cells[c], orders[c], t,
+                                              corpora[c], hits[c], reference_states,
+                                              [args.seed, int(c), t], q_prefix, d_prefix,
+                                              args.eval_batch_size)
                 memories[c].refill({str(orders[c][s]): list(cells[c][orders[c][s]]["train_q"])
                                     for s in range(t)})
             for r in range(R):
@@ -276,7 +330,14 @@ def main():
                     payload = {"clients_before": states, "clients": trained}
                     states = {c: _clone(trained[c]) for c in clients}
                 else:
-                    global_state = fedavg([trained[c] for c in clients])
+                    average = fedavg([trained[c] for c in clients])
+                    global_state = average
+                    if guards:
+                        step, tried = acceptance.choose_step(lambda s: guard_regression(
+                            model, acceptance.step_state(broadcast, average, s), guards,
+                            corpora, q_prefix, d_prefix, args.eval_batch_size))
+                        record["acceptance"] = {"step": step, "tried": tried}
+                        global_state = acceptance.step_state(broadcast, average, step)
                     payload = {"broadcast": broadcast, "clients": trained,
                                "global": global_state}
                 record["hashes"] = _hashes(payload)
@@ -298,6 +359,7 @@ def main():
                 "scores": scored[str(current[c])]}
         if not local and args.arm != "frozen":
             teacher_state = _clone(global_state)
+            reference_states.append(teacher_state)
         dump_json(out, jpath)
 
     for c in clients:

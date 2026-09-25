@@ -1250,3 +1250,25 @@ Launch conditions as in 14 and 15.1. To be appended as 16.1 before the first LoT
 manifest digests and the hard-passage depth the build used, the lambda and the F decision
 under 15, a profile run's measured cost and the launch commit. LoTTE test scores are read only
 after every run of the block has validated.
+
+Deviation in block T1 (recorded 2026-09-25 07:16 UTC, the clock of the commit that adds it).
+Section 14 defines arm B as local-only continual training with the same memory budget and the
+same number of optimiser steps. continual_driver gave retained queries only to the replay
+arms, so T1's arm B kept none: on client 0 in the last round it trained on 1,437 examples in
+44 steps, as plain FedAvg (C) did, against 1,703 examples and 53 steps under replay (D). The
+gate (G1 and G2) uses arm D only and is unaffected. G3, reported only, compared D with a local
+arm without retained queries. The observation in 14.2 of D against B mixes federation with
+replay; the contrast without that confound is C against B, neither with retained queries: G
+lower by 0.0320 in 6 of 6 paired runs, nDCG@10 on earlier experiences at the end higher by
+0.0193, and A lower by 0.0031.
+
+Amendment to 16, before any LoTTE run (recorded 2026-09-25 07:16 UTC, the clock of the commit
+that adds it). Arm B is local-only continual training with the retained-query budget of 256
+drawn as in D (driver arm local-replay, added in the previous commit), as 14 defines it. Arm
+B0, local-only training without retained queries (driver arm local, as T1's B ran), is added
+so that T1's contrast without the replay confound is repeated. The block has 30 runs without F
+and 36 with it. H4 stands as written, with this B. A fifth hypothesis is added:
+
+- H5, federation against local training, neither with retained queries: G under C is lower
+  than under B0 in at least five of the six runs paired by schedule and seed, and the mean
+  nDCG@10 on the earlier experience at the end of the stream is higher under C than under B0.

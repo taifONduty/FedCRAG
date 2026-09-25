@@ -127,13 +127,23 @@ def test_local_arm_keeps_one_model_per_client(stream, tmp_path):
     assert result["references"]["0"] and result["references"]["1"]
 
 
+def test_local_replay_retains_what_replay_retains_and_local_retains_nothing(stream, tmp_path):
+    shared, _, _ = run(stream, "fedavg-replay", tmp_path / "shared")
+    alone, _, _ = run(stream, "local-replay", tmp_path / "alone")
+    bare, _, _ = run(stream, "local", tmp_path / "bare")
+    memory = lambda result: [r["memory"]["0"] for r in result["rounds"]]
+    assert memory(alone) == memory(shared)
+    assert all(m["used"] == 0 for m in memory(bare))
+
+
 def test_frozen_arm_trains_nothing(stream, tmp_path):
     result, _, fakes = run(stream, "frozen", tmp_path / "out")
     assert fakes.calls == [] and result["rounds"] == []
     assert result["matrix"]["1"]["0"] and result["frozen"]["0"]
 
 
-@pytest.mark.parametrize("arm", ["fedavg-replay", "local", "fedavg-replay-distill", "frozen"])
+@pytest.mark.parametrize("arm", ["fedavg-replay", "local", "local-replay",
+                                 "fedavg-replay-distill", "frozen"])
 def test_validator_accepts_a_genuine_run(stream, tmp_path, arm):
     run(stream, arm, tmp_path / "out")
     report = validate_continual.validate_run(tmp_path / "out")

@@ -22,9 +22,10 @@ from federated_forgetting import (_runtime_provenance, _sha256_file, amp_enabled
                                   response_encode, set_adapter_state)
 from memory import ReplayMemory
 
-ARMS = ("frozen", "local", "fedavg", "fedavg-replay", "fedavg-replay-distill",
+ARMS = ("frozen", "local", "local-replay", "fedavg", "fedavg-replay", "fedavg-replay-distill",
         "fedavg-replay-accept")
-REPLAY_ARMS = ("fedavg-replay", "fedavg-replay-distill", "fedavg-replay-accept")
+LOCAL_ARMS = ("local", "local-replay")
+REPLAY_ARMS = ("local-replay", "fedavg-replay", "fedavg-replay-distill", "fedavg-replay-accept")
 SOURCE_FILES = ("continual_driver.py", "experiences.py", "memory.py", "regression.py",
                 "validate_continual.py", "acceptance.py")
 SPLITS = ("guard", "test")
@@ -285,7 +286,7 @@ def main():
                                     q_prefix, d_prefix, args.eval_batch_size)
     dump_json(out, jpath)
 
-    local = args.arm == "local"
+    local = args.arm in LOCAL_ARMS
     replay = args.arm in REPLAY_ARMS
     memories = {c: ReplayMemory(args.memory_budget if replay else 0, args.seed * 100 + int(c))
                 for c in clients}

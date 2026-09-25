@@ -9,7 +9,7 @@ import torch
 import acceptance
 import experiences
 from aggregation_schemes import state_dict_sha256
-from continual_driver import REPLAY_ARMS, _digest
+from continual_driver import LOCAL_ARMS, REPLAY_ARMS, _digest
 from federated_forgetting import _sha256_file, fedavg
 
 
@@ -73,7 +73,7 @@ def validate_run(run_directory, manifest_path=None):
     rounds = result["rounds"]
     expected = 0 if arm == "frozen" else T * R
     _require(len(rounds) == expected, f"expected {expected} rounds, found {len(rounds)}")
-    local = arm == "local"
+    local = arm in LOCAL_ARMS
     budget = int(result["args"]["memory_budget"]) if arm in REPLAY_ARMS else 0
     initial = result["initial_state_sha256"]
     previous = {c: initial for c in clients} if local else initial

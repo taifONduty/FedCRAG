@@ -40,9 +40,14 @@ proxy federation with a Contriever backbone, not all federated retrievers.
    validation also does not erase the recorded candidate-count protocol
    discrepancy.
 
-Continual retrieval across sequential experiences remains unevaluated. The
-current evidence concerns retrieval quality, not generated-answer quality or
-formal privacy protection.
+Continual retrieval has one pilot (registration section 14.2): on a
+constructed MS-Shift stream of five clients and four experiences, shared
+training acquires each new experience while per-query regression on earlier
+ones remains above the registered threshold under bounded replay, and the
+tested distillation arm reduces that regression at a larger acquisition cost
+than its criterion allowed. The pilot now informs method design, so it is
+development evidence rather than confirmation. The current evidence concerns
+retrieval quality, not generated-answer quality or formal privacy protection.
 
 ## Presentation notes
 
@@ -69,6 +74,8 @@ registrations or replace the paper draft.
   constructed semantic-shift stream over MS MARCO and MS-Shift, the retained-query
   budget, the retention measures, the experience loop with its baseline arms, its
   validator and the GPU-machine chain (design in `docs/continual-pipeline-design.md`)
+- `t1_gate.py`, `t1_report.py` - the pilot's registered gate, and its report
+  recomputed from the per-query records without the production metric code
 - `tests/` - unit, integration, mutation and tamper tests
 - `registration/` - the signed pre-registration for the experiment program,
   with predictions and decision rules committed before the data existed

@@ -1013,3 +1013,87 @@ only wall time, exit status and validation state are read.
 Measured cost so far, replacing the projections: pilot-frozen-A-s123 8,248 s, and
 pilot-local-A-s123 7,510 s with 32 rounds validated. The campaign is projected from these
 two measurements at about 57 hours; the distillation arm's own cost is not yet measured.
+
+### 14.2 Pilot outcome (written 2026-09-25 06:08 UTC, the clock of the commit that adds it; after all 26 runs of block T1 validated)
+
+Completion. The chain ran on the L4 from commit fda2e25 between 2026-09-22 17:18 and
+2026-09-25 03:40 UTC and wrote DONE. All 26 runs exited 0 and passed validate_continual.
+Wall time per run: frozen 8,247 and 8,248 s; local 7,510 to 7,559 s; fedavg 7,529 to
+7,559 s; fedavg-replay 7,912 to 8,000 s; fedavg-replay-distill 9,109 to 9,159 s; 209,563 s
+(58.2 hours) in all.
+
+Gate. t1_gate.py at fda2e25 was run on the L4 and again, on a second machine, from the copied
+records; the two outputs are identical.
+
+| criterion | threshold | mean over the six runs | runs at half / at full threshold | result |
+|---|---:|---:|---:|---|
+| G2, A under D | 0.020 | 0.1075 | 6 / 6 | passes |
+| G1, G under D | 0.010 | 0.0233 | 6 / 6 | passes |
+| G3, A under D at least A under B (reported) | | 0.1075 against 0.1079 | | not met |
+
+Registered outcome: G1 and G2 pass, so method arms are designed and registered separately.
+Arm E does not meet its reported criterion: its G, 0.0140, is not below half of D's
+(0.0116), and its A, 0.0932, is not within 0.005 of D's 0.1075. The calibration observation
+in 14.1 (one seed, two clients: G lower by 51.7 percent at an A lower by 0.0032) did not
+carry over to the primary streams, where E's G is 40 percent lower than D's and its A
+0.0143 lower. This concerns the calibration-selected lambda of 2.0 only.
+
+Required reporting, test queries, mean over runs (arm A has one seed per schedule). Cells
+are (client, experience, evaluation position) with the evaluation after the experience was
+learned; a worst cell is the largest over all runs of the arm.
+
+| arm | A | G | BWT | reference nDCG@10 | nDCG@10 on earlier experiences at the end | cells at or above 0.010, per run | worst cell |
+|---|---:|---:|---:|---:|---:|---:|---|
+| A frozen | 0 | 0 | 0 | 0.4057 | 0.4044 | 0 of 30 | none |
+| B local | 0.1079 | 0.0565 | -0.0112 | 0.5116 | 0.4978 | 30 of 30 | 0.1104, client 0, experience 3 |
+| C fedavg | 0.1049 | 0.0244 | 0.0119 | 0.5020 | 0.5171 | 30 of 30 | 0.0388, client 4, experience 0 |
+| D fedavg-replay | 0.1075 | 0.0233 | 0.0157 | 0.5032 | 0.5231 | 30 of 30 | 0.0470, client 4, experience 0 |
+| E fedavg-replay-distill | 0.0932 | 0.0140 | 0.0043 | 0.4945 | 0.4986 | 18 to 24 of 30 | 0.0325, client 4, experience 0 |
+
+The per-run values, the full client-by-experience matrix, peak forgetting, guard-query
+values and each client's evaluation pool are in the report that t1_report.py writes from the
+records. t1_report.py recomputes A and G from the per-query records without regression.py,
+continual_driver.summarise or t1_gate.py. For all 26 runs they agree with the stored values
+within 1e-9, and its checks find no problem: the frozen arm's scores never change, each
+acquisition reference equals the scores recorded at its own position, the query set of every
+cell is fixed over time, and in every test cell the signed change equals the mean improvement
+minus the mean positive-part regression.
+
+Observations outside the registered decision, recorded as development evidence for the
+method design and not as tested claims. Paired by schedule and seed:
+- D against B: A lower by 0.0005, G lower by 0.0332 (lower in 6 of 6 runs), and nDCG@10 on
+  earlier experiences at the end higher by 0.0253.
+- D against C: A higher by 0.0026 and G lower by 0.0012 (lower in 4 of 6 runs).
+- E against D: G lower by 0.0092 (6 of 6), and nDCG@10 on earlier experiences at the end
+  lower by 0.0245; E's acquisition references are also lower (0.4945 against 0.5032).
+- Under C and D the mean signed change on earlier experiences is positive (BWT 0.0119 and
+  0.0157), while 15.2 and 14.6 percent of (query, evaluation) pairs lose at least 0.010.
+- Regression grows with the age of an experience in 19 of the 20 (trained arm, client) rows;
+  the exception is client 3 under C (0.0301 at age 2, 0.0288 at age 3).
+- Guard and test queries give similar A and G. Scores on the retained replay queries were
+  not recorded, so retained and unseen queries cannot be compared from these records.
+
+Because the pilot now informs the method design, a later method claim treats these streams
+as development data; its confirmation uses query families or collections not used for the
+design (LoTTE, LongEval) under its own registration.
+
+Records. gs://fedcrag-t1-archive/T1_20260921, a private bucket with public access prevention
+enforced (Standard class, asia-northeast1), holds the block's directory as written on the L4:
+1,198 files, 73.4 GB, all 26 runs' checkpoint chains, the calibration and profile runs, the
+manifests, the chain log and a SHA256SUMS that lists every other file. The size and CRC32C of
+every object match the files on the L4's disk. pilot-fedavg-replay-A-s123 was restored from
+the bucket into a separate directory: its 38 files match their SHA-256, validate_continual
+passes on the restored copy against the restored manifest, and re-scoring its final checkpoint
+on client 0 reproduces all 1,940 recorded guard and test scores of the four experiences
+exactly when the scoring process has first run one training call, as the driver's process had.
+Scored in a fresh process, the same state gives identical scores in two separate runs, but 2
+of the 1,940 differ from the record (one guard and one test query of experience 3, by 0.044
+and 0.031). Scoring therefore depends slightly on whether the process has trained; the
+training call leaves TF32 off and the float32 matmul precision at "highest", and the cause is
+not identified. The same check on the untrained backbone: before any training it reproduces
+the recorded frozen scores exactly; after one training call, 5 of the 1,940 scores differ and
+no split's mean moves by more than 0.0004. The frozen scores were computed before training and
+the trained states' scores after it, so acquisition against the frozen backbone carries this
+effect; on client 0 it is 0.00003 in the mean over the four test splits, against a threshold
+of 0.020. G, backward transfer and the trained states' absolute scores are each computed
+within one condition.

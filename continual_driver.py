@@ -95,6 +95,14 @@ def client_train_distill(model, teacher, start_state, teacher_state, data, repla
     return get_adapter_state(model), len(examples), steps
 
 
+def _encode(model, state, texts, batch_size):
+    """Unit embeddings under fp16 autocast. Training leaves the sentence-transformers
+    forward wrapped in autocast, so without this the untrained backbone would be scored in
+    fp32 and every trained state in fp16."""
+    with torch.autocast("cuda", dtype=torch.float16, enabled=amp_enabled()):
+        return response_encode(model, state, texts, batch_size)
+
+
 def _summarise(scores):
     per_query = {m: {q: float(v[m]) for q, v in scores.items()} for m in regression.MEASURES}
     means = {m: (float(np.mean(list(per_query[m].values()))) if per_query[m] else float("nan"))
@@ -106,16 +114,16 @@ def evaluate(model, state, corpus, cells, experience_ids, q_prefix, d_prefix, ba
     """Per-query scores of ``state`` on the guard and test queries of the given experiences
     of one client, against its fixed corpus encoded once."""
     cids = list(corpus)
-    c_emb = response_encode(model, state, [d_prefix + doc_text(corpus[c]) for c in cids],
-                            batch_size)
+    c_emb = _encode(model, state, [d_prefix + doc_text(corpus[c]) for c in cids],
+                    batch_size)
     out = {}
     for e in experience_ids:
         cell = cells[e]
         out[str(e)] = {}
         for split in SPLITS:
             qids = list(cell[f"{split}_q"])
-            q_emb = response_encode(model, state, [q_prefix + cell[f"{split}_q"][q] for q in qids],
-                                    batch_size)
+            q_emb = _encode(model, state, [q_prefix + cell[f"{split}_q"][q] for q in qids],
+                            batch_size)
             out[str(e)][split] = _summarise(regression.per_query_scores(
                 cids, c_emb, qids, q_emb, cell[f"{split}_qrels"]))
     return out
@@ -297,10 +305,10 @@ def main():
         queries, qrels = experiences.eval_queries(manifest, args.data_root, c)
         qids = sorted(queries, key=int)
         cids = list(corpora[c])
-        c_emb = response_encode(model, state, [d_prefix + doc_text(corpora[c][x]) for x in cids],
-                                args.eval_batch_size)
-        q_emb = response_encode(model, state, [q_prefix + queries[q] for q in qids],
-                                args.eval_batch_size)
+        c_emb = _encode(model, state, [d_prefix + doc_text(corpora[c][x]) for x in cids],
+                        args.eval_batch_size)
+        q_emb = _encode(model, state, [q_prefix + queries[q] for q in qids],
+                        args.eval_batch_size)
         scored = _summarise(regression.per_query_scores(cids, c_emb, qids, q_emb, qrels))
         out["eval_pool"][c] = {m: scored[m] for m in regression.MEASURES} | {
             "n": len(qids), "source": manifest["clients"][c]["eval_source"]}

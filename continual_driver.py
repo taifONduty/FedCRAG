@@ -363,6 +363,8 @@ def main():
         dump_json(out, jpath)
 
     for c in clients:
+        if not manifest["clients"][c]["eval_pool"]:
+            continue
         state = initial if args.arm == "frozen" else (states[c] if local else global_state)
         queries, qrels = experiences.eval_queries(manifest, args.data_root, c)
         qids = sorted(queries, key=int)

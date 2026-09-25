@@ -74,6 +74,8 @@ registrations or replace the paper draft.
   constructed semantic-shift stream over MS MARCO and MS-Shift, the retained-query
   budget, the retention measures, the experience loop with its baseline arms, its
   validator and the GPU-machine chain (design in `docs/continual-pipeline-design.md`)
+- `lotte.py` - LoTTE as a continual stream for the confirmation block: five topics as
+  clients, each topic's dev and test forums as its two experiences
 - `acceptance.py` - arm F of the development study (registration section 15): a
   reference-based acceptance check on the server's update
 - `t1_gate.py`, `t1_report.py` - the pilot's registered gate, and its report

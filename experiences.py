@@ -355,6 +355,14 @@ def verify_manifest(manifest):
 def client_corpora(manifest, root, clients=None):
     """Every client's fixed corpus, read in one pass over the collection."""
     clients = list(clients or manifest["clients"])
+    if manifest.get("source") == "lotte":
+        import lotte
+        passages = {}
+        for c in clients:
+            entry = manifest["clients"][c]
+            passages.update(lotte.load_passages(root, entry["topic"], entry["corpus"]))
+        return {c: {pid: {"text": passages[pid]} for pid in manifest["clients"][c]["corpus"]}
+                for c in clients}
     wanted = {pid for c in clients for pid in manifest["clients"][c]["corpus"]}
     passages = load_passages(root, wanted)
     return {c: {pid: {"text": passages[pid]} for pid in manifest["clients"][c]["corpus"]}
@@ -365,8 +373,12 @@ def materialise(manifest, root, client, experience, corpus=None):
     """The data dict of one (client, experience) cell in the shape ``client_train`` and
     the evaluation consume."""
     cell = manifest["clients"][client]["experiences"][str(experience)]
-    train_queries = load_queries(os.path.join(root, "msmarco-passage", "queries.train.tsv"))
-    eval_q, _ = eval_queries(manifest, root, client)
+    if manifest.get("source") == "lotte":
+        import lotte
+        train_queries = eval_q = lotte.load_queries(root, manifest["clients"][client]["topic"])[0]
+    else:
+        train_queries = load_queries(os.path.join(root, "msmarco-passage", "queries.train.tsv"))
+        eval_q, _ = eval_queries(manifest, root, client)
     data = {"corpus": corpus if corpus is not None
             else client_corpora(manifest, root, [client])[client]}
     for split, source in (("train", train_queries), ("guard", train_queries), ("test", eval_q)):

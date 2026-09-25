@@ -1189,3 +1189,64 @@ Launch. On the L4, in this order, output in ~/D15_20260925: D-r4, D-r2, E-0.25, 
 each validated before the next starts. The launcher refuses unless the repository is at this
 commit with a clean tree and the manifest digests match; the machine powers off when the chain
 ends. Until all five runs validate, only wall time, exit status and validation state are read.
+
+### 16 Block L1: confirmation on LoTTE (registered 2026-09-25 07:10 UTC, the clock of the commit that adds it; before the LoTTE manifests are built and before any LoTTE run)
+
+Purpose. Test, on a collection not used for any design decision, the observations that 14.2
+recorded as development evidence on MS-Shift. Nothing in this block is tuned on LoTTE: the
+recipe, the arms and their settings come from 14.1, from 15 and from the rules of 15.
+
+Data. LoTTE (the ColBERTv2 release, lotte.tar.gz, 3,576,167,599 bytes, sha256
+37c0f39af23a6e3464f63395a4d04a22b91fe59c1aa64ea1773a8aff113c7ab5). Clients 0 to 4 are its
+topics lifestyle, recreation, science, technology and writing. A client's experience 0 is the
+topic's dev split and experience 1 its test split; the two come from different StackExchange
+forums and share no passage. Each experience pools the split's search and forum queries (5,156
+to 5,571 per topic in all).
+
+Construction (lotte.py as committed in 05c7c10, seed 1). Per client and experience, sampled
+and disjoint: 1,949 training, 194 guard and 350 test queries, T1's rule applied to the
+smallest experience (lifestyle dev, 2,493 queries). A training query is judged by its
+highest-voted answer only, a tie going to the smaller passage number, because forum queries
+have up to 292 answers where MS MARCO has about one; guard and test queries are judged by all
+their answers. Corpus per client, fixed across experiences: every answer passage of every
+selected query, the top-5 BM25 passages (bm25s, English stopwords, over the topic's two
+collections) of every selected query, and passages drawn uniformly from those collections to
+60,000 in all. If any client's answer and hard passages exceed 60,000, the hard passages are
+the top-3 for every client; the bound computed from the query files is 61,282 for technology
+and at most 57,767 for the others. Schedules: in A, clients 0, 2 and 4 learn experience 0 then
+1, and clients 1 and 3 the reverse; in B every client is reversed.
+
+Arms, recipe and seeds. B local, C fedavg, D fedavg-replay, E fedavg-replay-distill with the
+lambda chosen by the rule of 15, and F fedavg-replay-accept if and only if the condition of 15
+is met. Eight rounds per experience, learning rate 5e-5 and every other setting of 14.1, a
+retained-query budget of 256, scoring under explicit fp16 autocast. Seeds 123, 2024 and 3407
+under both schedules: 24 runs without F, 30 with it. The untrained backbone is scored at the
+start of every run, so there is no separate frozen run.
+
+Hypotheses, each over the six runs of an arm (three seeds by two schedules), on test queries.
+A consistency criterion passes if the mean over the six runs clears the threshold and at least
+five of the six runs clear half of it, as in 14.
+
+- H1, useful acquisition: A under D is at least 0.020 (consistency criterion).
+- H2, regression remains under replay: G under D is at least 0.010 (consistency criterion).
+- H3, a positive average hides per-query losses: under D the mean backward transfer over the
+  six runs is above zero, and at least 10 percent of the (query, evaluation) pairs of the
+  earlier experience, pooled over the six runs, lose at least 0.010.
+- H4, shared training retains more than local training: G under D is lower than under B in at
+  least five of the six runs paired by schedule and seed, and the mean nDCG@10 on the earlier
+  experience at the end of the stream is higher under D than under B.
+
+Reported without a pass or fail rule: E and F against D and C against D (paired differences in
+A, G and end nDCG@10 on the earlier experience), the per-client and per-experience cells, the
+worst cell, the reference nDCG@10, and the six per-run values of every quantity.
+
+Outcomes. Each hypothesis is reported as confirmed or not, and the paper states which of the
+observations in 14.2 replicate on LoTTE and which do not, with their numbers. No LoTTE result
+changes a setting, and no LoTTE run is repeated because of its scores. With two experiences
+each client has one historical cell, so the growth of regression with an experience's age
+stays a development observation from T1.
+
+Launch conditions as in 14 and 15.1. To be appended as 16.1 before the first LoTTE run: the
+manifest digests and the hard-passage depth the build used, the lambda and the F decision
+under 15, a profile run's measured cost and the launch commit. LoTTE test scores are read only
+after every run of the block has validated.

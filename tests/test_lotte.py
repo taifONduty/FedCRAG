@@ -107,3 +107,19 @@ def test_the_driver_and_validator_run_a_lotte_manifest_unchanged(tmp_path, monke
     result = json.loads(next(out.glob("continual_*.json")).read_text())
     assert report["rounds_validated"] == 4 and result["eval_pool"] == {}
     assert result["summary"]["G"] >= 0
+
+
+def test_the_no_shift_control_re_splits_the_same_queries_over_the_same_corpus(tmp_path):
+    root = synthetic_lotte(tmp_path)
+    manifest = build(root, 200)
+    control = lotte.no_shift_manifest(root, manifest, 1)
+    for c, client in control["clients"].items():
+        source = manifest["clients"][c]
+        ids = lambda m: sorted(q for cell in m["experiences"].values()
+                               for split in ("train", "guard", "test") for q in cell[split])
+        assert ids(client) == ids(source) and client["corpus"] == source["corpus"]
+        for cell in client["experiences"].values():
+            assert (len(cell["train"]), len(cell["guard"]), len(cell["test"])) == (10, 4, 6)
+            assert {q.split("-")[0] for q in cell["train"] + cell["test"]} == {"dev", "test"}
+            assert all(len(cell["qrels"][q]) == 1 for q in cell["train"])
+            assert all(len(cell["qrels"][q]) == 2 for q in cell["guard"] + cell["test"])

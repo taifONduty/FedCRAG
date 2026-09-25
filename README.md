@@ -82,7 +82,9 @@ registrations or replace the paper draft.
   distillation weight and whether the acceptance arm enters
 - `t1_gate.py`, `t1_report.py` - the pilot's registered gate, and its report
   recomputed from the per-query records without the production metric code
-- `l1_report.py` - the LoTTE block's hypotheses H1 to H5, from the same recomputation
+- `l1_report.py` - the LoTTE block's hypotheses H1 to H6, from the same recomputation
+- `seed_churn.py` - per-query differences between two seeds at the same stage, on the
+  scale of the regression it is compared with
 - `tests/` - unit, integration, mutation and tamper tests
 - `registration/` - the signed pre-registration for the experiment program,
   with predictions and decision rules committed before the data existed

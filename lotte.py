@@ -174,6 +174,34 @@ def build_manifests(root, schedules, counts, corpus_size, seed, retriever_for,
     return manifests
 
 
+def no_shift_manifest(root, manifest, seed):
+    """The no-shift control of the amended section 16: each client's selected queries,
+    re-split at random into two experiences of the same sizes, with the same corpus and the
+    same judgement rule, so the second experience brings no change of forums."""
+    control = copy.deepcopy(manifest)
+    control["control"] = "no-shift"
+    counts = manifest["counts"]
+    size = counts["train"] + counts["guard"] + counts["test"]
+    for c, client in control["clients"].items():
+        _, answers, _ = load_queries(root, client["topic"])
+        votes = answer_votes(root, client["topic"])
+        pool = sorted(q for cell in client["experiences"].values()
+                      for split in ("train", "guard", "test") for q in cell[split])
+        order = np.random.default_rng([seed, int(c), len(SPLITS) + 1]).permutation(len(pool))
+        for e in range(len(SPLITS)):
+            picked = [pool[i] for i in order[e * size:(e + 1) * size]]
+            train = sorted(picked[:counts["train"]])
+            guard = sorted(picked[counts["train"]:counts["train"] + counts["guard"]])
+            test = sorted(picked[counts["train"] + counts["guard"]:])
+            qrels = {q: {top_answer(answers[q], votes): 1} for q in train}
+            qrels.update({q: {p: 1 for p in answers[q]} for q in guard + test})
+            client["experiences"][str(e)] = {"train": train, "guard": guard, "test": test,
+                                             "qrels": qrels}
+        client["guard_hits"] = {}
+        client["digests"] = _client_digests(client)
+    return control
+
+
 def guard_hits(manifest):
     """Each guard query's top-5 BM25 passages, per client, for arm F's check pool."""
     return {c: client["guard_hits"] for c, client in manifest["clients"].items()}
@@ -181,15 +209,22 @@ def guard_hits(manifest):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["build", "guard-hits"])
+    ap.add_argument("command", choices=["build", "guard-hits", "no-shift"])
     ap.add_argument("--data_root", default="./beir_data")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--schedules", help="JSON {name: {client: [experience order]}} (build)")
     ap.add_argument("--counts", help="JSON {train, guard, test} (build)")
     ap.add_argument("--corpus_size", type=int, default=60000)
-    ap.add_argument("--manifest", help="manifest whose guard hits to write (guard-hits)")
+    ap.add_argument("--manifest", help="source manifest (guard-hits, no-shift)")
     ap.add_argument("--out", required=True, help="output directory (build) or hits file")
     args = ap.parse_args()
+    if args.command == "no-shift":
+        with open(args.manifest) as handle:
+            control = no_shift_manifest(args.data_root, json.load(handle), args.seed)
+        verify_manifest(control)
+        with open(args.out, "w") as handle:
+            json.dump(control, handle)
+        return
     if args.command == "guard-hits":
         with open(args.manifest) as handle:
             hits = guard_hits(json.load(handle))

@@ -243,6 +243,8 @@ lotte() {  # the LoTTE confirmation block (section 16; 16.1 must exist before th
         run_one "l1-fedavg-replay-accept-$sched-s$seed" "$m" fedavg-replay-accept "$seed" 8 \
           --lr 5e-5 --guard_hits "$hits"
       fi
+      run_one "l1-iid-fedavg-replay-$sched-s$seed" "$MANIFESTS/lotte_iid_$sched.json" \
+        fedavg-replay "$seed" 8 --lr 5e-5
     done
   done
 }

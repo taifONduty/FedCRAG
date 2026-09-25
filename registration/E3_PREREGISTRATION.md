@@ -1171,3 +1171,21 @@ lambda are shown together.
 
 Cost at T1's measured run times: at most 7,955 s for each D run, about 9,137 s for each E run,
 and for F the time of a D run plus its pool checks, at most about 0.6 million passage encodes.
+
+### 15.1 Launch record for the development study (written 2026-09-25 07:07 UTC, the clock of the commit that adds it; before its first run)
+
+Code. The runs start from the commit that adds this section. It contains arm F as committed in
+f544a9a (550 tests passing on the L4) and the LoTTE builder of 05c7c10, which these runs do
+not use; for an MS-Shift manifest the driver behaves as at f544a9a.
+
+Inputs. Manifest primary_A.json, sha256
+9bd8a61b7f08c30542de6cca58999b021df8b133f72065f7fa38d54ce451c5b1, the file the pilot used.
+Guard hits guard_hits_primary_A.json, sha256
+9510b7414b745675ccb977068c87dff61d42464b6a741cf64631be67a9c2d9d6: the top-5 BM25 passages of
+all 2,700 guard queries (540 per client), retrieved with the saved index of the manifest build
+in 8 min 50 s; every one of the 13,500 passages lies in its client's corpus.
+
+Launch. On the L4, in this order, output in ~/D15_20260925: D-r4, D-r2, E-0.25, E-0.1, then F,
+each validated before the next starts. The launcher refuses unless the repository is at this
+commit with a clean tree and the manifest digests match; the machine powers off when the chain
+ends. Until all five runs validate, only wall time, exit status and validation state are read.

@@ -1406,3 +1406,18 @@ Reported for every run: A, G, backward transfer, the absolute nDCG@10 on earlier
 beside the reference nDCG@10, the per-client and per-experience cells, and the wall time on
 the T4, which is not comparable with the L4's. Test scores of these runs are read only after
 all five validate.
+
+### 17.1 Interruption record for the development runs (written 2026-09-26 15:09 UTC, the clock of the commit that adds it; while the restarted run trains and before any score of these runs is read)
+
+The T4 carries an Azure auto-shutdown schedule, created with the machine on 10 September, that
+deallocates it daily at 08:30 UTC. The schedule deallocated it at 08:30 UTC on 26 September,
+while rar-anchor-lam0.5-fragile-A-s123 was training: the run had started at 05:25 UTC and had
+written 29 of its 32 round checkpoints, the last at 08:29:55 UTC. The three runs before it had
+validated: D in 9,374 s, and RAR with lambda 0.5 and 2.0 under random retention in 13,788 s
+and 13,697 s. The interrupted run's directory was moved, unread, to
+~/R17_20260925/interrupted/rar-anchor-lam0.5-fragile-A-s123-20260926T0830Z, and at 15:08 UTC
+the chain was started again with the same command at e3ecabe. The launcher checked the commit
+and the manifest digests, skipped the three validated runs and started the interrupted run
+from its first round. Nothing else changed. The schedule stays in place: at the 13,697 and
+13,788 s measured for the first two RAR runs, the two remaining runs end before it next
+triggers.

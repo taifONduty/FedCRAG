@@ -1422,7 +1422,7 @@ from its first round. Nothing else changed. The schedule stays in place: at the 
 13,788 s measured for the first two RAR runs, the two remaining runs end before it next
 triggers.
 
-### 17.2 Development outcome for rank-anchored replay (written 2026-09-26 01:08 UTC, the clock of the commit that adds it; after all five runs validated)
+### 17.2 Development outcome for rank-anchored replay (written 2026-09-27 01:08 UTC, the clock of the commit that adds it; after all five runs validated; the heading first carried the date 2026-09-26, corrected in the next commit)
 
 All five runs exited 0 and passed validate_continual; the chain wrote DONE at 22:33:37 UTC on
 2026-09-26. Wall times on the T4: D 9,374 s; RAR with lambda 0.5 and 2.0 under random

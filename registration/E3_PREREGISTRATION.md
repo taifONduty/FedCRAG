@@ -1603,3 +1603,33 @@ last, a tie going to the smaller lambda; it enters block 18 only if that score i
 
 Launch. From the commit that adds this section; the second T4 is deallocated when its chain
 ends.
+
+### 17.3.1 Development outcome for the one-sided floor (written 2026-09-27 21:17 UTC, the clock of the commit that adds it; after both runs validated)
+
+Both runs exited 0 and passed validate_continual; the chain wrote DONE at 21:01:34 UTC on
+2026-09-27. Wall times on the T4: 13,359 s (lambda 0.5) and 13,348 s (lambda 2.0). Results on
+test queries, recomputed with the functions of t1_report.py (no sanity problem), beside 17's
+D run on the same T4; development evidence, one seed and one order:
+
+| run | A | G | improvement | backward transfer | reference nDCG@10 | nDCG@10 on earlier experiences at the end | pairs losing at least 0.010 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| D (T4) | 0.1058 | 0.0242 | 0.0390 | 0.0149 | 0.4990 | 0.5269 | 14.9% |
+| floor, lambda 0.5 | 0.1308 | 0.0105 | 0.0491 | 0.0385 | 0.5098 | 0.5650 | 7.3% |
+| floor, lambda 2.0 | 0.1295 | 0.0101 | 0.0491 | 0.0389 | 0.5088 | 0.5643 | 7.0% |
+
+In every one of the five clients, under both lambdas, regression is lower than under D at
+every age and the end nDCG@10 on earlier experiences is higher. The first experience trains as
+D: its recorded states are not bitwise equal to D's (training is not deterministic on the
+GPU), and its acquisition cells differ from D's by +0.0001 on average and by at most 0.0016
+in any client. The acquisition advantage then grows with position: +0.0138, +0.0371 and
++0.0492 at positions 1, 2 and 3 (lambda 0.5). The floor set's nine non-relevant passages are
+hard negatives, which the recipe of 14.1 does not otherwise use; the hard-negative replay of
+17.4 uses the same sets without the one-sided condition.
+
+Rule of 17.3, applied by rar_settings.py (output floor_settings.json, sha256 2b6565834088dbd913e126c4044011ed47b24279170494e8184115c333306d2b): both runs
+clear the acquisition floor of 0.1008; mean nDCG@10 on the guard queries of the first three
+experiences after the last is 0.5780 at lambda 0.5 and 0.5776 at lambda 2.0, against 0.5283
+for D. Lambda 0.5 is chosen and enters block 18. The records, without the per-round model
+states, are archived in gs://fedcrag-t1-archive/R17_3_20260927 (R17_3_records.tgz, sha256
+63834f7ef365fdf75d52ba437c394aa4a50a5416885e231e049ba6bdf7cf77f3); the states stay on the
+first T4's disk.

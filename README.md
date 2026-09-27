@@ -84,8 +84,9 @@ registrations or replace the paper draft.
   recomputed from the per-query records without the production metric code
 - `l1_report.py` - the LoTTE block's hypotheses H1 to H6, from the same recomputation
 - `anchors.py`, `rar_settings.py` - rank-anchored replay (registration section 17): each
-  retained query keeps its acquisition reference's top-10 order, and the rule that picks
-  its development configuration
+  retained query keeps its acquisition reference's top-10 order, or under the one-sided floor
+  of 17.3 only its relevant passage's share against a drop, and the rule that picks the
+  development configuration
 - `seed_churn.py` - per-query differences between two seeds at the same stage, on the
   scale of the regression it is compared with
 - `tests/` - unit, integration, mutation and tamper tests

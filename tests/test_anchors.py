@@ -1,4 +1,5 @@
-"""anchors.py: each retained query keeps its reference top-k, and training holds that order."""
+"""anchors.py: each retained query keeps its reference top-k, and training holds that order,
+or, under the one-sided floor, only the relevant passage's share of it."""
 import numpy as np
 import pytest
 import torch
@@ -35,6 +36,10 @@ def test_anchors_keep_the_reference_top_k_in_order_and_the_margin_to_the_best_ne
     assert made["q"]["pids"] == ["p0", "p1"]
     assert made["q"]["scores"] == pytest.approx([20 * sims[0, 0], 20 * sims[0, 1]])
     assert made["q"]["margin"] == pytest.approx(20 * (sims[0, 3] - sims[0, 0]))
+    assert made["q"]["floor_pids"] == ["p3", "p0"]
+    assert made["q"]["floor_scores"] == pytest.approx([20 * sims[0, 3], 20 * sims[0, 0]])
+    with pytest.raises(ValueError, match="no relevant passage"):
+        anchors.rank_anchors(q_emb, ["q"], {"q": {"p9": 1}}, c_emb, ["p0", "p1", "p2", "p3"], 2)
 
 
 def test_the_anchor_term_vanishes_when_the_order_is_kept_and_grows_when_it_is_lost():
@@ -52,3 +57,24 @@ def test_the_anchor_term_vanishes_when_the_order_is_kept_and_grows_when_it_is_lo
     assert lost(features, labels).item() > contrastive.item() + 1e-4
     off = anchors.RankAnchorLoss(model, [("q", ["p1", "p2", "p3"], kept[::-1])], 1, 0.0, 0)
     assert off(features, labels).item() == pytest.approx(contrastive.item(), abs=1e-6)
+
+
+def test_the_floor_term_penalizes_only_a_drop_of_the_relevant_passages_share():
+    torch.manual_seed(0)
+    table = {t: F.normalize(torch.randn(8), dim=0) for t in ("q", "p1", "p2", "p3")}
+    model = TextStub(table)
+    features = [{"embedding": torch.randn(6, 8)}, {"embedding": torch.randn(6, 8)}]
+    labels = torch.zeros(6)
+    from sentence_transformers.losses import MultipleNegativesRankingLoss
+    contrastive = MultipleNegativesRankingLoss(model)(features, labels).item()
+    now = [20 * float(table["q"] @ table[p]) for p in ("p1", "p2", "p3")]
+    stored = {"gained": [now[0] - 1.0, now[1], now[2]], "reordered": [now[0], now[2], now[1]],
+              "lost": [now[0] + 1.0, now[1], now[2]]}
+    loss = {name: anchors.RankAnchorLoss(model, [("q", ["p1", "p2", "p3"], scores)], 1, 2.0, 0,
+                                         floor=True)(features, labels).item()
+            for name, scores in stored.items()}
+    assert loss["gained"] == pytest.approx(contrastive, abs=1e-5)
+    assert loss["reordered"] == pytest.approx(contrastive, abs=1e-5)
+    assert loss["lost"] > contrastive + 1e-4
+    kl = anchors.RankAnchorLoss(model, [("q", ["p1", "p2", "p3"], stored["reordered"])], 1, 2.0, 0)
+    assert kl(features, labels).item() > contrastive + 1e-4

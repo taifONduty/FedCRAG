@@ -12,6 +12,8 @@
 #   CONTINUAL_OUT=<dir> EXPECT_COMMIT=<sha> bash run_continual.sh lotte  # the LoTTE block (after 16.1)
 #   CONTINUAL_OUT=<dir> CONTINUAL_MANIFESTS=<T1 manifests> EXPECT_COMMIT=<sha> \
 #     bash run_continual.sh rar-dev                    # rank-anchored replay development (section 17)
+#   CONTINUAL_OUT=<dir> CONTINUAL_MANIFESTS=<T1 manifests> EXPECT_COMMIT=<sha> RAR_OUT=<17 out> \
+#     bash run_continual.sh floor-dev                  # one-sided rank anchors (section 17.3)
 # The pilot refuses to start unless the repository is at EXPECT_COMMIT with a clean tree and
 # the manifest digests match; every run records its exit status, and an interrupted run is
 # never silently resumed.
@@ -266,6 +268,20 @@ rar_dev() {  # rank-anchored replay development (section 17): schedule A, seed 1
   "$PY" rar_settings.py "$OUT" | tee "$OUT/rar_settings.json"
 }
 
+floor_dev() {  # one-sided rank anchors (section 17.3): against 17's replay run on the same T4
+  say "floor-dev"
+  require_approved_commit
+  require_manifests
+  local m="$MANIFESTS/primary_A.json" rar="${RAR_OUT:-}"
+  [ -n "$rar" ] && [ -f "$rar/rar-fedavg-replay-A-s123/.validated" ] || {
+    say "RAR_OUT does not hold the validated replay run of section 17"; finish REFUSED; }
+  for lam in 0.5 2.0; do
+    run_one "floor-lam$lam-A-s123" "$m" fedavg-replay-anchor 123 8 \
+      --lr 5e-5 --lambda_anchor "$lam" --anchor_k 10 --retention random --anchor_loss floor
+  done
+  "$PY" rar_settings.py "$OUT" "$rar" | tee "$OUT/floor_settings.json"
+}
+
 case "$MODE" in
   bootstrap) bootstrap ;;
   manifests) manifests ;;
@@ -277,5 +293,6 @@ case "$MODE" in
   lotte-profile) lotte_profile; finish DONE ;;
   lotte) lotte; finish DONE ;;
   rar-dev) rar_dev; finish DONE ;;
+  floor-dev) floor_dev; finish DONE ;;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

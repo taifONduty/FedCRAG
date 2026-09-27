@@ -238,6 +238,7 @@ def parse_args():
     ap.add_argument("--lambda_anchor", type=float, default=1.0)
     ap.add_argument("--anchor_k", type=int, default=10)
     ap.add_argument("--retention", choices=("random", "fragile"), default="random")
+    ap.add_argument("--anchor_loss", choices=("kl", "floor"), default="kl")
     ap.add_argument("--no_grad_ckpt", action="store_true")
     ap.add_argument("--out", required=True)
     return ap.parse_args()
@@ -335,13 +336,16 @@ def main():
                     record["training_ids_sha256"][c] = _digest(sorted(data["train_q"]))
                     start = states[c] if local else broadcast
                     if anchor and t > 0:
+                        floor = args.anchor_loss == "floor"
+                        pids, stored = ("floor_pids", "floor_scores") if floor else (
+                            "pids", "scores")
                         anchored = [(q_prefix + data["train_q"][q],
                                      [d_prefix + doc_text(corpora[c][p])
-                                      for p in anchors[c][q]["pids"]],
-                                     anchors[c][q]["scores"]) for q in memories[c].ids]
+                                      for p in anchors[c][q][pids]],
+                                     anchors[c][q][stored]) for q in memories[c].ids]
                         new, n_examples, n_steps = rank.client_train_anchor(
                             model, start, data, anchored, q_prefix, d_prefix, args.batch_size,
-                            args.lr, args.lambda_anchor, [args.seed, int(c), t, r])
+                            args.lr, args.lambda_anchor, [args.seed, int(c), t, r], floor=floor)
                     elif args.arm == "fedavg-replay-distill" and teacher_state is not None:
                         new, n_examples, n_steps = client_train_distill(
                             model, teacher, start, teacher_state, data, memories[c].ids,

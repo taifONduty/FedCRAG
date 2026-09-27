@@ -1453,3 +1453,47 @@ a negative development result and no method block runs from 17. The records, wit
 per-round model states, are archived in gs://fedcrag-t1-archive/R17_20260925 (R17_records.tgz,
 sha256 fa2c53ee493be639ec06ed0832634644d421d34df3ab1655a409063c885ff107); the states stay on
 the T4's disk.
+
+### 17.3 Second method development study: one-sided rank anchors (registered 2026-09-27 13:34 UTC, the clock of the commit that adds it; before any of its runs)
+
+Status. Development. These runs decide, by the rule below, whether one-sided rank anchors are
+confirmed on LoTTE in block 18, which is registered before any score of block L1 is read.
+
+Method (anchors.py and the driver's --anchor_loss floor, commit 103b4a8). RAR as in 17,
+with a different added term. When a client finishes an experience, each of its training
+queries keeps a floor set: the relevant passage that the experience's acquisition reference
+scores highest, followed by the nine non-relevant passages it scores highest, with their
+scores (20 times the cosine) from the reference's own evaluation pass. In every later round,
+for the client's retained queries on the schedule of 17 (each retained query once per round),
+the loss adds lambda times max(0, log p_ref - log p_now), where p is the softmax share of the
+relevant passage within the floor set, under the stored scores and under the current model.
+The term is zero whenever the relevant passage keeps or gains share, whatever happens to the
+order of the other nine. Retention is random; the first experience trains exactly as D.
+Rationale, from 17.2: under D the later rounds raise the earlier experiences more than they
+lower them (improvement 0.0390 against G 0.0242), and RAR held back both movements by holding
+the whole top-10 distribution; the floor resists only the movement that G measures. The
+stored anchors now also carry the floor sets, so a RAR run at this commit records different
+anchor digests than in 17; its training is unchanged.
+
+Runs, on the Azure T4 in ~/R17_3_20260927, with manifest primary_A.json (sha256
+9bd8a61b7f08c30542de6cca58999b021df8b133f72065f7fa38d54ce451c5b1), seed 123, the recipe of
+14.1 and floor sets of ten passages: lambda 0.5, then lambda 2.0. The replay baseline is the D
+run of 17 on the same T4 (~/R17_20260925/rar-fedavg-replay-A-s123, at e3ecabe). Between
+e3ecabe and this commit the code changes only the anchor arm, the settings script, the
+launcher and the tests, so D's code path is the same; the launcher refuses unless that run is
+validated.
+
+Rule (rar_settings.py given the out dirs of this study and of 17). As in 17: among the two
+runs whose A is at least D's A on the T4 (0.1058) minus 0.005, the one with the highest mean
+nDCG@10 on the guard queries of the first three experiences after the last; a tie goes to the
+smaller lambda. That configuration enters block 18 only if its score is higher than D's
+(0.5283). Otherwise the one-sided anchors are reported as a second negative development
+result, and no method block runs.
+
+Reported for every run: the measures of 17 and 17.2, including the improvement on earlier
+experiences. Test scores of these runs are read only after both validate.
+
+Launch. From the commit that adds this section, after the T4's shutdown at 08:30 UTC on 27
+September (17.1): at the 13,321 to 13,788 s measured for the runs of 17, both runs end before
+its next trigger. The machine stays on when the chain ends; a watcher copies the records and
+deallocates it.

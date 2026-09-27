@@ -1497,3 +1497,45 @@ Launch. From the commit that adds this section, after the T4's shutdown at 08:30
 September (17.1): at the 13,321 to 13,788 s measured for the runs of 17, both runs end before
 its next trigger. The machine stays on when the chain ends; a watcher copies the records and
 deallocates it.
+
+### 17.4 Third method development study: hard-negative replay and server averaging (registered 2026-09-27 14:22 UTC, the clock of the commit that adds it; before any of its runs and evaluations)
+
+Status. Development, alongside 17.3. These runs and evaluations decide, by the rule of 17,
+whether hard-negative replay or server averaging is confirmed on LoTTE in block 18, which is
+registered before any score of block L1 is read.
+
+Hard-negative replay (anchors.py mode "hard", driver --anchor_loss hard, commit 6748c23). As
+the floor of 17.3, except that the added term is lambda times -log p_now: the current softmax
+share of the relevant passage within the retained query's floor set (its best relevant
+passage and the nine non-relevant passages its reference scored highest). No stored score
+enters, so a retained query is trained to rank its relevant passage above the passages its
+reference found hardest whether or not it has lost ground. Runs on a second T4
+(fedcrag-a6-t4b, created from a snapshot of the first T4's disk taken at 14:16 UTC on 27
+September, so its code, data and drivers are the same) in ~/R17_4h_20260927: lambda 0.5,
+then 2.0, otherwise as 17.3.
+
+Server averaging (server_average.py, same commit). At the end of each experience the server
+deploys the average of the global models of that experience's last K rounds instead of the
+last one; training is unchanged. It is evaluated on the saved round states of 17's D run,
+each checked against the hash that run recorded, with the driver's own evaluation code, for
+K = 1, 2, 4 and 8, on the first T4 in ~/R17_4a_20260927 after the chain of 17.3 ends. K = 1
+is a reproduction check, not a candidate: it must reproduce D's A and G within 0.0001, or the
+evaluation stops as failed. Rationale: in the pilot, FedAvg, which averages the five clients'
+models in every round, regressed less than half as much as local training (0.024 against
+0.056) at an acquisition 0.003 lower, and replay's seed churn (0.015) was about two thirds of
+its regression; averaging over rounds targets the part of the regression that behaves like
+churn.
+
+Rule (rar_settings.py with the family hard or average). For each family separately, the rule
+of 17 with D's values on the T4 (A 0.1058, guard score 0.5283): among its candidates whose A
+is at least 0.1008, the highest mean nDCG@10 on the guard queries of the first three
+experiences after the last; a tie goes to the smaller lambda or window. The chosen
+configuration enters block 18 only if its guard score is higher than 0.5283. Every family of
+17.3 and 17.4 that enters is confirmed in block 18, each against D with its own paired
+comparisons. Reported as in 17.3; test scores of a family are read only after all its runs
+validate.
+
+Launch. Both from the commit that adds this section: hard-negative replay on the second T4 at
+once, server averaging on the first T4 once the chain of 17.3 has written its end marker.
+Each T4 is deallocated when its chain ends. The first T4's daily 08:30 UTC shutdown (17.1) is
+disabled until 10 October, at the user's decision, so that no run spans it.

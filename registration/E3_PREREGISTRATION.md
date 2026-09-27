@@ -1421,3 +1421,35 @@ and the manifest digests, skipped the three validated runs and started the inter
 from its first round. Nothing else changed. The schedule stays in place: at the 13,697 and
 13,788 s measured for the first two RAR runs, the two remaining runs end before it next
 triggers.
+
+### 17.2 Development outcome for rank-anchored replay (written 2026-09-26 01:08 UTC, the clock of the commit that adds it; after all five runs validated)
+
+All five runs exited 0 and passed validate_continual; the chain wrote DONE at 22:33:37 UTC on
+2026-09-26. Wall times on the T4: D 9,374 s; RAR with lambda 0.5 and 2.0 under random
+retention 13,788 s and 13,697 s, under fragile retention 13,384 s (the restarted run of 17.1)
+and 13,321 s. Results on test queries, recomputed with the functions of t1_report.py (no
+sanity problem); development evidence, one seed and one order:
+
+| run | A | G | improvement | backward transfer | reference nDCG@10 | nDCG@10 on earlier experiences at the end | pairs losing at least 0.010 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| D (T4) | 0.1058 | 0.0242 | 0.0390 | 0.0149 | 0.4990 | 0.5269 | 14.9% |
+| RAR, lambda 0.5, random | 0.1007 | 0.0075 | 0.0166 | 0.0091 | 0.4964 | 0.5138 | 6.5% |
+| RAR, lambda 2.0, random | 0.0970 | 0.0065 | 0.0140 | 0.0075 | 0.4937 | 0.5084 | 5.8% |
+| RAR, lambda 0.5, fragile | 0.1012 | 0.0091 | 0.0173 | 0.0082 | 0.4967 | 0.5137 | 7.3% |
+| RAR, lambda 2.0, fragile | 0.0959 | 0.0073 | 0.0130 | 0.0057 | 0.4934 | 0.5073 | 6.1% |
+
+Improvement is the positive part of the change against the reference, so backward transfer is
+improvement minus G. D on the T4 is within 0.001 of D on the L4 (15.2) in every column.
+Against D, RAR lowered G by 0.0151 to 0.0177 (62% to 73%) and the improvement by 0.0218 to
+0.0260 (56% to 67%).
+
+Rule of 17, applied by rar_settings.py (output rar_settings.json, sha256
+2ef7017e753706c6be300547afa386d6f657ed3c313e9038fbc09be7f6fa1571). D's A on the T4 is 0.1058,
+so the floor is 0.1008; only lambda 0.5 with fragile retention (A 0.1012) clears it. Mean
+nDCG@10 on the guard queries of the first three experiences after the last: D 0.5283; RAR
+0.5193 (0.5, random), 0.5127 (2.0, random), 0.5155 (0.5, fragile) and 0.5117 (2.0, fragile).
+Every RAR run is below D on this statistic, so no configuration is chosen: RAR is reported as
+a negative development result and no method block runs from 17. The records, without the
+per-round model states, are archived in gs://fedcrag-t1-archive/R17_20260925 (R17_records.tgz,
+sha256 fa2c53ee493be639ec06ed0832634644d421d34df3ab1655a409063c885ff107); the states stay on
+the T4's disk.

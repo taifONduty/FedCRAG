@@ -1539,3 +1539,35 @@ Launch. Both from the commit that adds this section: hard-negative replay on the
 once, server averaging on the first T4 once the chain of 17.3 has written its end marker.
 Each T4 is deallocated when its chain ends. The first T4's daily 08:30 UTC shutdown (17.1) is
 disabled until 10 October, at the user's decision, so that no run spans it.
+
+### 17.5 Fourth method development study: exact running blend of deployments (registered 2026-09-27 17:44 UTC, the clock of the commit that adds it; before any of its evaluations)
+
+Status. Development. After the runs of 17.3 and 17.4 were launched, a survey of five bodies
+of work (continual dense retrieval, regression-free model updates, federated continual
+learning, parameter-efficient continual learning and model merging, continual contrastive
+learning) found no method that measures or reduces query-level regression in continual
+federated retrieval, and one consistent pattern: fixes that pull the new model toward the
+old one cost accuracy, while fixes that reduce the new model's variance (ensembles, weight
+averages, soups) reduce negative flips at no accuracy cost. Two directions were chosen from
+it: train fast and deploy slow (this section), and projected contrastive consolidation
+(registered separately, before its runs). These evaluations decide, by the rule of 17,
+whether the running blend enters block 18.
+
+Method (server_average.py --blend b, commit 0ea2a8b). Training is unchanged. At the end of each
+experience the server deploys d_t = b d_(t-1) + (1 - b) s_t, where s_t is that experience's
+last global model and d_0 = s_0. The blend is taken over the LoRA updates B A exactly, by
+stacking the adapters along the rank with each B scaled by its weight, not over the A and B
+factors separately, whose product would add cross terms. This is the weight interpolation of
+BCWI (Schumann et al., EACL 2024) and the running deployment average of TIME (Dziadzio et
+al., 2024), applied at every experience of a federated stream. It is evaluated on the saved
+round states of 17's D run, each checked against the hash that run recorded, with the
+driver's own evaluation code, for b = 0.25 and 0.5, on the second T4 in ~/R17_5_20260927
+once the chain of 17.4 there has written its end marker.
+
+Rule (rar_settings.py with the family blend). As in 17.4: among the two whose A is at least
+0.1008, the higher mean nDCG@10 on the guard queries of the first three experiences after
+the last, a tie going to the smaller b; it enters block 18 only if that score is higher than
+0.5283. Test scores are read only after both evaluations validate.
+
+Launch. From the commit that adds this section; the second T4 is deallocated when its chain
+ends.

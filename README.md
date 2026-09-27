@@ -88,8 +88,9 @@ registrations or replace the paper draft.
   of 17.3 only its relevant passage's share against a drop, or under hard-negative replay
   (17.4) trains that share against the passages its reference ranked hardest; and the rule
   that picks each family's development configuration
-- `server_average.py` - server averaging (17.4): a finished run's saved round states
-  evaluated as if the server had deployed the average of each experience's last K rounds
+- `server_average.py` - server averaging (17.4, 17.5): a finished run's saved round states
+  evaluated as if the server had deployed the average of each experience's last K rounds, or
+  an exact running blend of its deployments over LoRA updates
 - `seed_churn.py` - per-query differences between two seeds at the same stage, on the
   scale of the regression it is compared with
 - `tests/` - unit, integration, mutation and tamper tests

@@ -1,9 +1,13 @@
-"""Server averaging (registration section 17.4). At the end of each experience the server
-deploys the average of the global models of that experience's last K rounds instead of the
-last one. Training is unchanged, so a finished run's saved round states are evaluated again
-under that deployment with the driver's own evaluation; K = 1 must reproduce the run.
+"""Server averaging (registration sections 17.4 and 17.5). At the end of each experience the
+server deploys the average of the global models of that experience's last K rounds instead of
+the last one (17.4), or, with --blend b, the exact running blend b * previous deployment +
+(1 - b) * this experience's last global model, averaged as LoRA updates B A rather than as
+separate factors (17.5). Training is unchanged, so a finished run's saved round states are
+evaluated again under that deployment with the driver's own evaluation; K = 1 must reproduce
+the run.
 
-usage: python server_average.py --source <run dir> --window K --data_root <dir> --out <dir>
+usage: python server_average.py --source <run dir> (--window K | --blend b) --data_root <dir>
+           --out <dir>
 """
 import argparse
 import glob
@@ -26,6 +30,26 @@ def average(states):
             for k in states[0]}
 
 
+def stack(weighted):
+    """One LoRA state whose update B A equals the weighted sum of the given states' updates,
+    for a model of rank (states x rank) with the same alpha / r: the A factors stacked along
+    the rank, the B factors scaled by their weights and stacked alongside."""
+    out = {}
+    for key in weighted[0][1]:
+        if "lora_A" not in key and "lora_B" not in key:
+            raise ValueError(f"cannot stack the non-LoRA tensor {key}")
+        dim = 0 if "lora_A" in key else 1
+        out[key] = torch.cat([s[key] * (w if dim == 1 else 1.0) for w, s in weighted], dim=dim)
+    return out
+
+
+def blend_weights(position, b):
+    """The weight of each experience's last global model in the deployment at ``position``
+    under d_0 = s_0, d_t = b d_(t-1) + (1 - b) s_t."""
+    return [b ** position if s == 0 else b ** (position - s) * (1 - b)
+            for s in range(position + 1)]
+
+
 def round_states(source_dir, record, position, window):
     """The global states of the last ``window`` rounds at ``position``, each checked against
     the hash the run recorded for it."""
@@ -42,7 +66,9 @@ def round_states(source_dir, record, position, window):
 def parse_args(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True, help="the directory of a validated federated run")
-    ap.add_argument("--window", type=int, required=True)
+    rule = ap.add_mutually_exclusive_group(required=True)
+    rule.add_argument("--window", type=int)
+    rule.add_argument("--blend", type=float)
     ap.add_argument("--data_root", required=True)
     ap.add_argument("--out", required=True)
     return ap.parse_args(argv)
@@ -55,8 +81,11 @@ def main(argv=None):
         source = json.load(handle)
     T, R, clients = (source["experiences_per_client"], source["rounds_per_experience"],
                      source["clients"])
-    if source["arm"] in driver.LOCAL_ARMS + ("frozen",) or not 1 <= args.window <= R:
-        raise SystemExit(f"cannot average {source['arm']} over {args.window} of {R} rounds")
+    if source["arm"] in driver.LOCAL_ARMS + ("frozen",) or (
+            args.window is not None and not 1 <= args.window <= R) or (
+            args.blend is not None and not 0 < args.blend < 1):
+        raise SystemExit(f"cannot average {source['arm']} with window {args.window} "
+                         f"or blend {args.blend} over {R} rounds")
     if driver._sha256_file(source["manifest_path"]) != source["manifest_sha256"]:
         raise SystemExit("the manifest does not match the run's recorded digest")
     with open(source["manifest_path"]) as handle:
@@ -66,9 +95,11 @@ def main(argv=None):
                  for e in range(T)} for c in clients}
     name, batch = source["args"]["model"], source["args"]["eval_batch_size"]
     model_path, q_prefix, d_prefix, fp16 = driver.resolve_local(name)
-    model, _ = driver.new_model(name, model_path, source["args"]["lora_rank"], fp16,
-                                "trainable-ab", grad_ckpt=False)
-    out = {"arm": source["arm"] + "-average", "window": args.window, "seed": source["seed"],
+    rank = source["args"]["lora_rank"]
+    model, _ = driver.new_model(name, model_path, rank, fp16, "trainable-ab", grad_ckpt=False)
+    last = [round_states(args.source, source, t, 1)[0] for t in range(T)] if args.blend else []
+    out = {"arm": source["arm"] + "-average", "window": args.window, "blend": args.blend,
+           "seed": source["seed"],
            "source_record": path, "source_sha256": driver._sha256_file(path),
            "manifest_path": source["manifest_path"], "manifest_sha256": source["manifest_sha256"],
            "clients": clients, "order": source["order"], "experiences_per_client": T,
@@ -76,7 +107,12 @@ def main(argv=None):
            "frozen": source["frozen"], "matrix": {}, "references": {c: {} for c in clients},
            "eval_pool": {}, "summary": {}}
     for t in range(T):
-        state = average(round_states(args.source, source, t, args.window))
+        if args.blend:
+            state = stack(list(zip(blend_weights(t, args.blend), last[:t + 1])))
+            model, _ = driver.new_model(name, model_path, rank * (t + 1), fp16, "trainable-ab",
+                                        grad_ckpt=False)
+        else:
+            state = average(round_states(args.source, source, t, args.window))
         out["matrix"][str(t)] = {}
         for c in clients:
             order = source["order"][c]
@@ -92,7 +128,8 @@ def main(argv=None):
         problems += [f"window 1 misses the run's {k} by {d}" for k, d in out["reproduction"].items()
                      if abs(d) > REPRODUCTION_TOLERANCE]
     os.makedirs(args.out, exist_ok=True)
-    jpath = os.path.join(args.out, os.path.basename(path)[:-5] + f"_average{args.window}.json")
+    tag = f"_average{args.window}" if args.window else f"_blend{args.blend}"
+    jpath = os.path.join(args.out, os.path.basename(path)[:-5] + tag + ".json")
     driver.dump_json(out, jpath)
     if problems:
         raise SystemExit("\n".join(problems))

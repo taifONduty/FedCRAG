@@ -1,9 +1,10 @@
 """The rank-anchored replay configuration chosen by the rule of registration section 17, or
 none if no configuration beats replay on the development criterion. Given the section 17 out
 dir and a family as well, the same rule over that family's runs against 17's replay run: the
-one-sided floor of 17.3, or the hard-negative replay and server averaging of 17.4.
+one-sided floor of 17.3, the hard-negative replay and server averaging of 17.4, or the exact
+running blend of 17.5.
 
-usage: python rar_settings.py <development out dir> [<section 17 out dir> [floor|hard|average]]
+usage: python rar_settings.py <development out dir> [<17 out dir> [floor|hard|average|blend]]
 """
 import json
 import os
@@ -19,7 +20,9 @@ CANDIDATES = {(lam, retention): f"rar-anchor-lam{lam}-{retention}-A-s123"
               for retention in ("random", "fragile") for lam in (0.5, 2.0)}
 FAMILIES = {"floor": {(lam, "random"): f"floor-lam{lam}-A-s123" for lam in (0.5, 2.0)},
             "hard": {(lam, "random"): f"hard-lam{lam}-A-s123" for lam in (0.5, 2.0)},
-            "average": {(k, "tail"): f"average-k{k}-A-s123" for k in (2, 4, 8)}}
+            "average": {(k, "tail"): f"average-k{k}-A-s123" for k in (2, 4, 8)},
+            "blend": {(b, "exact"): f"blend-b{b}-A-s123" for b in (0.25, 0.5)}}
+LABELS = {"average": ("window", "average"), "blend": ("blend", "average")}
 TOLERANCE = 0.005
 
 
@@ -41,8 +44,8 @@ def choose(candidates, baseline):
 
 def main(out_dir, baseline_dir=None, family="floor"):
     names = CANDIDATES if baseline_dir is None else FAMILIES[family]
-    anchored = names is not FAMILIES["average"]
-    labels = ("lambda_anchor", "retention") if anchored else ("window", "average")
+    labels = LABELS.get(family, ("lambda_anchor", "retention")) if baseline_dir else (
+        "lambda_anchor", "retention")
     baseline = measures(_record(os.path.join(baseline_dir or out_dir, BASELINE)))
     candidates = {k: measures(_record(os.path.join(out_dir, name))) for k, name in names.items()}
     chosen = choose(candidates, baseline)

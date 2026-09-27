@@ -15,6 +15,7 @@
 #   CONTINUAL_OUT=<dir> CONTINUAL_MANIFESTS=<T1 manifests> EXPECT_COMMIT=<sha> RAR_OUT=<17 out> \
 #     bash run_continual.sh floor-dev                  # one-sided rank anchors (section 17.3)
 #     ... hard-dev | average-dev                       # hard-negative replay, server averaging (17.4)
+#     ... blend-dev                                    # exact running blend of deployments (17.5)
 # The pilot refuses to start unless the repository is at EXPECT_COMMIT with a clean tree and
 # the manifest digests match; every run records its exit status, and an interrupted run is
 # never silently resumed.
@@ -287,8 +288,8 @@ anchor_dev() {  # family (floor: 17.3, hard: 17.4), against 17's replay run on a
   "$PY" rar_settings.py "$OUT" "$RAR" "$1" | tee "$OUT/$1_settings.json"
 }
 
-average_one() {  # name window: 17's replay run deployed as the average of its last rounds
-  local name=$1 window=$2
+average_one() {  # name rule...: 17's replay run under a server averaging rule (17.4, 17.5)
+  local name=$1; shift
   local dir="$OUT/$name"
   if [ -f "$dir/.validated" ]; then say "SKIP $name"; return 0; fi
   if [ -f "$dir/.running" ]; then
@@ -300,7 +301,7 @@ average_one() {  # name window: 17's replay run deployed as the average of its l
   date -u +%FT%TZ > "$dir/.running"
   local t0=$(date +%s)
   local rc=0
-  "$PY" server_average.py --source "$RAR/rar-fedavg-replay-A-s123" --window "$window" \
+  "$PY" server_average.py --source "$RAR/rar-fedavg-replay-A-s123" "$@" \
     --data_root "$DATA" --out "$dir" > "$dir/run.log" 2>&1 || rc=$?
   echo "$(( $(date +%s) - t0 ))" > "$dir/wall_seconds"
   echo "$rc" > "$dir/exit_status"
@@ -315,8 +316,17 @@ average_dev() {  # server averaging (section 17.4): evaluation only; window 1 re
   require_approved_commit
   require_manifests
   require_rar_baseline
-  for k in 1 2 4 8; do average_one "average-k$k-A-s123" "$k"; done
+  for k in 1 2 4 8; do average_one "average-k$k-A-s123" --window "$k"; done
   "$PY" rar_settings.py "$OUT" "$RAR" average | tee "$OUT/average_settings.json"
+}
+
+blend_dev() {  # the exact running blend of deployments (section 17.5): evaluation only
+  say "blend-dev"
+  require_approved_commit
+  require_manifests
+  require_rar_baseline
+  for b in 0.25 0.5; do average_one "blend-b$b-A-s123" --blend "$b"; done
+  "$PY" rar_settings.py "$OUT" "$RAR" blend | tee "$OUT/blend_settings.json"
 }
 
 case "$MODE" in
@@ -333,5 +343,6 @@ case "$MODE" in
   floor-dev) anchor_dev floor; finish DONE ;;
   hard-dev) anchor_dev hard; finish DONE ;;
   average-dev) average_dev; finish DONE ;;
+  blend-dev) blend_dev; finish DONE ;;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

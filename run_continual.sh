@@ -14,6 +14,7 @@
 #     bash run_continual.sh rar-dev                    # rank-anchored replay development (section 17)
 #   CONTINUAL_OUT=<dir> CONTINUAL_MANIFESTS=<T1 manifests> EXPECT_COMMIT=<sha> RAR_OUT=<17 out> \
 #     bash run_continual.sh floor-dev                  # one-sided rank anchors (section 17.3)
+#     ... hard-dev | average-dev                       # hard-negative replay, server averaging (17.4)
 # The pilot refuses to start unless the repository is at EXPECT_COMMIT with a clean tree and
 # the manifest digests match; every run records its exit status, and an interrupted run is
 # never silently resumed.
@@ -268,18 +269,54 @@ rar_dev() {  # rank-anchored replay development (section 17): schedule A, seed 1
   "$PY" rar_settings.py "$OUT" | tee "$OUT/rar_settings.json"
 }
 
-floor_dev() {  # one-sided rank anchors (section 17.3): against 17's replay run on the same T4
-  say "floor-dev"
+require_rar_baseline() {  # the replay run of section 17 that 17.3 and 17.4 are measured against
+  RAR="${RAR_OUT:-}"
+  [ -n "$RAR" ] && [ -f "$RAR/rar-fedavg-replay-A-s123/.validated" ] || {
+    say "RAR_OUT does not hold the validated replay run of section 17"; finish REFUSED; }
+}
+
+anchor_dev() {  # family (floor: 17.3, hard: 17.4), against 17's replay run on a T4
+  say "$1-dev"
   require_approved_commit
   require_manifests
-  local m="$MANIFESTS/primary_A.json" rar="${RAR_OUT:-}"
-  [ -n "$rar" ] && [ -f "$rar/rar-fedavg-replay-A-s123/.validated" ] || {
-    say "RAR_OUT does not hold the validated replay run of section 17"; finish REFUSED; }
+  require_rar_baseline
   for lam in 0.5 2.0; do
-    run_one "floor-lam$lam-A-s123" "$m" fedavg-replay-anchor 123 8 \
-      --lr 5e-5 --lambda_anchor "$lam" --anchor_k 10 --retention random --anchor_loss floor
+    run_one "$1-lam$lam-A-s123" "$MANIFESTS/primary_A.json" fedavg-replay-anchor 123 8 \
+      --lr 5e-5 --lambda_anchor "$lam" --anchor_k 10 --retention random --anchor_loss "$1"
   done
-  "$PY" rar_settings.py "$OUT" "$rar" | tee "$OUT/floor_settings.json"
+  "$PY" rar_settings.py "$OUT" "$RAR" "$1" | tee "$OUT/$1_settings.json"
+}
+
+average_one() {  # name window: 17's replay run deployed as the average of its last rounds
+  local name=$1 window=$2
+  local dir="$OUT/$name"
+  if [ -f "$dir/.validated" ]; then say "SKIP $name"; return 0; fi
+  if [ -f "$dir/.running" ]; then
+    say "$name was interrupted on $(cat "$dir/.running"); move it aside before resuming"
+    finish REFUSED
+  fi
+  mkdir -p "$dir"
+  say "START $name"
+  date -u +%FT%TZ > "$dir/.running"
+  local t0=$(date +%s)
+  local rc=0
+  "$PY" server_average.py --source "$RAR/rar-fedavg-replay-A-s123" --window "$window" \
+    --data_root "$DATA" --out "$dir" > "$dir/run.log" 2>&1 || rc=$?
+  echo "$(( $(date +%s) - t0 ))" > "$dir/wall_seconds"
+  echo "$rc" > "$dir/exit_status"
+  [ "$rc" = "0" ] || { say "FAILED $name (exit $rc)"; finish FAILED; }
+  rm -f "$dir/.running"
+  echo ok > "$dir/.validated"
+  say "DONE $name ($(cat "$dir/wall_seconds") s)"
+}
+
+average_dev() {  # server averaging (section 17.4): evaluation only; window 1 reproduces 17's run
+  say "average-dev"
+  require_approved_commit
+  require_manifests
+  require_rar_baseline
+  for k in 1 2 4 8; do average_one "average-k$k-A-s123" "$k"; done
+  "$PY" rar_settings.py "$OUT" "$RAR" average | tee "$OUT/average_settings.json"
 }
 
 case "$MODE" in
@@ -293,6 +330,8 @@ case "$MODE" in
   lotte-profile) lotte_profile; finish DONE ;;
   lotte) lotte; finish DONE ;;
   rar-dev) rar_dev; finish DONE ;;
-  floor-dev) floor_dev; finish DONE ;;
+  floor-dev) anchor_dev floor; finish DONE ;;
+  hard-dev) anchor_dev hard; finish DONE ;;
+  average-dev) average_dev; finish DONE ;;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

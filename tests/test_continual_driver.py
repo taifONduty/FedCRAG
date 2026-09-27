@@ -235,8 +235,8 @@ def test_anchor_arm_anchors_every_replayed_query_and_validates(stream, tmp_path,
     calls = []
 
     def fake_anchor(model, start, data, anchored, q_prefix, d_prefix, batch_size, lr, lam, seed,
-                    floor=False):
-        calls.append((anchored, floor))
+                    mode="kl"):
+        calls.append((anchored, mode))
         new = {k: v.clone() for k, v in start.items()}
         new["lora_B"] = new["lora_B"] + 0.1
         return new, len(data["train_q"]), 3
@@ -245,14 +245,15 @@ def test_anchor_arm_anchors_every_replayed_query_and_validates(stream, tmp_path,
     random_run, _, _ = run(stream, "fedavg-replay-anchor", tmp_path / "random", ["--anchor_k", "3"])
     fragile_run, _, _ = run(stream, "fedavg-replay-anchor", tmp_path / "fragile",
                             ["--anchor_k", "3", "--retention", "fragile"])
-    run(stream, "fedavg-replay-anchor", tmp_path / "floor",
-        ["--anchor_k", "3", "--anchor_loss", "floor"])
-    for out in ("random", "fragile", "floor"):
+    for loss in ("floor", "hard"):
+        run(stream, "fedavg-replay-anchor", tmp_path / loss,
+            ["--anchor_k", "3", "--anchor_loss", loss])
+    for out in ("random", "fragile", "floor", "hard"):
         validate_continual.validate_run(tmp_path / out)
     assert calls and all(len(texts) == 3 and len(scores) == 3
                          for anchored, _ in calls for _, texts, scores in anchored)
-    flags = [floor for _, floor in calls]
-    assert flags == [False] * (2 * len(flags) // 3) + [True] * (len(flags) // 3)
+    modes, runs = [mode for _, mode in calls], len(calls) // 4
+    assert modes == ["kl"] * (2 * runs) + ["floor"] * runs + ["hard"] * runs
     assert all(set(r["anchors_sha256"]["0"]) == {str(stream[1]["clients"]["0"]["order"][0])}
                for r in (random_run, fragile_run))
     replayed = lambda result: [r["memory"]["0"]["replay"] for r in result["rounds"][2:]]

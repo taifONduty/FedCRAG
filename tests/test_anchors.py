@@ -1,5 +1,6 @@
 """anchors.py: each retained query keeps its reference top-k, and training holds that order,
-or, under the one-sided floor, only the relevant passage's share of it."""
+or, under the one-sided floor, only the relevant passage's share of it; hard-negative replay
+trains that share with no stored target."""
 import numpy as np
 import pytest
 import torch
@@ -59,7 +60,7 @@ def test_the_anchor_term_vanishes_when_the_order_is_kept_and_grows_when_it_is_lo
     assert off(features, labels).item() == pytest.approx(contrastive.item(), abs=1e-6)
 
 
-def test_the_floor_term_penalizes_only_a_drop_of_the_relevant_passages_share():
+def test_the_floor_penalizes_only_a_drop_of_the_relevant_share_and_hard_replay_always_trains_it():
     torch.manual_seed(0)
     table = {t: F.normalize(torch.randn(8), dim=0) for t in ("q", "p1", "p2", "p3")}
     model = TextStub(table)
@@ -71,10 +72,17 @@ def test_the_floor_term_penalizes_only_a_drop_of_the_relevant_passages_share():
     stored = {"gained": [now[0] - 1.0, now[1], now[2]], "reordered": [now[0], now[2], now[1]],
               "lost": [now[0] + 1.0, now[1], now[2]]}
     loss = {name: anchors.RankAnchorLoss(model, [("q", ["p1", "p2", "p3"], scores)], 1, 2.0, 0,
-                                         floor=True)(features, labels).item()
+                                         mode="floor")(features, labels).item()
             for name, scores in stored.items()}
     assert loss["gained"] == pytest.approx(contrastive, abs=1e-5)
     assert loss["reordered"] == pytest.approx(contrastive, abs=1e-5)
     assert loss["lost"] > contrastive + 1e-4
     kl = anchors.RankAnchorLoss(model, [("q", ["p1", "p2", "p3"], stored["reordered"])], 1, 2.0, 0)
     assert kl(features, labels).item() > contrastive + 1e-4
+    share = torch.log_softmax(torch.tensor(now), dim=0)[0].item()
+    for scores in stored.values():
+        hard = anchors.RankAnchorLoss(model, [("q", ["p1", "p2", "p3"], scores)], 1, 2.0, 0,
+                                      mode="hard")
+        assert hard(features, labels).item() == pytest.approx(contrastive - 2.0 * share, abs=1e-5)
+    with pytest.raises(ValueError, match="anchor mode"):
+        anchors.RankAnchorLoss(model, [], 1, 2.0, 0, mode="soft")

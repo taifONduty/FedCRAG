@@ -16,6 +16,7 @@
 #     bash run_continual.sh floor-dev                  # one-sided rank anchors (section 17.3)
 #     ... hard-dev | average-dev                       # hard-negative replay, server averaging (17.4)
 #     ... blend-dev                                    # exact running blend of deployments (17.5)
+#     ... ckc-dev                                      # contrastive consolidation (17.6)
 # The pilot refuses to start unless the repository is at EXPECT_COMMIT with a clean tree and
 # the manifest digests match; every run records its exit status, and an interrupted run is
 # never silently resumed.
@@ -276,16 +277,18 @@ require_rar_baseline() {  # the replay run of section 17 that 17.3 and 17.4 are 
     say "RAR_OUT does not hold the validated replay run of section 17"; finish REFUSED; }
 }
 
-anchor_dev() {  # family (floor: 17.3, hard: 17.4), against 17's replay run on a T4
-  say "$1-dev"
+anchor_dev() {  # family [args] (floor: 17.3, hard: 17.4, ckc: 17.6), against 17's replay run
+  local family=$1; shift
+  say "$family-dev"
   require_approved_commit
   require_manifests
   require_rar_baseline
   for lam in 0.5 2.0; do
-    run_one "$1-lam$lam-A-s123" "$MANIFESTS/primary_A.json" fedavg-replay-anchor 123 8 \
-      --lr 5e-5 --lambda_anchor "$lam" --anchor_k 10 --retention random --anchor_loss "$1"
+    run_one "$family-lam$lam-A-s123" "$MANIFESTS/primary_A.json" fedavg-replay-anchor 123 8 \
+      --lr 5e-5 --lambda_anchor "$lam" --anchor_k 10 --retention random \
+      --anchor_loss "$family" "$@"
   done
-  "$PY" rar_settings.py "$OUT" "$RAR" "$1" | tee "$OUT/$1_settings.json"
+  "$PY" rar_settings.py "$OUT" "$RAR" "$family" | tee "$OUT/${family}_settings.json"
 }
 
 average_one() {  # name rule...: 17's replay run under a server averaging rule (17.4, 17.5)
@@ -344,5 +347,6 @@ case "$MODE" in
   hard-dev) anchor_dev hard; finish DONE ;;
   average-dev) average_dev; finish DONE ;;
   blend-dev) blend_dev; finish DONE ;;
+  ckc-dev) anchor_dev ckc --projector_rank 16; finish DONE ;;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

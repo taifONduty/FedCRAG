@@ -115,6 +115,19 @@ def _summarise(scores):
     return {"per_query": per_query, **means}
 
 
+def anchored_items(anchors, ids, data, corpus, q_prefix, d_prefix, mode):
+    """Each retained query's text with what its anchor mode keeps: the reference top-k (kl),
+    the floor set (floor, hard), or the relevant passage with both reference vectors (ckc)."""
+    if mode == "ckc":
+        return [(q_prefix + data["train_q"][q],
+                 [d_prefix + doc_text(corpus[anchors[q]["floor_pids"][0]])],
+                 (anchors[q]["q_vec"], anchors[q]["p_vec"])) for q in ids]
+    pids, stored = ("pids", "scores") if mode == "kl" else ("floor_pids", "floor_scores")
+    return [(q_prefix + data["train_q"][q], [d_prefix + doc_text(corpus[p])
+                                             for p in anchors[q][pids]],
+             anchors[q][stored]) for q in ids]
+
+
 def encode_corpus(model, state, corpus, d_prefix, batch_size):
     cids = list(corpus)
     return cids, _encode(model, state, [d_prefix + doc_text(corpus[c]) for c in cids],
@@ -238,7 +251,8 @@ def parse_args():
     ap.add_argument("--lambda_anchor", type=float, default=1.0)
     ap.add_argument("--anchor_k", type=int, default=10)
     ap.add_argument("--retention", choices=("random", "fragile"), default="random")
-    ap.add_argument("--anchor_loss", choices=("kl", "floor", "hard"), default="kl")
+    ap.add_argument("--anchor_loss", choices=rank.MODES, default="kl")
+    ap.add_argument("--projector_rank", type=int, default=0, help="for --anchor_loss ckc")
     ap.add_argument("--no_grad_ckpt", action="store_true")
     ap.add_argument("--out", required=True)
     return ap.parse_args()
@@ -336,16 +350,13 @@ def main():
                     record["training_ids_sha256"][c] = _digest(sorted(data["train_q"]))
                     start = states[c] if local else broadcast
                     if anchor and t > 0:
-                        pids, stored = (("pids", "scores") if args.anchor_loss == "kl"
-                                        else ("floor_pids", "floor_scores"))
-                        anchored = [(q_prefix + data["train_q"][q],
-                                     [d_prefix + doc_text(corpora[c][p])
-                                      for p in anchors[c][q][pids]],
-                                     anchors[c][q][stored]) for q in memories[c].ids]
+                        anchored = anchored_items(anchors[c], memories[c].ids, data,
+                                                  corpora[c], q_prefix, d_prefix,
+                                                  args.anchor_loss)
                         new, n_examples, n_steps = rank.client_train_anchor(
                             model, start, data, anchored, q_prefix, d_prefix, args.batch_size,
                             args.lr, args.lambda_anchor, [args.seed, int(c), t, r],
-                            mode=args.anchor_loss)
+                            mode=args.anchor_loss, projector_rank=args.projector_rank)
                     elif args.arm == "fedavg-replay-distill" and teacher_state is not None:
                         new, n_examples, n_steps = client_train_distill(
                             model, teacher, start, teacher_state, data, memories[c].ids,
@@ -390,7 +401,8 @@ def main():
                 q_emb = _encode(model, state, [q_prefix + cell["train_q"][q] for q in qids],
                                 args.eval_batch_size)
                 made = rank.rank_anchors(q_emb, qids, cell["train_qrels"], encoded[1],
-                                         encoded[0], args.anchor_k)
+                                         encoded[0], args.anchor_k,
+                                         vectors=args.anchor_loss == "ckc")
                 anchors[c].update(made)
                 out["anchors_sha256"][c][str(current[c])] = _digest(
                     [json.dumps(made[q], sort_keys=True) for q in sorted(made)])

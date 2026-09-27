@@ -235,8 +235,8 @@ def test_anchor_arm_anchors_every_replayed_query_and_validates(stream, tmp_path,
     calls = []
 
     def fake_anchor(model, start, data, anchored, q_prefix, d_prefix, batch_size, lr, lam, seed,
-                    mode="kl"):
-        calls.append((anchored, mode))
+                    mode="kl", projector_rank=0):
+        calls.append((anchored, mode, projector_rank))
         new = {k: v.clone() for k, v in start.items()}
         new["lora_B"] = new["lora_B"] + 0.1
         return new, len(data["train_q"]), 3
@@ -245,15 +245,18 @@ def test_anchor_arm_anchors_every_replayed_query_and_validates(stream, tmp_path,
     random_run, _, _ = run(stream, "fedavg-replay-anchor", tmp_path / "random", ["--anchor_k", "3"])
     fragile_run, _, _ = run(stream, "fedavg-replay-anchor", tmp_path / "fragile",
                             ["--anchor_k", "3", "--retention", "fragile"])
-    for loss in ("floor", "hard"):
+    for loss in ("floor", "hard", "ckc"):
         run(stream, "fedavg-replay-anchor", tmp_path / loss,
-            ["--anchor_k", "3", "--anchor_loss", loss])
-    for out in ("random", "fragile", "floor", "hard"):
+            ["--anchor_k", "3", "--anchor_loss", loss, "--projector_rank", "2"])
+    for out in ("random", "fragile", "floor", "hard", "ckc"):
         validate_continual.validate_run(tmp_path / out)
-    assert calls and all(len(texts) == 3 and len(scores) == 3
-                         for anchored, _ in calls for _, texts, scores in anchored)
-    modes, runs = [mode for _, mode in calls], len(calls) // 4
-    assert modes == ["kl"] * (2 * runs) + ["floor"] * runs + ["hard"] * runs
+    modes, runs = [mode for _, mode, _ in calls], len(calls) // 5
+    assert modes == ["kl"] * (2 * runs) + ["floor"] * runs + ["hard"] * runs + ["ckc"] * runs
+    assert all(len(texts) == 3 and len(scores) == 3
+               for anchored, mode, _ in calls if mode != "ckc" for _, texts, scores in anchored)
+    assert all(len(texts) == 1 and len(q_vec) == len(p_vec) == 8 and rank == 2
+               for anchored, mode, rank in calls if mode == "ckc"
+               for _, texts, (q_vec, p_vec) in anchored)
     assert all(set(r["anchors_sha256"]["0"]) == {str(stream[1]["clients"]["0"]["order"][0])}
                for r in (random_run, fragile_run))
     replayed = lambda result: [r["memory"]["0"]["replay"] for r in result["rounds"][2:]]

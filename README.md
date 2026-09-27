@@ -86,8 +86,10 @@ registrations or replace the paper draft.
 - `anchors.py`, `rar_settings.py` - rank-anchored replay (registration section 17): each
   retained query keeps its acquisition reference's top-10 order, or under the one-sided floor
   of 17.3 only its relevant passage's share against a drop, or under hard-negative replay
-  (17.4) trains that share against the passages its reference ranked hardest; and the rule
-  that picks each family's development configuration
+  (17.4) trains that share against the passages its reference ranked hardest, or under
+  contrastive consolidation (17.6) keeps each retained item's reference embeddings
+  identifiable through a small learned map; and the rule that picks each family's development
+  configuration
 - `server_average.py` - server averaging (17.4, 17.5): a finished run's saved round states
   evaluated as if the server had deployed the average of each experience's last K rounds, or
   an exact running blend of its deployments over LoRA updates

@@ -1,10 +1,10 @@
 """The rank-anchored replay configuration chosen by the rule of registration section 17, or
 none if no configuration beats replay on the development criterion. Given the section 17 out
 dir and a family as well, the same rule over that family's runs against 17's replay run: the
-one-sided floor of 17.3, the hard-negative replay and server averaging of 17.4, or the exact
-running blend of 17.5.
+one-sided floor of 17.3, the hard-negative replay and server averaging of 17.4, the exact
+running blend of 17.5, or the contrastive consolidation of 17.6.
 
-usage: python rar_settings.py <development out dir> [<17 out dir> [floor|hard|average|blend]]
+usage: python rar_settings.py <development out dir> [<17 out dir> [<family>]]
 """
 import json
 import os
@@ -21,7 +21,8 @@ CANDIDATES = {(lam, retention): f"rar-anchor-lam{lam}-{retention}-A-s123"
 FAMILIES = {"floor": {(lam, "random"): f"floor-lam{lam}-A-s123" for lam in (0.5, 2.0)},
             "hard": {(lam, "random"): f"hard-lam{lam}-A-s123" for lam in (0.5, 2.0)},
             "average": {(k, "tail"): f"average-k{k}-A-s123" for k in (2, 4, 8)},
-            "blend": {(b, "exact"): f"blend-b{b}-A-s123" for b in (0.25, 0.5)}}
+            "blend": {(b, "exact"): f"blend-b{b}-A-s123" for b in (0.25, 0.5)},
+            "ckc": {(lam, "random"): f"ckc-lam{lam}-A-s123" for lam in (0.5, 2.0)}}
 LABELS = {"average": ("window", "average"), "blend": ("blend", "average")}
 TOLERANCE = 0.005
 

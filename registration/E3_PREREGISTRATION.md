@@ -1571,3 +1571,35 @@ the last, a tie going to the smaller b; it enters block 18 only if that score is
 
 Launch. From the commit that adds this section; the second T4 is deallocated when its chain
 ends.
+
+### 17.6 Fifth method development study: contrastive consolidation (registered 2026-09-27 18:00 UTC, the clock of the commit that adds it; before any of its runs)
+
+Status. Development, the second direction chosen from the survey of 17.5: projected
+contrastive consolidation, after C-CLIP (Liu et al., ICLR 2025), which reports earlier tasks
+improving during continual image-text retrieval. These runs decide, by the rule of 17,
+whether it enters block 18.
+
+Method (anchors.py mode "ckc", driver --anchor_loss ckc --projector_rank 16, commit
+c2ca4e2). As 17.3, except the added term. When a client finishes an experience, each of
+its training queries keeps its reference embedding and the reference embedding of its best
+relevant passage. In every later round, at every step, the next retained queries and their
+relevant passages are embedded by the current model, mapped by a rank-16 residual map
+x + 2 (x V) U^T whose U starts at zero, and must pick out their own stored embedding among the
+stored embeddings of all the client's retained queries (cross-entropy at scale 20); lambda
+weighs the mean of the query and passage terms. The earlier geometry therefore only has to
+stay recoverable through a small map rather than stay identical, and the low rank keeps the
+map from fitting 256 arbitrary targets. The map is registered on the model for the client's
+local epoch, because the training loop's optimizer holds only the model's own parameters,
+and a fresh one is drawn for every local epoch. Retention is random; the first experience
+trains exactly as D.
+
+Runs, on the second T4 in ~/R17_6_20260927 once the chain of 17.5 there has written its end
+marker, with manifest primary_A.json, seed 123 and the recipe of 14.1: lambda 0.5, then 2.0.
+
+Rule (rar_settings.py with the family ckc). As in 17.4: among the two runs whose A is at least
+0.1008, the higher mean nDCG@10 on the guard queries of the first three experiences after the
+last, a tie going to the smaller lambda; it enters block 18 only if that score is higher than
+0.5283. Test scores are read only after both runs validate.
+
+Launch. From the commit that adds this section; the second T4 is deallocated when its chain
+ends.

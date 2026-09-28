@@ -1708,3 +1708,37 @@ acquisition floor; the guard scores, 0.5268 (b = 0.25) and 0.5256 (b = 0.5), are
 0.5283, so no blend is chosen and none enters block 18 as a method. The records are archived
 in gs://fedcrag-t1-archive/R17_5_20260927 (R17_5_records.tgz, sha256
 398a52e8b78dd8dd069b352e1ed142a15997f9bc3c574540718722c1ef29cc75).
+
+### 17.7 Hard negatives in training: a baseline, and the floor on top of it (registered 2026-09-28 06:16 UTC, the clock of the commit that adds it; before any of its runs)
+
+Status. Development. After 17.3.1 and 17.4.2, the user chose the floor as the paper's method,
+with hard-negative replay reported as the arm that trades per-query regression for average
+quality. Since the floor sets carry hard negatives that the recipe of 14.1 does not use,
+these two runs test whether the floor adds anything once ordinary training uses hard
+negatives too.
+
+Hard negatives in training (driver --hard_negatives 0.5 --hard_k 4, commit 3a77116). At
+the start of each experience, the model of that moment (the initial model for the first
+experience, afterwards the acquisition reference just evaluated) ranks the client's corpus
+for every training query of that experience and of the earlier ones; each query keeps its
+best relevant passage and the three non-relevant passages ranked highest. In every round,
+every training query, current or replayed, is trained once per local epoch with the added
+term 0.5 times -log of its relevant passage's softmax share within those four passages.
+Three negatives rather than the floor's nine keep the per-step memory within the T4's: one
+training step on the longest texts of client 0 peaked at 5.66 GiB for hn and 6.05 GiB for
+floorhn, of 15.57 GiB.
+
+Runs, both with manifest primary_A.json, seed 123 and the recipe of 14.1: hn, arm D with
+hard negatives in training, on the first T4 in ~/R17_7_20260928 at once; floorhn, the floor
+of 17.3 with lambda 0.5 plus the same hard negatives in training, on the second T4 in
+~/R17_7_20260928 once the chain of 17.6 there has written its end marker.
+
+Decisions. hn enters block 18 as a baseline whatever its result. floorhn enters block 18 as
+the method on this stronger recipe if its A is at least hn's A minus 0.005 and its mean
+nDCG@10 on the guard queries of the first three experiences after the last is higher than
+hn's (rar_settings.py, family floorhn, against hn). Otherwise the floor goes to block 18 on
+the recipe of 14.1 only, as 17.3.1 decided, and the paper reports that its advantage did not
+survive hard negatives in training. Reported for both: the measures of 17.4.2. Test scores
+are read only after both runs validate.
+
+Launch. From the commit that adds this section; each T4 is deallocated when its chain ends.

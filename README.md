@@ -91,6 +91,8 @@ registrations or replace the paper draft.
   identifiable through a small learned map; with hard negatives in training (17.7), every
   training query also meets the passages its experience's starting model ranked hardest; and
   the rule that picks each family's development configuration
+- `false_negatives.py` - whether earlier test queries lose because their relevant passages
+  served as a retained query's hard negatives (17.8), from a run's saved reference states
 - `server_average.py` - server averaging (17.4, 17.5): a finished run's saved round states
   evaluated as if the server had deployed the average of each experience's last K rounds, or
   an exact running blend of its deployments over LoRA updates

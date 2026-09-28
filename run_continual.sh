@@ -17,6 +17,8 @@
 #     ... hard-dev | average-dev                       # hard-negative replay, server averaging (17.4)
 #     ... blend-dev                                    # exact running blend of deployments (17.5)
 #     ... ckc-dev                                      # contrastive consolidation (17.6)
+#     ... hn-dev | floorhn-dev                         # hard negatives in training, alone or under
+#                                                      # the floor (17.7)
 # The pilot refuses to start unless the repository is at EXPECT_COMMIT with a clean tree and
 # the manifest digests match; every run records its exit status, and an interrupted run is
 # never silently resumed.
@@ -332,6 +334,15 @@ blend_dev() {  # the exact running blend of deployments (section 17.5): evaluati
   "$PY" rar_settings.py "$OUT" "$RAR" blend | tee "$OUT/blend_settings.json"
 }
 
+hard_negatives_dev() {  # name arm [args]: hard negatives for every training query (17.7)
+  local name=$1 arm=$2; shift 2
+  say "$name-dev"
+  require_approved_commit
+  require_manifests
+  run_one "$name-A-s123" "$MANIFESTS/primary_A.json" "$arm" 123 8 --lr 5e-5 \
+    --hard_negatives 0.5 --hard_k 4 "$@"
+}
+
 case "$MODE" in
   bootstrap) bootstrap ;;
   manifests) manifests ;;
@@ -348,5 +359,8 @@ case "$MODE" in
   average-dev) average_dev; finish DONE ;;
   blend-dev) blend_dev; finish DONE ;;
   ckc-dev) anchor_dev ckc --projector_rank 16; finish DONE ;;
+  hn-dev) hard_negatives_dev hn fedavg-replay; finish DONE ;;
+  floorhn-dev) hard_negatives_dev floorhn fedavg-replay-anchor --lambda_anchor 0.5 --anchor_k 10 \
+    --retention random --anchor_loss floor; finish DONE ;;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

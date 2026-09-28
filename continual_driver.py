@@ -128,6 +128,20 @@ def anchored_items(anchors, ids, data, corpus, q_prefix, d_prefix, mode):
              anchors[q][stored]) for q in ids]
 
 
+def mine_negatives(model, state, cells, experience_ids, encoded, q_prefix, batch_size, k):
+    """Every training query's floor set (its best relevant passage and the k - 1 non-relevant
+    passages ranked highest) under ``state``, over the corpus as ``encoded``."""
+    mined = {}
+    for e in experience_ids:
+        cell = cells[e]
+        qids = list(cell["train_q"])
+        q_emb = _encode(model, state, [q_prefix + cell["train_q"][q] for q in qids], batch_size)
+        made = rank.rank_anchors(q_emb, qids, cell["train_qrels"], encoded[1], encoded[0], k)
+        mined.update({q: {key: a[key] for key in ("floor_pids", "floor_scores")}
+                      for q, a in made.items()})
+    return mined
+
+
 def encode_corpus(model, state, corpus, d_prefix, batch_size):
     cids = list(corpus)
     return cids, _encode(model, state, [d_prefix + doc_text(corpus[c]) for c in cids],
@@ -253,6 +267,10 @@ def parse_args():
     ap.add_argument("--retention", choices=("random", "fragile"), default="random")
     ap.add_argument("--anchor_loss", choices=rank.MODES, default="kl")
     ap.add_argument("--projector_rank", type=int, default=0, help="for --anchor_loss ckc")
+    ap.add_argument("--hard_negatives", type=float, default=0.0,
+                    help="weight of every training query's hard-negative term (17.7)")
+    ap.add_argument("--hard_k", type=int, default=4,
+                    help="the relevant passage and hard_k - 1 hard negatives per query (17.7)")
     ap.add_argument("--no_grad_ckpt", action="store_true")
     ap.add_argument("--out", required=True)
     return ap.parse_args()
@@ -262,6 +280,9 @@ def main():
     args = parse_args()
     accept = args.arm == "fedavg-replay-accept"
     anchor = args.arm == "fedavg-replay-anchor"
+    hard = args.hard_negatives > 0
+    if hard and args.arm not in ("fedavg-replay", "fedavg-replay-anchor"):
+        raise SystemExit("--hard_negatives needs arm fedavg-replay or fedavg-replay-anchor")
     if accept and not args.guard_hits:
         raise SystemExit("arm fedavg-replay-accept needs --guard_hits")
     torch.manual_seed(args.seed)
@@ -322,6 +343,16 @@ def main():
     anchors = {c: {} for c in clients}
     if anchor:
         out["anchors_sha256"] = {c: {} for c in clients}
+    negatives = {}
+    if hard:
+        out["negatives_sha256"] = {c: {} for c in clients}
+        for c in clients:
+            negatives[c] = mine_negatives(
+                model, initial, cells[c], [orders[c][0]],
+                encode_corpus(model, initial, corpora[c], d_prefix, args.eval_batch_size),
+                q_prefix, args.eval_batch_size, args.hard_k)
+            out["negatives_sha256"][c]["0"] = _digest(
+                [json.dumps(negatives[c][q], sort_keys=True) for q in sorted(negatives[c])])
     for t in range(T):
         current = {c: orders[c][t] for c in clients}
         guards = {}
@@ -349,14 +380,18 @@ def main():
                     data = training_data(cells[c], current[c], memories[c].ids)
                     record["training_ids_sha256"][c] = _digest(sorted(data["train_q"]))
                     start = states[c] if local else broadcast
-                    if anchor and t > 0:
-                        anchored = anchored_items(anchors[c], memories[c].ids, data,
-                                                  corpora[c], q_prefix, d_prefix,
-                                                  args.anchor_loss)
+                    if hard or (anchor and t > 0):
+                        anchored = (anchored_items(anchors[c], memories[c].ids, data,
+                                                   corpora[c], q_prefix, d_prefix,
+                                                   args.anchor_loss) if anchor and t > 0 else [])
+                        current_items = (anchored_items(negatives[c], data["train_q"], data,
+                                                        corpora[c], q_prefix, d_prefix, "hard")
+                                         if hard else None)
                         new, n_examples, n_steps = rank.client_train_anchor(
                             model, start, data, anchored, q_prefix, d_prefix, args.batch_size,
                             args.lr, args.lambda_anchor, [args.seed, int(c), t, r],
-                            mode=args.anchor_loss, projector_rank=args.projector_rank)
+                            mode=args.anchor_loss, projector_rank=args.projector_rank,
+                            current=current_items, current_lam=args.hard_negatives)
                     elif args.arm == "fedavg-replay-distill" and teacher_state is not None:
                         new, n_examples, n_steps = client_train_distill(
                             model, teacher, start, teacher_state, data, memories[c].ids,
@@ -406,6 +441,12 @@ def main():
                 anchors[c].update(made)
                 out["anchors_sha256"][c][str(current[c])] = _digest(
                     [json.dumps(made[q], sort_keys=True) for q in sorted(made)])
+            if hard and t < T - 1:
+                negatives[c] = mine_negatives(model, state, cells[c],
+                                              [orders[c][s] for s in range(t + 2)], encoded,
+                                              q_prefix, args.eval_batch_size, args.hard_k)
+                out["negatives_sha256"][c][str(t + 1)] = _digest(
+                    [json.dumps(negatives[c][q], sort_keys=True) for q in sorted(negatives[c])])
             out["matrix"][str(t)][c] = scored
             out["references"][c][str(current[c])] = {
                 "position": t, "sha256": state_dict_sha256(state),

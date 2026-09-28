@@ -128,3 +128,17 @@ def test_the_projector_is_a_model_parameter_during_fit_and_is_removed_after(monk
     anchors.client_train_anchor(model, {}, {}, [item], "", "", 4, 1e-4, 1.0, 0, mode="ckc",
                                 projector_rank=1)
     assert model.seen == ["ckc_u", "ckc_v"] and not list(model.named_parameters())
+
+
+def test_training_hard_negatives_add_lambda_times_the_negative_log_share():
+    torch.manual_seed(0)
+    table = {t: F.normalize(torch.randn(8), dim=0) for t in ("q", "p1", "p2", "p3")}
+    model = TextStub(table)
+    features = [{"embedding": torch.randn(6, 8)}, {"embedding": torch.randn(6, 8)}]
+    labels = torch.zeros(6)
+    base = anchors.RankAnchorLoss(model, [], 0, 0.0, 0)
+    now = [20 * float(table["q"] @ table[p]) for p in ("p1", "p2", "p3")]
+    loss = anchors.CurrentHardLoss(base, [("q", ["p1", "p2", "p3"], now)], 1, 0.5, [0, 1])
+    share = torch.log_softmax(torch.tensor(now), dim=0)[0].item()
+    assert loss(features, labels).item() == pytest.approx(
+        base(features, labels).item() - 0.5 * share, abs=1e-5)

@@ -2,9 +2,10 @@
 none if no configuration beats replay on the development criterion. Given the section 17 out
 dir and a family as well, the same rule over that family's runs against 17's replay run: the
 one-sided floor of 17.3, the hard-negative replay and server averaging of 17.4, the exact
-running blend of 17.5, or the contrastive consolidation of 17.6.
+running blend of 17.5, or the contrastive consolidation of 17.6; for the floor with hard
+negatives in training (17.7), the second dir holds the hard-negative baseline run instead.
 
-usage: python rar_settings.py <development out dir> [<17 out dir> [<family>]]
+usage: python rar_settings.py <development out dir> [<baseline out dir> [<family>]]
 """
 import json
 import os
@@ -22,7 +23,9 @@ FAMILIES = {"floor": {(lam, "random"): f"floor-lam{lam}-A-s123" for lam in (0.5,
             "hard": {(lam, "random"): f"hard-lam{lam}-A-s123" for lam in (0.5, 2.0)},
             "average": {(k, "tail"): f"average-k{k}-A-s123" for k in (2, 4, 8)},
             "blend": {(b, "exact"): f"blend-b{b}-A-s123" for b in (0.25, 0.5)},
-            "ckc": {(lam, "random"): f"ckc-lam{lam}-A-s123" for lam in (0.5, 2.0)}}
+            "ckc": {(lam, "random"): f"ckc-lam{lam}-A-s123" for lam in (0.5, 2.0)},
+            "floorhn": {(0.5, "random"): "floorhn-A-s123"}}
+BASELINES = {"floorhn": "hn-A-s123"}
 LABELS = {"average": ("window", "average"), "blend": ("blend", "average")}
 TOLERANCE = 0.005
 
@@ -47,7 +50,8 @@ def main(out_dir, baseline_dir=None, family="floor"):
     names = CANDIDATES if baseline_dir is None else FAMILIES[family]
     labels = LABELS.get(family, ("lambda_anchor", "retention")) if baseline_dir else (
         "lambda_anchor", "retention")
-    baseline = measures(_record(os.path.join(baseline_dir or out_dir, BASELINE)))
+    baseline = measures(_record(os.path.join(baseline_dir or out_dir,
+                                             BASELINES.get(family, BASELINE))))
     candidates = {k: measures(_record(os.path.join(out_dir, name))) for k, name in names.items()}
     chosen = choose(candidates, baseline)
     print(json.dumps({"chosen": None if chosen is None else dict(zip(labels, chosen)),

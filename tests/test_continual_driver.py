@@ -235,7 +235,7 @@ def test_anchor_arm_anchors_every_replayed_query_and_validates(stream, tmp_path,
     calls = []
 
     def fake_anchor(model, start, data, anchored, q_prefix, d_prefix, batch_size, lr, lam, seed,
-                    mode="kl", projector_rank=0):
+                    mode="kl", projector_rank=0, current=None, current_lam=0.0):
         calls.append((anchored, mode, projector_rank))
         new = {k: v.clone() for k, v in start.items()}
         new["lora_B"] = new["lora_B"] + 0.1
@@ -261,3 +261,30 @@ def test_anchor_arm_anchors_every_replayed_query_and_validates(stream, tmp_path,
                for r in (random_run, fragile_run))
     replayed = lambda result: [r["memory"]["0"]["replay"] for r in result["rounds"][2:]]
     assert replayed(random_run) != replayed(fragile_run)
+
+
+def test_hard_negatives_train_every_query_of_every_round_against_its_mined_set(
+        stream, tmp_path, monkeypatch):
+    calls = []
+
+    def fake_anchor(model, start, data, anchored, q_prefix, d_prefix, batch_size, lr, lam, seed,
+                    mode="kl", projector_rank=0, current=None, current_lam=0.0):
+        calls.append((len(data["train_q"]), len(anchored), current, current_lam))
+        new = {k: v.clone() for k, v in start.items()}
+        new["lora_B"] = new["lora_B"] + 0.1
+        return new, len(data["train_q"]), 3
+
+    monkeypatch.setattr(driver.rank, "client_train_anchor", fake_anchor)
+    for arm, extra in (("fedavg-replay", []), ("fedavg-replay-anchor", ["--anchor_loss", "floor"])):
+        result, _, _ = run(stream, arm, tmp_path / arm,
+                           ["--anchor_k", "3", "--hard_k", "3", "--hard_negatives", "0.5",
+                            *extra])
+        validate_continual.validate_run(tmp_path / arm)
+        assert all(set(by) == {"0", "1"} for by in result["negatives_sha256"].values())
+    assert calls and all(len(current) == queries and lam == 0.5
+                         and all(len(texts) == len(stored) == 3 for _, texts, stored in current)
+                         for queries, _, current, lam in calls)
+    replay, floor = calls[:len(calls) // 2], calls[len(calls) // 2:]
+    assert all(n == 0 for _, n, _, _ in replay) and any(n > 0 for _, n, _, _ in floor)
+    with pytest.raises(SystemExit, match="hard_negatives"):
+        run(stream, "fedavg", tmp_path / "plain", ["--hard_negatives", "0.5"])

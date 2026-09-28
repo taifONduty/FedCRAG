@@ -7,7 +7,9 @@ non-relevant ones is held, and only against a drop; under hard-negative replay (
 relevant passage is trained against those passages without any stored target. Under
 contrastive consolidation (17.6), each retained query and its relevant passage keep their
 reference embeddings, and the current embeddings, through a small learned map, must pick
-their own out of the client's bank, as in C-CLIP's knowledge consolidation."""
+their own out of the client's bank, as in C-CLIP's knowledge consolidation. With hard
+negatives in training (17.7), every training query of the round is also trained against the
+passages that the model at the start of its experience ranked hardest."""
 import math
 
 import numpy as np
@@ -124,6 +126,19 @@ class RankAnchorLoss(torch.nn.Module):
         return loss
 
 
+class CurrentHardLoss(torch.nn.Module):
+    """``base`` plus lambda times hard-negative replay's term over the round's training
+    queries, each once per epoch."""
+
+    def __init__(self, base, items, per_step, lam, seed):
+        super().__init__()
+        self.base = base
+        self.hard = RankAnchorLoss(base.model, items, per_step, lam, seed, mode="hard")
+
+    def forward(self, sentence_features, labels):
+        return self.base(sentence_features, labels) + self.hard.lam * self.hard._anchor_term()
+
+
 def attach_projector(model, dim, rank, seed):
     """A rank-``rank`` residual map on embeddings, registered on the model so that fit()
     trains it with the adapters: U starts at zero, so the map starts as the identity."""
@@ -135,9 +150,12 @@ def attach_projector(model, dim, rank, seed):
 
 
 def client_train_anchor(model, start_state, data, anchored, q_prefix, d_prefix, batch_size,
-                        lr, lam, seed, mode="kl", projector_rank=0):
+                        lr, lam, seed, mode="kl", projector_rank=0, current=None,
+                        current_lam=0.0):
     """One local epoch as in client_train, with each anchored query anchored once; under
-    "ckc" with ``projector_rank``, a fresh projector for this epoch."""
+    "ckc" with ``projector_rank``, a fresh projector for this epoch; with ``current``, every
+    training query also trained once against its hard negatives, weighted by
+    ``current_lam``."""
     set_adapter_state(model, start_state)
     examples = make_examples(data, q_prefix, d_prefix)
     loader = NoDuplicatesDataLoader(examples, batch_size=batch_size)
@@ -146,6 +164,9 @@ def client_train_anchor(model, start_state, data, anchored, q_prefix, d_prefix, 
     projector = (attach_projector(model, len(anchored[0][2][0]), projector_rank, seed)
                  if mode == "ckc" and projector_rank and anchored else None)
     loss = RankAnchorLoss(model, anchored, per_step, lam, seed, mode=mode, projector=projector)
+    if current:
+        loss = CurrentHardLoss(loss, current, math.ceil(len(current) / steps), current_lam,
+                               [*np.atleast_1d(seed).tolist(), 1])
     try:
         model.fit(train_objectives=[(loader, loss)],
                   epochs=1, steps_per_epoch=steps, optimizer_params={"lr": lr},

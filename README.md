@@ -88,8 +88,9 @@ registrations or replace the paper draft.
   of 17.3 only its relevant passage's share against a drop, or under hard-negative replay
   (17.4) trains that share against the passages its reference ranked hardest, or under
   contrastive consolidation (17.6) keeps each retained item's reference embeddings
-  identifiable through a small learned map; and the rule that picks each family's development
-  configuration
+  identifiable through a small learned map; with hard negatives in training (17.7), every
+  training query also meets the passages its experience's starting model ranked hardest; and
+  the rule that picks each family's development configuration
 - `server_average.py` - server averaging (17.4, 17.5): a finished run's saved round states
   evaluated as if the server had deployed the average of each experience's last K rounds, or
   an exact running blend of its deployments over LoRA updates

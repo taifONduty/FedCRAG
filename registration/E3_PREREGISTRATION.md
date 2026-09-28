@@ -1686,3 +1686,25 @@ acquisition floor; the guard scores are 0.6488 (lambda 0.5) and 0.6486 (lambda 2
 0.5283 for D. Lambda 0.5 is chosen and enters block 18. The records are archived in
 gs://fedcrag-t1-archive/R17_4h_20260927 (R17_4h_records.tgz, sha256
 bef318dca94cf6c7328546214b5d4670c7aecce0f16fa0ef92fd1af783be1818).
+
+### 17.5.1 Development outcome for the exact running blend (written 2026-09-28 05:59 UTC, the clock of the commit that adds it; after both evaluations validated)
+
+Both evaluations exited 0; the chain wrote DONE at 05:00:02 UTC on 2026-09-28 (3,221 s each on
+the second T4). Results on test queries, recomputed with the functions of t1_report.py (no
+sanity problem):
+
+| deployment | A | G | improvement | backward transfer | nDCG@10 on earlier experiences at the end | pairs losing at least 0.010 |
+|---|---:|---:|---:|---:|---:|---:|
+| D (last global model) | 0.1058 | 0.0242 | 0.0390 | 0.0149 | 0.5269 | 14.9% |
+| blend, b = 0.25 | 0.1041 | 0.0204 | 0.0345 | 0.0141 | 0.5237 | 13.1% |
+| blend, b = 0.5 | 0.1016 | 0.0161 | 0.0285 | 0.0124 | 0.5199 | 10.8% |
+
+Blending each deployment with the previous one lowers regression and the gains of earlier
+queries together, and lowers acquisition: the same trade as the constraints of 15 and 17.
+
+Rule of 17.5, applied by rar_settings.py (output blend_settings.json, sha256
+a4726a44bbff32d2fd8a90b9f92d56509b87df698085c2628eb2d6ac560f4611): both clear the
+acquisition floor; the guard scores, 0.5268 (b = 0.25) and 0.5256 (b = 0.5), are below D's
+0.5283, so no blend is chosen and none enters block 18 as a method. The records are archived
+in gs://fedcrag-t1-archive/R17_5_20260927 (R17_5_records.tgz, sha256
+398a52e8b78dd8dd069b352e1ed142a15997f9bc3c574540718722c1ef29cc75).

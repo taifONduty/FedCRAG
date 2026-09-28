@@ -1791,3 +1791,25 @@ acquisition floor; the guard scores are 0.5343 (lambda 0.5) and 0.5341 (lambda 2
 0.5283 for D, so lambda 0.5 is chosen and enters block 18 under the rule as written. The
 records are archived in gs://fedcrag-t1-archive/R17_6_20260927 (R17_6_records.tgz, sha256
 d70451e42ce03842ec497e77a856bd8565fb3ab12d4e280759dc010fd39dd6a7).
+
+### 17.8.1 Outcome of the false-negative analysis (written 2026-09-28 14:58 UTC, the clock of the commit that adds it; after both analyses finished)
+
+Both analyses ran on the first T4 at b6cb27f and wrote DONE at 14:57 UTC on 2026-09-28
+(fn_hard.json sha256 a1d8f677c8afb5b43582c09a6913e9d55fbc84f6dd43e2ea85421728b8e846b8,
+fn_floor.json sha256 e5c8356347cda714e9d10666cac4659d644dc429e5d5f0ceecd9d0523225e3f4).
+Pairs are (earlier test query, later evaluation), 10,500 in all:
+
+| run | pairs | mean loss in the run | mean loss under D | share losing at least 0.010, run / D | share losing at least 0.1, run / D |
+|---|---:|---:|---:|---:|---:|
+| hard, flagged | 857 | 0.0552 | 0.0285 | 19.6% / 17.2% | 14.1% / 9.0% |
+| hard, unflagged | 9,643 | 0.0419 | 0.0238 | 16.6% / 14.7% | 12.2% / 7.5% |
+| floor, flagged | 772 | 0.0181 | 0.0321 | 10.1% / 18.9% | 4.9% / 10.5% |
+| floor, unflagged | 9,728 | 0.0099 | 0.0235 | 7.0% / 14.5% | 3.2% / 7.4% |
+
+Flagged pairs lose more than unflagged ones under hard-negative replay, but also under D,
+which never trained against those negatives; and of hard-negative replay's excess loss over
+D (the sum over pairs of the difference in mean loss), the flagged pairs carry about 12%. The
+extra regression of hard-negative replay is therefore mostly not passages relevant to earlier
+test queries being pushed down as negatives. The floor lowers loss in both groups. By the use
+stated in 17.8, no variant that avoids such negatives is registered, and the analysis is
+reported as it stands.

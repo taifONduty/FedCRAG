@@ -1742,3 +1742,29 @@ survive hard negatives in training. Reported for both: the measures of 17.4.2. T
 are read only after both runs validate.
 
 Launch. From the commit that adds this section; each T4 is deallocated when its chain ends.
+
+### 17.8 Analysis: do earlier test queries lose because their passages served as negatives? (registered 2026-09-28 06:20 UTC, the clock of the commit that adds it; before the analysis runs)
+
+Question. Under hard-negative replay (17.4.2) more earlier test queries lose than under D.
+One mechanism: a retained training query's hard negatives, the non-relevant passages its
+reference ranked highest, can be relevant to test queries of the same experience, which were
+never judged against that training query; training pushes them down for everyone.
+
+Analysis (false_negatives.py, commit 3731749). For the run hard-lam0.5-A-s123 of 17.4, each
+training query's floor set is rebuilt from the run's saved reference state at the end of its
+experience (each state checked against its recorded hash), with the run's own anchor_k of
+10. At each evaluation position v, the negatives used by then are those of the queries the
+run's records list as retained in the rounds of positions 1 to v. Each earlier test query at
+each later evaluation is flagged when one of its relevant passages is among them. For flagged
+and unflagged pairs separately: their number, mean positive-part loss against the
+acquisition reference, and the shares losing at least 0.010 and 0.1, in the run and in 17's D
+run (same stream, order and test queries) as the control. The same analysis is repeated for
+floor-lam0.5-A-s123 of 17.3. Test qrels are used only here, to flag queries after training.
+
+Use. Descriptive. If flagged pairs lose clearly more than unflagged ones under hard-negative
+replay and not under D, a variant that avoids such negatives is registered separately before
+any run; otherwise the analysis is reported as it stands.
+
+Launch. On the first T4, from the commit that adds this section, once the run of 17.7 there
+has written its end marker; the hard run's three reference states and record are copied from
+the second T4 to the first beforehand.

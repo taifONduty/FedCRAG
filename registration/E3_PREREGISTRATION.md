@@ -1659,3 +1659,30 @@ three windows clear the acquisition floor of 0.1008; the guard scores are 0.5281
 any difference this study treats as meaningful. The records are archived in
 gs://fedcrag-t1-archive/R17_4a_20260927 (R17_4a_records.tgz, sha256
 4c1ae5273928e661ec93058ea34f19f80f9d880cd3d5ed06dfc19b76b5e4924e).
+
+### 17.4.2 Development outcome for hard-negative replay (written 2026-09-28 03:14 UTC, the clock of the commit that adds it; after both runs validated)
+
+Both runs exited 0 and passed validate_continual; the chain wrote DONE at 21:47:46 UTC on
+2026-09-27 (collected at 03:11 UTC on 2026-09-28 for the same reason as in 17.4.1). Wall
+times on the second T4: 13,355 s (lambda 0.5) and 13,129 s (lambda 2.0). Results on test
+queries, recomputed with the functions of t1_report.py (no sanity problem), beside 17's D run
+and the floor of 17.3.1:
+
+| run | A | G | improvement | backward transfer | reference nDCG@10 | nDCG@10 on earlier experiences at the end | pairs losing at least 0.010 | pairs losing at least 0.1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| D (T4) | 0.1058 | 0.0242 | 0.0390 | 0.0149 | 0.4990 | 0.5269 | 14.9% | 7.7% |
+| floor, lambda 0.5 | 0.1308 | 0.0105 | 0.0491 | 0.0385 | 0.5098 | 0.5650 | 7.3% | 3.3% |
+| hard, lambda 0.5 | 0.1884 | 0.0430 | 0.1319 | 0.0889 | 0.5455 | 0.6534 | 16.8% | 12.3% |
+| hard, lambda 2.0 | 0.1853 | 0.0497 | 0.1355 | 0.0858 | 0.5426 | 0.6479 | 18.0% | 13.7% |
+
+Hard-negative replay raises acquisition, the gains of earlier queries and the end nDCG@10 on
+earlier experiences far above D's, and raises regression above D's in every client at every
+age. An evaluation that reports only average backward transfer or end quality would show it
+as a clear improvement; per query, more of the earlier queries lose, and lose more.
+
+Rule of 17.4, applied by rar_settings.py (output hard_settings.json, sha256
+f88fe33eeba0d2897b2e99462aba41657a1c5fb9c4ff9f9224b381433ab27cef): both runs clear the
+acquisition floor; the guard scores are 0.6488 (lambda 0.5) and 0.6486 (lambda 2.0), against
+0.5283 for D. Lambda 0.5 is chosen and enters block 18. The records are archived in
+gs://fedcrag-t1-archive/R17_4h_20260927 (R17_4h_records.tgz, sha256
+bef318dca94cf6c7328546214b5d4670c7aecce0f16fa0ef92fd1af783be1818).

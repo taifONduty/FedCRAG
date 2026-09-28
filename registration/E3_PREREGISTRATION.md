@@ -1768,3 +1768,26 @@ any run; otherwise the analysis is reported as it stands.
 Launch. On the first T4, from the commit that adds this section, once the run of 17.7 there
 has written its end marker; the hard run's three reference states and record are copied from
 the second T4 to the first beforehand.
+
+### 17.6.1 Development outcome for contrastive consolidation (written 2026-09-28 13:39 UTC, the clock of the commit that adds it; after both runs validated)
+
+Both runs exited 0 and passed validate_continual; the chain wrote DONE at 10:53:15 UTC on
+2026-09-28 (collected at 13:37 UTC, the Mac that runs the watchers having slept, which also
+left the second T4 idle until 13:38). Wall times on the second T4: 10,398 s (lambda 0.5) and
+10,425 s (lambda 2.0). Results on test queries, recomputed with the functions of
+t1_report.py (no sanity problem):
+
+| run | A | G | improvement | backward transfer | nDCG@10 on earlier experiences at the end | pairs losing at least 0.010 |
+|---|---:|---:|---:|---:|---:|---:|
+| D (T4) | 0.1058 | 0.0242 | 0.0390 | 0.0149 | 0.5269 | 14.9% |
+| consolidation, lambda 0.5 | 0.1073 | 0.0210 | 0.0361 | 0.0151 | 0.5278 | 13.7% |
+| consolidation, lambda 2.0 | 0.1079 | 0.0196 | 0.0354 | 0.0159 | 0.5294 | 13.3% |
+
+Consolidation lowers regression somewhat without lowering acquisition or end quality.
+
+Rule of 17.6, applied by rar_settings.py (output ckc_settings.json, sha256
+68f1947a700c4a50a76a066b68a2dbbb8cad99556834b653d47c9b705ad58b5e): both clear the
+acquisition floor; the guard scores are 0.5343 (lambda 0.5) and 0.5341 (lambda 2.0) against
+0.5283 for D, so lambda 0.5 is chosen and enters block 18 under the rule as written. The
+records are archived in gs://fedcrag-t1-archive/R17_6_20260927 (R17_6_records.tgz, sha256
+d70451e42ce03842ec497e77a856bd8565fb3ab12d4e280759dc010fd39dd6a7).

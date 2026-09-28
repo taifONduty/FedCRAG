@@ -1633,3 +1633,29 @@ for D. Lambda 0.5 is chosen and enters block 18. The records, without the per-ro
 states, are archived in gs://fedcrag-t1-archive/R17_3_20260927 (R17_3_records.tgz, sha256
 63834f7ef365fdf75d52ba437c394aa4a50a5416885e231e049ba6bdf7cf77f3); the states stay on the
 first T4's disk.
+
+### 17.4.1 Development outcome for server averaging (written 2026-09-28 03:09 UTC, the clock of the commit that adds it; after all four evaluations validated)
+
+All four evaluations exited 0; the chain wrote DONE at 00:45:16 UTC on 2026-09-28 (the
+watcher collected the records at 03:07 UTC, the Mac that runs it having slept). Wall times on
+the first T4: 3,277 s (K = 1), 3,298 s (2), 3,308 s (4) and 3,327 s (8). The reproduction check
+passed exactly: K = 1 reproduces D's A and G with differences of 0.0 and 0.0. Results on test
+queries, recomputed with the functions of t1_report.py (no sanity problem):
+
+| deployment | A | G | improvement | backward transfer | nDCG@10 on earlier experiences at the end | pairs losing at least 0.010 |
+|---|---:|---:|---:|---:|---:|---:|
+| D (last round) | 0.1058 | 0.0242 | 0.0390 | 0.0149 | 0.5269 | 14.9% |
+| last 2 rounds | 0.1050 | 0.0240 | 0.0398 | 0.0158 | 0.5268 | 14.9% |
+| last 4 rounds | 0.1037 | 0.0237 | 0.0401 | 0.0164 | 0.5263 | 14.7% |
+| last 8 rounds | 0.1009 | 0.0255 | 0.0425 | 0.0170 | 0.5237 | 15.2% |
+
+Averaging the last rounds of an experience leaves regression essentially where it is: the
+round-to-round variation within an experience is not what the later experiences undo.
+
+Rule of 17.4, applied by rar_settings.py (output average_settings.json, sha256 7939795ca15708afdd799f16d03e06103aa1d9a893f84e0de2e7827fafc2d107): all
+three windows clear the acquisition floor of 0.1008; the guard scores are 0.5281 (K = 2),
+0.5287 (4) and 0.5267 (8), against 0.5283 for D. K = 4 is chosen and, being higher than D by
+0.0004, enters block 18 under the rule as written, although the margin is far smaller than
+any difference this study treats as meaningful. The records are archived in
+gs://fedcrag-t1-archive/R17_4a_20260927 (R17_4a_records.tgz, sha256
+4c1ae5273928e661ec93058ea34f19f80f9d880cd3d5ed06dfc19b76b5e4924e).

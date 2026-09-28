@@ -1813,3 +1813,37 @@ extra regression of hard-negative replay is therefore mostly not passages releva
 test queries being pushed down as negatives. The floor lowers loss in both groups. By the use
 stated in 17.8, no variant that avoids such negatives is registered, and the analysis is
 reported as it stands.
+
+### 17.7.1 Development outcome for hard negatives in training (written 2026-09-28 21:31 UTC, the clock of the commit that adds it; after both runs validated)
+
+Both runs exited 0 and passed validate_continual: hn on the first T4 (DONE at 13:03:37 UTC,
+24,352 s) and floorhn on the second (DONE at 21:22:46 UTC, 27,872 s; launched at 13:38
+because the Mac that runs the watchers slept). Results on test queries, recomputed with the
+functions of t1_report.py (no sanity problem), beside D, the floor and hard-negative replay:
+
+| run | A | G | improvement | backward transfer | reference nDCG@10 | nDCG@10 on earlier experiences at the end | pairs losing at least 0.010 | pairs losing at least 0.1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| D (T4) | 0.1058 | 0.0242 | 0.0390 | 0.0149 | 0.4990 | 0.5269 | 14.9% | 7.7% |
+| floor | 0.1308 | 0.0105 | 0.0491 | 0.0385 | 0.5098 | 0.5650 | 7.3% | 3.3% |
+| hard | 0.1884 | 0.0430 | 0.1319 | 0.0889 | 0.5455 | 0.6534 | 16.8% | 12.3% |
+| hn | 0.2544 | 0.0434 | 0.0708 | 0.0274 | 0.6341 | 0.6756 | 18.6% | 13.0% |
+| floorhn | 0.2508 | 0.0274 | 0.0617 | 0.0344 | 0.6302 | 0.6775 | 14.1% | 8.6% |
+
+Hard negatives in training give the highest acquisition and end nDCG@10 of all runs, and
+regression 1.8 times D's. Adding the floor keeps the end nDCG@10 (0.6775 against 0.6756) and
+lowers regression by 37% (0.0274 against 0.0434), lower than hn's in all 30 historical cells
+and in each of the five clients.
+
+Decisions of 17.7. hn enters block 18 as a baseline. floorhn: its A (0.2508) is within 0.005
+of hn's (0.2544), and its guard score is 0.673437 against hn's 0.673441, lower by 0.000004;
+rar_settings.py (family floorhn, output floorhn_settings.json, sha256
+0fe4ae605ab4c648827e41a63b4a3d5ef1fd1c5a1e884498af2d4153790e0e34) therefore chooses nothing,
+and by the rule as written floorhn does not enter block 18. The rule scores quality only; on
+this run the two quality scores are equal to five decimals while regression differs by a
+third, so the consequence written in 17.7, that the floor's advantage did not survive hard
+negatives in training, holds for its quality advantage and not for its regression advantage.
+Whether floorhn is nonetheless confirmed on LoTTE is left to block 18's registration, which
+must record the choice and its reason. The records are archived in
+gs://fedcrag-t1-archive/R17_7_20260928 (R17_7hn_records.tgz, sha256
+a51d772012c4ed72f6d8d4c998e03fae3573949b1de0b469f3263cef77f537bd; R17_7floorhn_records.tgz,
+sha256 46a820c8c528ffa95cbaf0cb6373507977d323bc5d63e08edacc8781b6497150).

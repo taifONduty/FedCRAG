@@ -19,6 +19,9 @@
 #     ... ckc-dev                                      # contrastive consolidation (17.6)
 #     ... hn-dev | floorhn-dev                         # hard negatives in training, alone or under
 #                                                      # the floor (17.7)
+#   CONTINUAL_OUT=<dir> CONTINUAL_MANIFESTS=<L1 manifests> EXPECT_COMMIT=<sha> L1_OUT=<L1 out> \
+#     bash run_continual.sh lotte-methods              # block 18 on the L4
+#     ... lotte-hn | lotte-floorhn                     # block 18 on the T4s
 # The pilot refuses to start unless the repository is at EXPECT_COMMIT with a clean tree and
 # the manifest digests match; every run records its exit status, and an interrupted run is
 # never silently resumed.
@@ -293,7 +296,7 @@ anchor_dev() {  # family [args] (floor: 17.3, hard: 17.4, ckc: 17.6), against 17
   "$PY" rar_settings.py "$OUT" "$RAR" "$family" | tee "$OUT/${family}_settings.json"
 }
 
-average_one() {  # name rule...: 17's replay run under a server averaging rule (17.4, 17.5)
+average_one() {  # name args...: a replay run under a server averaging rule (17.4, 17.5, 18)
   local name=$1; shift
   local dir="$OUT/$name"
   if [ -f "$dir/.validated" ]; then say "SKIP $name"; return 0; fi
@@ -306,8 +309,7 @@ average_one() {  # name rule...: 17's replay run under a server averaging rule (
   date -u +%FT%TZ > "$dir/.running"
   local t0=$(date +%s)
   local rc=0
-  "$PY" server_average.py --source "$RAR/rar-fedavg-replay-A-s123" "$@" \
-    --data_root "$DATA" --out "$dir" > "$dir/run.log" 2>&1 || rc=$?
+  "$PY" server_average.py "$@" --data_root "$DATA" --out "$dir" > "$dir/run.log" 2>&1 || rc=$?
   echo "$(( $(date +%s) - t0 ))" > "$dir/wall_seconds"
   echo "$rc" > "$dir/exit_status"
   [ "$rc" = "0" ] || { say "FAILED $name (exit $rc)"; finish FAILED; }
@@ -321,7 +323,9 @@ average_dev() {  # server averaging (section 17.4): evaluation only; window 1 re
   require_approved_commit
   require_manifests
   require_rar_baseline
-  for k in 1 2 4 8; do average_one "average-k$k-A-s123" --window "$k"; done
+  for k in 1 2 4 8; do
+    average_one "average-k$k-A-s123" --source "$RAR/rar-fedavg-replay-A-s123" --window "$k"
+  done
   "$PY" rar_settings.py "$OUT" "$RAR" average | tee "$OUT/average_settings.json"
 }
 
@@ -330,7 +334,9 @@ blend_dev() {  # the exact running blend of deployments (section 17.5): evaluati
   require_approved_commit
   require_manifests
   require_rar_baseline
-  for b in 0.25 0.5; do average_one "blend-b$b-A-s123" --blend "$b"; done
+  for b in 0.25 0.5; do
+    average_one "blend-b$b-A-s123" --source "$RAR/rar-fedavg-replay-A-s123" --blend "$b"
+  done
   "$PY" rar_settings.py "$OUT" "$RAR" blend | tee "$OUT/blend_settings.json"
 }
 
@@ -341,6 +347,39 @@ hard_negatives_dev() {  # name arm [args]: hard negatives for every training que
   require_manifests
   run_one "$name-A-s123" "$MANIFESTS/primary_A.json" "$arm" 123 8 --lr 5e-5 \
     --hard_negatives 0.5 --hard_k 4 "$@"
+}
+
+lotte_arm() {  # name arm [args]: one method arm of block 18 on both LoTTE schedules, 3 seeds
+  local name=$1 arm=$2; shift 2
+  for sched in A B; do
+    for seed in 123 2024 3407; do
+      run_one "l18-$name-$sched-s$seed" "$MANIFESTS/lotte_$sched.json" "$arm" "$seed" 8 \
+        --lr 5e-5 "$@"
+    done
+  done
+}
+
+lotte_methods() {  # block 18 on the L4: the floor, hard-negative replay, server averaging
+  say "lotte-methods"
+  require_approved_commit
+  require_manifests
+  local l1="${L1_OUT:-}" sched seed
+  for sched in A B; do
+    for seed in 123 2024 3407; do
+      [ -n "$l1" ] && [ -f "$l1/l1-fedavg-replay-$sched-s$seed/.validated" ] || {
+        say "L1_OUT does not hold block L1's validated replay runs"; finish REFUSED; }
+    done
+  done
+  for loss in floor hard; do
+    lotte_arm "$loss" fedavg-replay-anchor --lambda_anchor 0.5 --anchor_k 10 --retention random \
+      --anchor_loss "$loss"
+  done
+  for sched in A B; do
+    for seed in 123 2024 3407; do
+      average_one "l18-average-$sched-s$seed" --source "$l1/l1-fedavg-replay-$sched-s$seed" \
+        --window 4
+    done
+  done
 }
 
 case "$MODE" in
@@ -362,5 +401,11 @@ case "$MODE" in
   hn-dev) hard_negatives_dev hn fedavg-replay; finish DONE ;;
   floorhn-dev) hard_negatives_dev floorhn fedavg-replay-anchor --lambda_anchor 0.5 --anchor_k 10 \
     --retention random --anchor_loss floor; finish DONE ;;
+  lotte-methods) lotte_methods; finish DONE ;;
+  lotte-hn) say "lotte-hn"; require_approved_commit; require_manifests
+    lotte_arm hn fedavg-replay --hard_negatives 0.5 --hard_k 4; finish DONE ;;
+  lotte-floorhn) say "lotte-floorhn"; require_approved_commit; require_manifests
+    lotte_arm floorhn fedavg-replay-anchor --lambda_anchor 0.5 --anchor_k 10 --retention random \
+      --anchor_loss floor --hard_negatives 0.5 --hard_k 4; finish DONE ;;
   *) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

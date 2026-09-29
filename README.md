@@ -83,6 +83,8 @@ registrations or replace the paper draft.
 - `t1_gate.py`, `t1_report.py` - the pilot's registered gate, and its report
   recomputed from the per-query records without the production metric code
 - `l1_report.py` - the LoTTE block's hypotheses H1 to H6, from the same recomputation
+- `l18_report.py` - block 18's hypotheses on LoTTE: the floor against replay (M1 to M3), the
+  stronger recipes (T1, T2), the floor on hard negatives in training (M4), averaging (A1)
 - `anchors.py`, `rar_settings.py` - rank-anchored replay (registration section 17): each
   retained query keeps its acquisition reference's top-10 order, or under the one-sided floor
   of 17.3 only its relevant passage's share against a drop, or under hard-negative replay

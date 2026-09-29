@@ -1847,3 +1847,74 @@ must record the choice and its reason. The records are archived in
 gs://fedcrag-t1-archive/R17_7_20260928 (R17_7hn_records.tgz, sha256
 a51d772012c4ed72f6d8d4c998e03fae3573949b1de0b469f3263cef77f537bd; R17_7floorhn_records.tgz,
 sha256 46a820c8c528ffa95cbaf0cb6373507977d323bc5d63e08edacc8781b6497150).
+
+### 18 Block 18: confirmation of the method on LoTTE (registered 2026-09-29 01:09 UTC, the clock of the commit that adds it; before any of its runs and before any score of block L1 is read)
+
+Status. Confirmatory. The development of 17 to 17.8, each study decided by a rule registered
+before its runs, chose the one-sided floor (17.3.1) as the method, found that hard-negative
+replay (17.4.2) and hard negatives in training (17.7.1) raise average quality and per-query
+regression together, and admitted server averaging over the last four rounds (17.4.1) by
+0.0004. On 29 September the user decided that the paper is built around the floor, with
+hard-negative replay as the trade-off arm; that contrastive consolidation, which its rule
+admitted by 0.006 (17.6.1), is reported as development evidence only, to keep the machines'
+time for the rest; and that the floor on hard negatives in training is confirmed although the
+rule of 17.7 did not admit it.
+
+Amendment to 17.7. That rule scored quality only, and floorhn's guard score equalled hn's to
+five decimals (0.673437 against 0.673441) while its regression was 37% lower, in all 30
+historical cells (17.7.1). A rule on quality alone cannot decide a claim of equal quality with
+less regression, so floorhn is confirmed here under its own hypothesis M4, registered below
+before any run of this block. The departure from 17.7's rule was decided after its
+development result was known; the confirmation uses LoTTE data that no design choice has
+seen.
+
+Data and recipe. As block L1 (16, 16.1): manifests lotte_A.json and lotte_B.json (sha256
+d9356cdac79e00fdca36ed58b41cfdbd7af85765e422f55ad25a2d40ef47870e and
+987f8845ee8f093a11f990dd6b50dd842c379856f414cff44757421489d19442), in ~/L1_20260925/manifests
+on the L4 and, with their SHA256SUMS verified, in ~/L18_manifests on both T4s; LoTTE
+lotte.tar.gz (sha256 37c0f39af23a6e3464f63395a4d04a22b91fe59c1aa64ea1773a8aff113c7ab5)
+downloaded to each T4 and checked before any run there; the recipe of 14.1; seeds 123, 2024
+and 3407 under schedules A and B, six runs per arm.
+
+Arms (commit 4ab2405, run_continual.sh modes lotte-methods, lotte-hn, lotte-floorhn).
+- floor: arm fedavg-replay-anchor with anchor_loss floor, lambda 0.5, anchor_k 10, random
+  retention (17.3).
+- hard: the same with anchor_loss hard (17.4).
+- hn: arm D with hard negatives in training, --hard_negatives 0.5 --hard_k 4 (17.7).
+- floorhn: the floor plus the same hard negatives in training (17.7).
+- average: block L1's six D runs deployed as the average of each experience's last four global
+  states (server_average.py --window 4), an evaluation of their saved states.
+- D: block L1's six D runs, l1-fedavg-replay-<schedule>-s<seed>, already running under 16.
+
+Machines and pairs. floor, hard and average run on the L4 after block L1 ends, on the hardware
+of the D runs they are paired with. hn and floorhn run at once on the two T4s (hn on the
+first, floorhn on the second) and are paired with each other. T2 pairs hn on a T4 with D on
+the L4; in 17.2, D on the T4 was within 0.001 of D on the L4 in every column.
+
+Hypotheses (l18_report.py). Pairs are the six (schedule, seed) combinations; "in five of six"
+counts strict inequalities.
+- M1 to M3, the method: under the floor, G is lower than under D in at least five of six pairs
+  (M1), the nDCG@10 on earlier experiences at the end is higher in at least five of six (M2),
+  and the mean A is at least D's minus 0.005 (M3). The method is confirmed if all three hold.
+- T1 and T2, stronger recipes raise the average and per-query regression together: under hard
+  (T1) and under hn (T2), the nDCG@10 on earlier experiences at the end is higher than under D
+  in at least five of six pairs, and G is higher in at least five of six.
+- M4, the method on the strong recipe: under floorhn, G is lower than under hn in at least
+  five of six pairs, and its mean end nDCG@10 on earlier experiences and its mean A are each at
+  least hn's minus 0.005.
+- A1, server averaging: G is lower than under D and the end nDCG@10 on earlier experiences is
+  higher, each in at least five of six pairs.
+Reported for every arm without a pass or fail rule: the measures of 17.7.1 per run and per
+pair, the pooled shares of pairs losing at least 0.010 and 0.1, and the regression by client
+and experience age.
+
+Reading. Block L1's scores may be read once its 42 runs validate, this section being
+registered first. No test score of an arm of this block is read before its six runs (or
+evaluations) have validated, and no hypothesis is evaluated before all of its arms have.
+
+Launch. From the commit that adds this section: lotte-hn on the first T4 and lotte-floorhn on
+the second as soon as LoTTE is verified there; lotte-methods on the L4 with
+L1_OUT=~/L1_20260925 once block L1's chain has powered it off and its records are copied.
+Each machine is stopped or deallocated when its chain ends. The ablations of the method on
+the development stream (the floor with random rather than reference negatives; the floor
+under local training) are registered separately before their runs.
